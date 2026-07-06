@@ -10,6 +10,7 @@ CMDPLUS 是一款功能强大的 Windows 系统管理工具箱，专为系统管
 **目标平台:** Windows 7 SP1 \~ Windows 11 26H1
 **编译环境:** MSBuild + VS2026 v145生成工具
 **代码规模:** 约34,000行
+**开源DMSP:** `signature_protection_nocert.h` (无证书版, 不含签名验证与证书信息)
 
 #### 软件架构
 
@@ -46,10 +47,11 @@ DebugPrivilegeEnabler (权限启用)
 ```
 
 **自我保护架构** — DMSP v5.4 (Distributed Multi-Layer Signature Protection) 多层防护系统：
+> 开源版本使用 `signature_protection_nocert.h`，**L1 签名验证已跳过**（不含证书信息），其余 10 层保护正常运行。
 
 |  层次 | 子系统    | 核心能力                                             |
 | :-: | ------ | ------------------------------------------------ |
-|  L1 | 数字签名验证 | PE 完整性 + WinVerifyTrust + 14 项证书身份校验             |
+|  L1 | 数字签名验证 | 开源版: 已跳过 (nocert)                              |
 |  L2 | 反调试检测  | 13 种检测方法加权投票                                     |
 |  L3 | 进程自我保护 | PPL + BreakOnTermination + Job Object + Watchdog |
 |  L4 | 代码完整性  | 全量 .text 段 CRC32C 分块校验                           |
@@ -62,6 +64,7 @@ DebugPrivilegeEnabler (权限启用)
 | L11 | 控制流混淆  | 函数指针加密 + 不透明谓词 + state-machine dispatcher        |
 
 **依赖库:**
+> 开源版 (nocert) 无需 wintrust.lib / crypt32.lib；此处列出完整发布版依赖。
 
 ```cpp
 advapi32.lib    // 高级API (注册表、令牌)
