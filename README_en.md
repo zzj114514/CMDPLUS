@@ -10,6 +10,7 @@ CMDPLUS is a powerful Windows system administration toolkit designed for system 
 **Target Platform:** Windows 7 SP1 \~ Windows 11 26H1
 **Build Environment:** MSBuild + VS2026 v145 Toolset
 **Code Size:** ~34,000 lines
+**Open-Source DMSP:** `signature_protection_nocert.h` (no-cert version, signature verification & certificate data excluded)
 
 #### Software Architecture
 
@@ -46,10 +47,11 @@ Enhanced Protection Module
 ```
 
 **Self-Protection Architecture** — DMSP v5.4 (Distributed Multi-Layer Signature Protection):
+> Open-source build uses `signature_protection_nocert.h` — **L1 signature verification is skipped** (no certificate data included). The remaining 10 protection layers operate normally.
 
 | Tier | Subsystem | Core Capability |
 |:---:|-----------|-----------------|
-| L1 | Digital Signature Verification | PE Integrity + WinVerifyTrust + 14 Certificate Identity Checks |
+| L1 | Digital Signature Verification | Open-source: skipped (nocert) |
 | L2 | Anti-Debug Detection | 13 Detection Methods with Weighted Voting |
 | L3 | Process Self-Protection | PPL + BreakOnTermination + Job Object + Watchdog |
 | L4 | Code Integrity | Full .text Section CRC32C Chunk Verification |
@@ -62,6 +64,7 @@ Enhanced Protection Module
 | L11 | Control Flow Obfuscation | Function Pointer Encryption + Opaque Predicates + State-Machine Dispatcher |
 
 **Dependencies:**
+> Open-source (nocert) build does not require `wintrust.lib` / `crypt32.lib`; listed here for the full release build.
 
 ```cpp
 advapi32.lib    // Advanced API (Registry, Tokens)
