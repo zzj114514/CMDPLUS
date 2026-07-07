@@ -214,13 +214,6 @@ CMDPLUS/
 └── CMDPLUS26.7.7_KERNEL_DRIVER_2.bat  启动批处理文件
 ```
 
-**开源仓库说明：**
-
-- `CMDPLUS.cpp`（单体文件）及其备份副本**不包含在开源上传中**
-- `BOVID/` 目录（PhantomKiller.sys 驱动源代码）**不包含在开源上传中**——PhantomKiller.sys 仅以预编译二进制形式通过 `PhantomKiller_bin.h` / `PhantomKiller_base64.h` 嵌入
-- `RTCore64.sys资料/` 目录（驱动加载器及资料）**不包含在开源上传中**
-- `新建文件夹/`（临时文件）**不包含在开源上传中**
-- 编译产物（`x64/Release/*.exe`, `*.obj`, `*.pdb` 等）可通过 MSBuild 自行生成，**不包含在开源上传中**
 
 ---
 
