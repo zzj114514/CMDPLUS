@@ -30,8 +30,7 @@ CMDPLUS Modular Architecture:
 │   │   ├── Open Layer    12 OpenProcess strategies (incl. driver-based privilege escalation)
 │   │   ├── Kill Layer    User-mode + kernel-mode termination techniques
 │   │   └── Utils Layer   COM/Firewall/USB/Input device recovery
-│   ├── ProcessGuard      Process protection engine (DACL + Job Object + Watchdog)
-│   └── WG                Critical process marking (ProcessProtector)
+│   └── ProcessGuard      Process protection engine (DACL + Job Object + Watchdog)
 
 ├── Privilege & Token
 │   ├── DebugPrivilegeEnabler  Debug privilege escalation (SeDebug etc., 7 privileges)
@@ -201,7 +200,6 @@ CMDPLUS/
 ├── AdvancedProcessCreator.{h,cpp}  Advanced process creation
 ├── DebugPrivilegeEnabler.h   Debug privilege escalation
 ├── WTSHelper.h               Terminal Services token helper
-├── WG.cpp                    Critical process protection
 ├── stubs.cpp                 Linker stubs
 ├── ppl_driver.h              RTCore64.sys PPL bypass driver
 ├── PhantomKiller_bin.h       PhantomKiller.sys embedded binary
@@ -213,7 +211,7 @@ CMDPLUS/
 ├── CMDPLUS.vcxproj           MSBuild project file
 ├── README.md                 简体中文说明
 ├── README_en.md              English Documentation
-└── LICENSE                   Apache 2.0 license
+└── CMDPLUS26.7.7_KERNEL_DRIVER_2.bat  Startup batch file
 ```
 
 **Open-Source Repository Notes:**
@@ -236,10 +234,10 @@ CMDPLUS embeds DMSP (Distributed Multi-Layer Signature Protection), an ~5400-lin
 - **Kernel protection**: KUSER_SHARED_DATA direct-read cross-validation
 - **Obfuscation**: Function pointer encryption, opaque predicates, state-machine dispatcher
 
-Detailed design documentation at [DMSP_README.md](./DMSP_README.md).
+
 
 ---
 
 ---
 
-**Disclaimer:** This tool is distributed under the [Apache 2.0](LICENSE) open-source license and is intended for educational and research purposes only. The author assumes no responsibility for any system damage, data loss or leakage, or violation of local laws resulting from the use of this tool. By using this tool, you acknowledge and agree to assume all risks.
+**Disclaimer:** This tool is distributed under the Apache 2.0 open-source license and is intended for educational and research purposes only. The author assumes no responsibility for any system damage, data loss or leakage, or violation of local laws resulting from the use of this tool. By using this tool, you acknowledge and agree to assume all risks.
