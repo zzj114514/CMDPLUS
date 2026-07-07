@@ -30,8 +30,7 @@ CMDPLUS 模块化架构:
 │   │   ├── 进程打开层    12 种 OpenProcess 策略（含驱动提权）
 │   │   ├── 终止方法层    用户态 + 内核态终止技术
 │   │   └── 工具层        COM/Firewall/USB/输入设备恢复
-│   ├── ProcessGuard      进程保护引擎（DACL + Job Object + Watchdog）
-│   └── WG                关键进程标记（ProcessProtector）
+│   └── ProcessGuard      进程保护引擎（DACL + Job Object + Watchdog）
 
 ├── 权限与令牌
 │   ├── DebugPrivilegeEnabler  调试权限提升（SeDebug 等 7 项权限）
@@ -201,7 +200,6 @@ CMDPLUS/
 ├── AdvancedProcessCreator.{h,cpp}  高级进程创建
 ├── DebugPrivilegeEnabler.h    调试权限提升
 ├── WTSHelper.h                终端服务令牌辅助
-├── WG.cpp                     关键进程保护
 ├── stubs.cpp                  链接器桩函数
 ├── ppl_driver.h               RTCore64.sys PPL 绕过驱动
 ├── PhantomKiller_bin.h        PhantomKiller.sys 二进制嵌入
@@ -213,7 +211,7 @@ CMDPLUS/
 ├── CMDPLUS.vcxproj            MSBuild 项目文件
 ├── README.md                  简体中文说明
 ├── README_en.md               English Documentation
-└── LICENSE                    开源协议（Apache 2.0）
+└── CMDPLUS26.7.7_KERNEL_DRIVER_2.bat  启动批处理文件
 ```
 
 **开源仓库说明：**
@@ -236,10 +234,10 @@ CMDPLUS 内嵌的 DMSP（Distributed Multi-Layer Signature Protection）是一�
 - **内核防护**：KUSER_SHARED_DATA 直读交叉验证
 - **混淆技术**：函数指针加密、不透明谓词、state-machine dispatcher
 
-详细设计文档见 [DMSP_README.md](./DMSP_README.md)。
+
 
 ---
 
 ***
 
-**免责声明：** 本工具遵循 [Apache 2.0](LICENSE) 开源协议，仅供学习和研究目的使用。使用本工具造成的任何系统损坏、数据丢失或泄露、违反当地法律法规等，作者不承担任何责任。使用本工具即表示您已理解并同意承担所有风险。
+**免责声明：** 本工具遵循 Apache 2.0 开源协议，仅供学习和研究目的使用。使用本工具造成的任何系统损坏、数据丢失或泄露、违反当地法律法规等，作者不承担任何责任。使用本工具即表示您已理解并同意承担所有风险。
